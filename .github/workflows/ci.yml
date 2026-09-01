@@ -1,0 +1,158 @@
+# Audit Log Service CI — unit gate (no Docker required).
+#
+# Copy or symlink this workflow to the GitHub repository root that owns this
+# service (GitHub only loads `.github/workflows` from the repo root). Path
+# filters below cover both monorepo and standalone layouts.
+
+name: Audit Service CI
+
+on:
+  push:
+    paths:
+      - "everycred_backend/audit/**"
+      - "audit/**"
+      - ".github/workflows/audit-service-ci.yml"
+      - "**/audit/.github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "everycred_backend/audit/**"
+      - "audit/**"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve working directory
+        id: dir
+        run: |
+          if [ -f "pyproject.toml" ] && grep -q "everycred-audit-service" pyproject.toml 2>/dev/null; then
+            echo "path=." >> "$GITHUB_OUTPUT"
+          elif [ -d "everycred_backend/audit" ]; then
+            echo "path=everycred_backend/audit" >> "$GITHUB_OUTPUT"
+          elif [ -d "audit" ]; then
+            echo "path=audit" >> "$GITHUB_OUTPUT"
+          else
+            echo "Could not locate audit service directory" >&2
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: uv sync --all-extras --frozen
+
+      - name: Lint
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Typecheck
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: uv run mypy app
+
+      - name: Unit tests
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: uv run pytest -m "not integration"
+
+      - name: Security
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: |
+          uv run bandit -c pyproject.toml -r app
+          uv run pip-audit
+
+  # The integration suite is a separate job because it needs live services. It is
+  # not optional coverage: the guarantees it checks are enforced by Elasticsearch
+  # itself (constant_keyword rejecting a wrong-tenant document, `enabled: false`
+  # making ciphertext unsearchable, op_type:create deduplicating a replay) or
+  # emerge from the worker/Redis/ES interaction (a gap-free, correctly linked hash
+  # chain). Mocks cannot observe any of them, and every one of those checks has
+  # already caught a real defect.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      elasticsearch:
+        # Must track the client major version pinned in pyproject.toml.
+        image: docker.elastic.co/elasticsearch/elasticsearch:9.2.0
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          # No xpack.ilm.enabled: the setting was removed in 9.x and passing it
+          # makes the node refuse to boot.
+          ES_JAVA_OPTS: -Xms1g -Xmx1g
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve working directory
+        id: dir
+        run: |
+          if [ -f "pyproject.toml" ] && grep -q "everycred-audit-service" pyproject.toml 2>/dev/null; then
+            echo "path=." >> "$GITHUB_OUTPUT"
+          elif [ -d "everycred_backend/audit" ]; then
+            echo "path=everycred_backend/audit" >> "$GITHUB_OUTPUT"
+          elif [ -d "audit" ]; then
+            echo "path=audit" >> "$GITHUB_OUTPUT"
+          else
+            echo "Could not locate audit service directory" >&2
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        working-directory: ${{ steps.dir.outputs.path }}
+        run: uv sync --all-extras --frozen
+
+      - name: Integration tests
+        working-directory: ${{ steps.dir.outputs.path }}
+        env:
+          ENVIRONMENT: local
+          # Obviously-fake CI values. The 32-byte floor on the JWT key is
+          # enforced at startup (RFC 7518 s.3.2).
+          JWT_SECRET_KEY: ci-only-signing-secret-0123456789abcdef
+          JWT_AUDIENCE: everycred-api
+          SERVICE_API_KEYS: ci-only-service-key
+          ES_HOSTS: http://localhost:9200
+          ES_USERNAME: elastic
+          ES_PASSWORD: ci-only-password
+          ES_VERIFY_CERTS: "false"
+          REDIS_URL: redis://localhost:6379/0
+          # A single-node cluster cannot allocate replicas.
+          INDEX_REPLICAS: "0"
+          # MinIO is not started here; the WORM archive has its own coverage and
+          # the chain tests deliberately isolate from it.
+          ARCHIVE_ENABLED: "false"
+          # 32 zero bytes, base64url. Fake, and never used outside CI.
+          PII_MASTER_KEK: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          RATE_LIMIT_ENABLED: "false"
+        run: uv run pytest -m integration -v

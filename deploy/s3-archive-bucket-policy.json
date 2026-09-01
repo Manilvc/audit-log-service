@@ -1,0 +1,114 @@
+{
+  "_comment": [
+    "Bucket policy for the audit WORM archive. Apply with:",
+    "  aws s3api put-bucket-policy --bucket <ARCHIVE_BUCKET> --policy file://s3-archive-bucket-policy.json",
+    "",
+    "WHY THIS IS NEEDED IN ADDITION TO OBJECT LOCK",
+    "",
+    "Object Lock in COMPLIANCE mode makes an object *version* immutable: a",
+    "targeted DeleteObjectVersion is refused outright ('WORM protected'), and no",
+    "principal - including the account root - can shorten the retention. That was",
+    "verified against the live archive.",
+    "",
+    "What Object Lock does NOT stop is a plain DeleteObject. On a versioned",
+    "bucket that call does not remove anything; it writes a zero-byte *delete",
+    "marker* that becomes the current version. The locked data version is still",
+    "there and still recoverable, so no evidence is destroyed - but a default",
+    "ListObjects or GetObject then behaves as though the segment is gone.",
+    "",
+    "For an audit archive that is unacceptable on its own terms: an auditor",
+    "listing the bucket would conclude records are missing, and an operator would",
+    "have to know to list versions to disprove it. The Deny statements below",
+    "remove the possibility rather than relying on nobody exercising it.",
+    "",
+    "Replace ACCOUNT_ID, ARCHIVE_BUCKET and AUDIT_WRITER_ROLE before applying."
+  ],
+
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyDeleteMarkersAndVersionDeletes",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET/*",
+      "_comment": [
+        "DeleteObject is what creates a delete marker; DeleteObjectVersion is",
+        "already refused by Object Lock, and denying it here makes the intent",
+        "explicit and survives a future retention expiry."
+      ]
+    },
+    {
+      "Sid": "DenyRetentionAndLegalHoldTampering",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": [
+        "s3:PutObjectRetention",
+        "s3:BypassGovernanceRetention",
+        "s3:PutObjectLegalHold",
+        "s3:PutBucketObjectLockConfiguration",
+        "s3:PutBucketVersioning"
+      ],
+      "Resource": [
+        "arn:aws:s3:::ARCHIVE_BUCKET",
+        "arn:aws:s3:::ARCHIVE_BUCKET/*"
+      ],
+      "_comment": [
+        "Suspending versioning would break Object Lock's guarantee, and rewriting",
+        "retention is the one operation that could shorten the WORM window.",
+        "COMPLIANCE mode already blocks the shortening; this also blocks the",
+        "attempt being made."
+      ]
+    },
+    {
+      "Sid": "DenyUnencryptedTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::ARCHIVE_BUCKET",
+        "arn:aws:s3:::ARCHIVE_BUCKET/*"
+      ],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    },
+    {
+      "Sid": "RestrictWritesToTheAuditWriterRole",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET/*",
+      "Condition": {
+        "StringNotLike": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::ACCOUNT_ID:role/AUDIT_WRITER_ROLE",
+            "arn:aws:sts::ACCOUNT_ID:assumed-role/AUDIT_WRITER_ROLE/*"
+          ]
+        }
+      },
+      "_comment": [
+        "Only the audit service may seal segments. Anyone else writing here could",
+        "plant an object that is then permanently undeletable."
+      ]
+    }
+  ],
+
+  "operator_notes": [
+    "Object Lock can ONLY be enabled at bucket creation:",
+    "  aws s3api create-bucket --bucket <name> --object-lock-enabled-for-bucket",
+    "The service logs `worm_archive_misconfigured` at startup if it is missing,",
+    "which means archived segments are ordinary deletable objects.",
+    "",
+    "Recovering a segment hidden by a delete marker (if one was created before",
+    "this policy was applied):",
+    "  aws s3api list-object-versions --bucket <name> --prefix <key>",
+    "  aws s3api delete-object --bucket <name> --key <key> --version-id <marker-id>",
+    "Removing a delete marker is permitted and is not a data deletion.",
+    "",
+    "The keyring index is deliberately NOT archived here. Writing wrapped PII",
+    "keys into WORM storage would make them undeletable and defeat",
+    "crypto-shredding outright - erasure works by destroying that key."
+  ]
+}

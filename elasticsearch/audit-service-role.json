@@ -1,0 +1,99 @@
+{
+  "_comment": [
+    "Least-privilege Elasticsearch role for the audit service.",
+    "",
+    "Apply, then mint a scoped API key for ES_API_KEY:",
+    "  PUT  _security/role/audit_service          <- the 'role' object below",
+    "  POST _security/api_key                     <- { name, role_descriptors: { audit_service: <role> } }",
+    "",
+    "Two properties matter most:",
+    "",
+    "1. The service has NO 'delete' privilege on the audit data streams. Audit",
+    "   records are append-only, and erasure is crypto-shredding, which touches",
+    "   only the keyring index. Withholding 'delete' means a compromised service",
+    "   credential cannot destroy audit evidence at all - the cluster refuses it,",
+    "   rather than relying on the application never asking.",
+    "",
+    "2. 'delete' IS granted on the keyring index, and only there. That single",
+    "   deletion is the entire crypto-shredding mechanism, so it is the one",
+    "   mutable surface the service needs.",
+    "",
+    "manage_ilm and manage_index_templates are cluster-level because bootstrap",
+    "applies the ILM policy and index templates on startup. If policy is applied",
+    "out-of-band instead, drop both and the service still runs - it logs",
+    "cluster_bootstrap_failed and continues buffering."
+  ],
+
+  "role": {
+    "cluster": [
+      "monitor",
+      "manage_ilm",
+      "manage_index_templates"
+    ],
+    "indices": [
+      {
+        "names": ["audit-shared", "audit-shared*", "audit-t-*", ".ds-audit-*"],
+        "privileges": [
+          "create_doc",
+          "create_index",
+          "read",
+          "view_index_metadata",
+          "monitor",
+          "manage"
+        ],
+        "_comment": [
+          "'create_doc' allows indexing new documents but NOT overwriting an",
+          "existing one - the storage-layer expression of an append-only log.",
+          "'delete' and 'write' are deliberately absent: 'write' would permit",
+          "update and delete operations on audit records.",
+          "'manage' is needed for data stream rollover and point-in-time.",
+          "Backing indices (.ds-audit-*) must be listed: ILM and PIT address",
+          "them directly rather than through the data stream alias."
+        ],
+        "allow_restricted_indices": false
+      },
+      {
+        "names": ["audit-keyring-v1"],
+        "privileges": [
+          "create_index",
+          "read",
+          "write",
+          "delete",
+          "view_index_metadata"
+        ],
+        "_comment": [
+          "The one mutable store. 'delete' here is what executes a data-subject",
+          "erasure. It holds only WRAPPED data keys, so a stolen copy is still",
+          "gated by PII_MASTER_KEK, which lives outside the cluster.",
+          "",
+          "Operationally this index is the single point of failure for PII",
+          "readability: lose it and every encrypted field is unreadable forever.",
+          "It must be included in the snapshot policy."
+        ],
+        "allow_restricted_indices": false
+      }
+    ],
+    "applications": [],
+    "run_as": [],
+    "metadata": {
+      "managed_by": "everycred-audit-service",
+      "purpose": "least-privilege audit ingest and query"
+    }
+  },
+
+  "snapshot_policy_note": [
+    "Elasticsearch is not the durability story for audit segments - the S3",
+    "Object Lock archive is. Snapshots still matter for two reasons:",
+    "  1. audit-keyring-v1 exists ONLY in Elasticsearch. It is not archived,",
+    "     because writing key material to WORM storage would make it",
+    "     undeletable and defeat crypto-shredding outright.",
+    "  2. Restoring a cluster from the archive means replaying millions of",
+    "     documents; a snapshot restore is hours faster.",
+    "",
+    "The keyring must therefore be in a snapshot policy with a retention at",
+    "least as long as RETENTION_DAYS. A snapshot taken before an erasure will",
+    "still contain the destroyed key, so snapshot retention is itself a GDPR",
+    "consideration: keep it as short as the recovery objective allows, and",
+    "document the window in the DPIA."
+  ]
+}

@@ -1,0 +1,22 @@
+# Keep the build context small and, more importantly, keep secrets and the host
+# virtualenv out of the image.
+.venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+docs/
+deploy/
+scripts/
+docker-compose.yml
+Dockerfile
+Makefile

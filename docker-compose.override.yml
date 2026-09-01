@@ -1,0 +1,22 @@
+# Local overrides. Compose loads this automatically on top of docker-compose.yml.
+#
+# Why this exists: a native redis-server.exe runs as a Windows service on the
+# default 6379 and cannot be stopped without administrator rights. It is also
+# far too old for this service - it answers `HELLO` with "unknown command",
+# which places it before Redis 6, and the ingest buffer is built on Redis
+# Streams (5.0+) with consumer groups. Rather than fight the service, the
+# container is published on 6380 and REDIS_URL points there.
+#
+# Nothing here belongs in a deployed environment: it exists to resolve a port
+# collision on one developer machine. Delete it once 6379 is free, and set
+# REDIS_URL back to redis://localhost:6379/0.
+
+services:
+  redis:
+    # `!override` replaces the base file's port list instead of extending it.
+    # Compose merges sequences by appending, so a plain `ports:` here would
+    # publish 6379 *as well as* 6380 - leaving two different Redis servers
+    # reachable on the same port number and the choice of which one you get up
+    # to bind ordering. That is a worse problem than the one being solved.
+    ports: !override
+      - "6380:6379"
