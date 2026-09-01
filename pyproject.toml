@@ -28,9 +28,12 @@ dependencies = [
     "python-multipart>=0.0.12",
 
     # --- Elasticsearch -----------------------------------------------------
-    # Pinned to the 9.x line: the client refuses to talk to a cluster of a
-    # different major version, so this must track the deployed cluster.
-    "elasticsearch[async]>=9,<10",
+    # Pinned to the 8.x line to match the deployed cluster (8.19.20). The
+    # client sends an `Accept: ...compatible-with=<major>` header and an 8.x
+    # node rejects major 9 outright ("Accept version must be either version 8
+    # or 7"). An 8.x client is still accepted by a 9.x node, so this is the
+    # safe side to sit on until the server is upgraded; bump both together.
+    "elasticsearch[async]>=8.19,<9",
 
     # --- Durable ingest buffer (Redis Streams) -----------------------------
     # >=5 for XAUTOCLAIM support, which the stale-entry recovery path needs.
