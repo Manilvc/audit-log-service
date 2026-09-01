@@ -1,0 +1,43 @@
+# One-shot: applies the Elasticsearch topology (ILM policy, index templates,
+# data streams, tenant keyring) before the API and worker first start.
+#
+# Idempotent — safe to re-run after an upgrade that changes mappings.
+#
+# Install:  sudo cp deploy/systemd/audit-log-bootstrap.service /etc/systemd/system/
+#           sudo systemctl daemon-reload
+#           sudo systemctl start audit-log-bootstrap
+#           sudo journalctl -u audit-log-bootstrap --no-pager
+#
+# Leave it disabled (do not `enable`) unless you want it to re-run on every
+# boot; running it once by hand before enabling the other two units is enough.
+
+[Unit]
+Description=EveryCRED Audit Log Service - Elasticsearch bootstrap (one-shot)
+Documentation=https://github.com/Manilvc/audit-log-service
+Wants=network-online.target
+After=network-online.target elasticsearch.service
+Before=audit-log-api.service audit-log-worker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=everycred-local
+Group=everycred-local
+WorkingDirectory=/var/www/api-evrc.viitorcloud.in/audit-log-service
+Environment="PATH=/var/www/api-evrc.viitorcloud.in/audit-log-service/.venv/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/var/www/api-evrc.viitorcloud.in/audit-log-service/.venv/bin/audit-service bootstrap
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=audit-log-bootstrap
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

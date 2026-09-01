@@ -1,0 +1,56 @@
+# EveryCRED Audit Log Service — ingest worker
+#
+# Separate process from the API by design (see app/cli.py): the API only
+# appends to the Redis stream, and this worker drains it into Elasticsearch and
+# the WORM archive. Without this unit running, POSTed events are accepted but
+# never become queryable.
+#
+# Install:  sudo cp deploy/systemd/audit-log-worker.service /etc/systemd/system/
+#           sudo systemctl daemon-reload
+#           sudo systemctl enable --now audit-log-worker
+
+[Unit]
+Description=EveryCRED Audit Log Service - ingest worker
+Documentation=https://github.com/Manilvc/audit-log-service
+Wants=network-online.target
+After=network-online.target
+After=redis-server.service elasticsearch.service
+# Not a hard requirement, but starting after the API keeps the boot log tidy.
+After=audit-log-api.service
+
+[Service]
+Type=exec
+User=everycred-local
+Group=everycred-local
+WorkingDirectory=/var/www/api-evrc.viitorcloud.in/audit-log-service
+Environment="PATH=/var/www/api-evrc.viitorcloud.in/audit-log-service/.venv/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# %H is the hostname: the consumer name identifies this box in the Redis
+# consumer group, so a second worker on another host does not collide.
+ExecStart=/var/www/api-evrc.viitorcloud.in/audit-log-service/.venv/bin/audit-service worker \
+    --name %H-worker-1
+
+Restart=always
+RestartSec=5
+# The worker traps SIGTERM and finishes the in-flight batch before exiting, so
+# give it room. Killing it early leaves entries pending for stale-reclaim.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=audit-log-worker
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+UMask=0027
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

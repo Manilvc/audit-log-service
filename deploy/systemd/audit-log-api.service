@@ -1,0 +1,66 @@
+# EveryCRED Audit Log Service — HTTP API
+#
+# Install:  sudo cp deploy/systemd/audit-log-api.service /etc/systemd/system/
+#           sudo systemctl daemon-reload
+#           sudo systemctl enable --now audit-log-api
+#
+# Mounted behind nginx at https://api-evrc.viitorcloud.in/audit/ .
+# nginx strips the /audit prefix (proxy_pass with a trailing slash), so the
+# app is told its external prefix via --root-path; without that, redirects and
+# any generated URL would drop /audit and 404 against the main backend.
+
+[Unit]
+Description=EveryCRED Audit Log Service - HTTP API (uvicorn)
+Documentation=https://github.com/Manilvc/audit-log-service
+Wants=network-online.target
+After=network-online.target
+# Both are hard dependencies of the request path. Drop either line if that
+# service runs on another host rather than locally.
+After=redis-server.service elasticsearch.service
+
+[Service]
+Type=exec
+User=everycred-local
+Group=everycred-local
+WorkingDirectory=/var/www/api-evrc.viitorcloud.in/audit-log-service
+Environment="PATH=/var/www/api-evrc.viitorcloud.in/audit-log-service/.venv/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# Bound to loopback on purpose: nginx is the only client, so the port must not
+# be reachable from outside the box.
+ExecStart=/var/www/api-evrc.viitorcloud.in/audit-log-service/.venv/bin/uvicorn \
+    app.main:app \
+    --host 127.0.0.1 \
+    --port 8020 \
+    --workers 5 \
+    --root-path /audit \
+    --proxy-headers \
+    --forwarded-allow-ips 127.0.0.1 \
+    --timeout-keep-alive 15 \
+    --limit-concurrency 1000 \
+    --no-access-log \
+    --no-server-header
+
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=audit-log-api
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+UMask=0027
+# Remove ProtectHome if boto3 must read credentials from ~/.aws instead of
+# taking them from .env or an instance role.
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
