@@ -215,28 +215,73 @@ Base path `/v1`. Responses use the platform envelope
 
 ### Authentication
 
-**Service principal** — `x-api-key`, for emitting services that have already
+One credential: **`x-api-key`**, for emitting services that have already
 enforced RBAC. Constant-time comparison against a list, so keys rotate with an
-overlap window. Grants `write`, `read`, `verify`, `export` — deliberately **not**
-`erase` or `cross_tenant`: destroying personal data and reading across tenants
-are human decisions.
+overlap window. There is no user-token path — this service validates no platform
+JWT and runs no login of its own.
 
 ```
 x-api-key:             <service key>
-x-audit-tenant-id:     <tenant uuid>          # tenant this call acts for
-x-audit-on-behalf-of:  <user uuid>            # attribution for the trail
+x-audit-tenant-id:     <tenant uuid>          # REQUIRED - tenant this call acts for
+x-audit-issuer-id:     <issuer uuid>          # issuer (sub-tenant) default for the batch
+x-audit-on-behalf-of:  <user uuid>            # the service user this call acts for
 x-service-name:        everycred-backend
 ```
 
-**User principal** — `Authorization: Bearer <platform JWT>`, validated with the
-same secret, issuer and audience as the main backend, so there is no separate
-login.
+Two headers, two different jobs. `x-api-key` decides **whether you may call at
+all** — it is the security boundary. `x-audit-tenant-id` decides **whose trail
+you are touching** — it is the tenant boundary, and the key is not bound to a
+tenant, so nothing else can supply it.
 
-A plain platform token carries no audit scopes, and this service has no access
-to the platform's RBAC tables. Rather than guess, an unscoped token gets exactly
-one grant: read access to **its own** events, with `actor_id` pinned so the
-filter cannot be widened. Broader access needs a token minted with explicit
-`audit_scopes`, or a service call from the main backend.
+The tenant header is required on every route that acts for one tenant: ingest,
+`GET /events/{id}`, export, integrity verification and erasure all answer
+**400** without it, before the request body is even read. It may be omitted only
+on search and aggregate with `cross_tenant=true`, which name no tenant by
+definition.
+
+The value is checked for shape — `[A-Za-z0-9._-]`, 1–63 characters, alphanumeric
+first, which is what keeps it safe inside an index name — and otherwise trusted.
+**This service does not check that the tenant exists.** The caller resolved the
+tenant from its own request context and authorised the user against it before
+calling; repeating that here would need either a second credential or a tenant
+registry, and it would put a network call in front of an audit write. The
+trade-off is that a well-formed id for a tenant that does not exist is accepted,
+and those events then belong to a tenant nobody can read — a caller bug, not a
+leak, since a read for tenant A still only ever returns tenant A's events.
+
+On ingest, an event whose body `tenant_id` disagrees with the header is rejected
+rather than silently resolved.
+
+One key is enough. `SERVICE_API_KEYS` is a list only so a rotation can keep the
+outgoing key valid during the cutover.
+
+### What the request records about the caller
+
+Three headers are stamped onto every event a call ingests, so a record stays
+attributable even when the emitter did not describe itself:
+
+| Header | Stored as | Notes |
+|---|---|---|
+| `x-service-name` | `actor.service`, and `service.name` | `service.name` only while the event left it `unknown` |
+| `x-audit-on-behalf-of` | `actor.on_behalf_of` | The service user - the person the backend is acting for |
+| `x-audit-issuer-id` | `tenant.issuer_id` | Issuer (sub-tenant); filterable on search and aggregate |
+
+All three **fill gaps and never overwrite**. An event that names its own issuer,
+service or acting user keeps what it sent - one batch can legitimately span
+issuers and users inside a tenant, and the emitter knows which event belongs to
+whom. Both id headers are capped at 64 characters, the width of the fields they
+land in; a longer value is a 400 rather than a truncated identity on an
+immutable record.
+
+The same identity is recorded on the audit-of-the-audit trail, so a read is
+attributed to the person behind it and not only to the service account.
+
+A valid key carries **every** scope, including `audit:erase` and
+`audit:cross_tenant` — with the user credential gone, nothing else can grant
+them. Key custody is therefore the access-control boundary: a leaked key can
+crypto-shred a data subject's personal data or read every tenant's trail. Keep
+keys distinct per environment, rotate them on a schedule, and keep the service
+unreachable from outside the cluster (see `deploy/`).
 
 ### Ingest example
 
@@ -408,7 +453,7 @@ app/
 │   ├── integrity.py       canonical JSON, hash chain, verifier (pure)
 │   ├── metrics.py         Prometheus queue/ingest counters
 │   ├── security/
-│   │   ├── auth.py        JWT + API key → Principal + scopes
+│   │   ├── auth.py        Service API key → Principal + scopes
 │   │   └── crypto.py      PII encryption, crypto-shredding
 │   ├── middleware/stack.py  request id, security headers, body limit, rate limit
 │   ├── exceptions.py      handlers — no internals ever leak to a client

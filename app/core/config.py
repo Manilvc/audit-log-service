@@ -72,16 +72,12 @@ class Settings(BaseSettings):
     CORS_ALLOW_ORIGINS: CsvList = Field(default_factory=list)
 
     # ------------------------------------------------------------------- auth
-    # Must match the main backend's signing key (config/signing_cookies.py ->
-    # SIGNIN_SECRET_KEY) so platform-issued access tokens validate here too.
-    JWT_SECRET_KEY: SecretStr
-    JWT_ALGORITHM: Literal["HS256", "HS384", "HS512", "RS256"] = "HS256"
-    JWT_AUDIENCE: str
-    JWT_ISSUER: str = "Your-Issuer"
-    JWT_LEEWAY_SECONDS: int = 30
-
-    # Service-to-service ingest credentials. A list, so keys can be rotated
+    # The only credential this service accepts. A list, so keys can be rotated
     # with an overlap window (old + new both valid during the cutover).
+    #
+    # A valid key carries every audit scope, including erase and cross-tenant,
+    # so it is a high-value secret: keep it distinct per environment and never
+    # hand it to a component that only needs to write events.
     SERVICE_API_KEYS: CsvSecretList = Field(default_factory=list)
 
     # ---------------------------------------------------------- elasticsearch
@@ -242,19 +238,6 @@ class Settings(BaseSettings):
                 problems.append("SERVICE_API_KEYS is required in prod")
             if problems:
                 raise ValueError("Unsafe production configuration: " + "; ".join(problems))
-
-        # RFC 7518 s.3.2: an HMAC key shorter than the hash output weakens the
-        # signature. PyJWT only warns; for a service holding audit evidence a
-        # warning is not enough, so this is a hard startup failure.
-        if self.JWT_ALGORITHM.startswith("HS"):
-            key_bytes = len(self.JWT_SECRET_KEY.get_secret_value().encode())
-            minimum = {"HS256": 32, "HS384": 48, "HS512": 64}[self.JWT_ALGORITHM]
-            if key_bytes < minimum:
-                raise ValueError(
-                    f"JWT_SECRET_KEY is {key_bytes} bytes; {self.JWT_ALGORITHM} "
-                    f"requires at least {minimum} (RFC 7518 s.3.2). This key is "
-                    "shared with the main backend, so lengthen it there too."
-                )
 
         if self.ES_API_KEY is None and not (self.ES_USERNAME and self.ES_PASSWORD):
             raise ValueError(

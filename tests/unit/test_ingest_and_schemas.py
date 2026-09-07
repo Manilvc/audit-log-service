@@ -27,7 +27,7 @@ from app.domain.enums import (
     infer_category,
 )
 from app.domain.events import REDACTED_PLACEHOLDER, Actor, AuditEvent, Change, Source
-from app.schemas.api import AuditEventIn, IngestBatchIn
+from app.schemas.api import UNKNOWN_SERVICE, AuditEventIn, IngestBatchIn
 from app.search.routing import TenantRouter
 from app.services.ingest_service import IngestService
 
@@ -57,21 +57,15 @@ def ingest(settings: Settings, queue: FakeQueue, router: TenantRouter) -> Ingest
     return IngestService(settings=settings, queue=queue, router=router)  # type: ignore[arg-type]
 
 
-def _service_principal(tenant_id: str | None = None) -> Principal:
+def _service_principal(
+    tenant_id: str | None = None, *, on_behalf_of: str | None = None
+) -> Principal:
     return Principal(
         subject="everycred-backend",
         actor_type=ActorType.SERVICE,
         tenant_id=tenant_id,
         scopes=frozenset({Scope.WRITE, Scope.READ}),
-    )
-
-
-def _user_principal(tenant_id: str | None = "tenant-a") -> Principal:
-    return Principal(
-        subject="u-42",
-        actor_type=ActorType.USER,
-        tenant_id=tenant_id,
-        scopes=frozenset({Scope.WRITE, Scope.READ}),
+        on_behalf_of=on_behalf_of,
     )
 
 
@@ -92,21 +86,22 @@ async def test_service_uses_the_tenant_header(ingest: IngestService, queue: Fake
     assert queue.published[0][1]["tenant_id"] == "tenant-a"
 
 
-async def test_user_token_tenant_claim_wins_over_any_header(
+async def test_header_decides_the_tenant_for_the_request(
     ingest: IngestService, queue: FakeQueue
 ) -> None:
-    """A user token can never be redirected at another tenant.
+    """The header is the authority, not whatever the principal was built with.
 
-    Even a header naming a different tenant is ignored, because a user's tenant
-    is fixed by their token.
+    `principal.tenant_id` is only the header value captured at authentication
+    time. If a call site passes the header explicitly, that is the value the
+    write must land under - otherwise two sources could disagree silently.
     """
     result = await ingest.ingest(
         [_event()],
-        principal=_user_principal("tenant-a"),
+        principal=_service_principal("tenant-stale"),
         header_tenant_id="tenant-b",
     )
     assert result.accepted == 1
-    assert queue.published[0][1]["tenant_id"] == "tenant-a"
+    assert queue.published[0][1]["tenant_id"] == "tenant-b"
 
 
 async def test_body_tenant_contradicting_the_principal_is_rejected(
@@ -120,7 +115,7 @@ async def test_body_tenant_contradicting_the_principal_is_rejected(
     )
     assert result.accepted == 0
     assert result.rejected == 1
-    assert "does not match the authenticated tenant" in result.errors[0]["reason"]
+    assert "does not match the x-audit-tenant-id header" in result.errors[0]["reason"]
 
 
 async def test_body_tenant_matching_the_principal_is_accepted(
@@ -151,8 +146,8 @@ async def test_hostile_tenant_id_is_rejected(ingest: IngestService) -> None:
 
 async def test_write_scope_is_required(ingest: IngestService) -> None:
     reader = Principal(
-        subject="u-42",
-        actor_type=ActorType.USER,
+        subject="read-only-service",
+        actor_type=ActorType.SERVICE,
         tenant_id="tenant-a",
         scopes=frozenset({Scope.READ}),
     )
@@ -164,6 +159,111 @@ async def test_oversized_batch_is_rejected(ingest: IngestService, settings: Sett
     events = [_event() for _ in range(settings.MAX_INGEST_BATCH_SIZE + 1)]
     with pytest.raises(IngestRejected, match="exceeds the maximum"):
         await ingest.ingest(events, principal=_service_principal(), header_tenant_id="tenant-a")
+
+
+# ---------------------------------------------------------------------------
+# Request identity: who submitted it, for whom, inside which issuer
+# ---------------------------------------------------------------------------
+# The emitting service is the authority on its own events, so these three
+# values fill gaps and never overwrite. What they buy is that an emitter which
+# forgets them still produces an attributable record instead of one that says
+# "unknown".
+USER = "9f2c4a71-6b0e-4c9d-8a35-1d7e2f4b6c80"
+
+
+async def test_request_identity_is_stamped_onto_an_event_that_names_none(
+    ingest: IngestService, queue: FakeQueue
+) -> None:
+    """Service, acting user and issuer all come from the request."""
+    result = await ingest.ingest(
+        [_event()],
+        principal=_service_principal(on_behalf_of=USER),
+        header_tenant_id="tenant-a",
+        header_issuer_id="issuer-77",
+    )
+    assert result.accepted == 1
+
+    document = queue.published[0][1]
+    assert document["actor"]["service"] == "everycred-backend"
+    assert document["actor"]["on_behalf_of"] == USER
+    assert document["issuer_id"] == "issuer-77"
+    assert document["service_name"] == "everycred-backend"
+
+
+async def test_an_event_keeps_the_identity_it_sent_itself(
+    ingest: IngestService, queue: FakeQueue
+) -> None:
+    """A batch can legitimately span issuers and act for several users.
+
+    The emitter knows which event belongs to whom; the headers only know what
+    the request as a whole was for. So a value on the event always wins.
+    """
+    incoming = _event(
+        issuer_id="issuer-own",
+        service_name="everycred-signer",
+        actor={"type": "user", "id": USER, "on_behalf_of": "admin-1", "service": "worker"},
+    )
+    result = await ingest.ingest(
+        [incoming],
+        principal=_service_principal(on_behalf_of="header-user"),
+        header_tenant_id="tenant-a",
+        header_issuer_id="issuer-header",
+    )
+    assert result.accepted == 1
+
+    document = queue.published[0][1]
+    assert document["issuer_id"] == "issuer-own"
+    assert document["service_name"] == "everycred-signer"
+    assert document["actor"]["service"] == "worker"
+    assert document["actor"]["on_behalf_of"] == "admin-1"
+
+
+async def test_identity_headers_are_optional(ingest: IngestService, queue: FakeQueue) -> None:
+    """No issuer and no acting user is a normal call, not an error.
+
+    Plenty of events are the platform acting on its own - a retention sweep, a
+    scheduled revocation - with no human and no sub-tenant behind them.
+    """
+    result = await ingest.ingest(
+        [_event()], principal=_service_principal(), header_tenant_id="tenant-a"
+    )
+    assert result.accepted == 1
+
+    document = queue.published[0][1]
+    assert document["issuer_id"] is None
+    assert document["actor"]["on_behalf_of"] is None
+
+
+def test_service_name_falls_back_to_the_caller_only_while_unknown() -> None:
+    """The `unknown` default is a sentinel; an explicit name is never replaced."""
+    stamped = _event().to_domain(tenant_id="t", submitted_by="everycred-backend")
+    assert stamped.service_name == "everycred-backend"
+
+    explicit = _event(service_name="everycred-verifier").to_domain(
+        tenant_id="t", submitted_by="everycred-backend"
+    )
+    assert explicit.service_name == "everycred-verifier"
+
+    nothing_to_fall_back_on = _event().to_domain(tenant_id="t")
+    assert nothing_to_fall_back_on.service_name == UNKNOWN_SERVICE
+
+
+def test_stamped_identity_reaches_the_stored_document() -> None:
+    """`tenant.issuer_id`, `actor.service`, `actor.on_behalf_of` - all mapped."""
+    document = (
+        _event()
+        .to_domain(
+            tenant_id="tenant-a",
+            issuer_id="issuer-77",
+            submitted_by="everycred-backend",
+            on_behalf_of=USER,
+        )
+        .to_document()
+    )
+
+    assert document["tenant"]["issuer_id"] == "issuer-77"
+    assert document["actor"]["service"] == "everycred-backend"
+    assert document["actor"]["on_behalf_of"] == USER
 
 
 # ---------------------------------------------------------------------------

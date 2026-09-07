@@ -65,8 +65,7 @@ than fall back to a guessable value.
 
 | Variable | Notes |
 |---|---|
-| `JWT_SECRET_KEY` | Byte-identical to the main backend's `SIGNIN_SECRET_KEY`. HS256 needs ≥32 bytes — enforced at boot |
-| `SERVICE_API_KEYS` | Comma-separated for rotation with overlap. `openssl rand -hex 32` |
+| `SERVICE_API_KEYS` | **The only credential**, and it carries every scope including `audit:erase` and `audit:cross_tenant`. Comma-separated for rotation with overlap. `openssl rand -hex 32`. Distinct per environment |
 | `PII_MASTER_KEK` | `audit-service generate-kek`. **Losing it makes all encrypted PII permanently unreadable** |
 | `ES_API_KEY` | Scoped key; preferred over `ES_USERNAME`/`ES_PASSWORD` |
 | `AWS_*` | Prefer an instance role / IRSA over static keys |

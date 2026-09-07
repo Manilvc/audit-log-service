@@ -47,7 +47,7 @@ Authoritative detail lives in each file's module docstring.
 | `app.core.middleware` | ASGI middleware package |
 | `app.core.middleware.stack` | Request id, security headers, body limit, rate limit |
 | `app.core.security` | Auth + PII crypto package |
-| `app.core.security.auth` | JWT / API-key → `Principal` + scopes |
+| `app.core.security.auth` | Service API key → `Principal` + scopes |
 | `app.core.security.crypto` | Per-subject AES-GCM + crypto-shredding |
 
 ## `app.domain`

@@ -25,10 +25,10 @@ import re
 from dataclasses import dataclass
 from typing import Final
 
-#: Tenant ids reach us from a JWT claim and end up inside an index name, so they
-#: are validated rather than trusted. Anything outside this alphabet is rejected
-#: before it can influence a URL path - the index-name equivalent of SQL
-#: injection defence.
+#: Tenant ids reach us from a request header and end up inside an index name, so
+#: they are validated rather than trusted. Anything outside this alphabet is
+#: rejected before it can influence a URL path - the index-name equivalent of
+#: SQL injection defence.
 _TENANT_ID_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 
 #: Elasticsearch forbids these in index names; the regex above already excludes

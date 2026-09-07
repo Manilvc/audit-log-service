@@ -16,12 +16,6 @@ import pytest
 # because Settings validates at construction and the module-level app in
 # app.main builds one on import.
 os.environ.setdefault("ENVIRONMENT", "local")
-os.environ.setdefault(
-    "JWT_SECRET_KEY",
-    # 32+ bytes: HS256 requires it, and Settings now enforces it at startup.
-    "unit-test-signing-secret-0123456789abcdef",
-)
-os.environ.setdefault("JWT_AUDIENCE", "everycred-api")
 os.environ.setdefault("ES_HOSTS", "http://localhost:9200")
 os.environ.setdefault("ES_USERNAME", "elastic")
 os.environ.setdefault("ES_PASSWORD", "test-password")

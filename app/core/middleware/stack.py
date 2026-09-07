@@ -91,6 +91,8 @@ API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-act
 #:   and injects its stylesheet at runtime.
 #: * `blob:` workers, which ReDoc uses for search indexing.
 #: * `data:` images for the icons it inlines.
+#:
+#: Note `connect-src 'self'`: the page fetches `openapi.json` from this origin.
 REDOC_CSP = (
     "default-src 'none'; "
     "script-src 'self' 'unsafe-inline'; "
@@ -102,24 +104,28 @@ REDOC_CSP = (
     "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 )
 
-#: CSP for Swagger UI at `/docs`.
+#: CSP for the interactive Swagger console at `/docs`.
 #:
-#: Unlike ReDoc this one is still FastAPI's stock page, which loads its bundle
-#: and stylesheet from jsDelivr, so that origin has to be allowed for the page
-#: to render at all - under `default-src 'none'` it returns 200 and then draws
-#: nothing, with the reason visible only in the browser console.
+#: No external origin, because `swagger-ui-dist` is vendored under `app/static`
+#: alongside ReDoc and the route is rebuilt in `_install_docs` to point at it.
+#: FastAPI's stock page loads the bundle from jsDelivr and the favicon from
+#: fastapi.tiangolo.com; on a network that cannot reach either - which is where
+#: an audit service tends to live - it returns 200 and then draws nothing, with
+#: the reason visible only in the browser console.
 #:
-#: It is the interactive console rather than the reference, so the looser policy
-#: buys "try it out" against a live server. Vendoring `swagger-ui-dist` the way
-#: ReDoc is vendored would let this collapse into REDOC_CSP.
+#: Identical to REDOC_CSP but for `worker-src`, which Swagger UI does not use.
+#: Kept as its own constant so relaxing one page cannot silently relax the other.
 SWAGGER_CSP = (
     "default-src 'none'; "
-    "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
-    "style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
-    "font-src 'self' https://cdn.jsdelivr.net data:; "
-    "img-src 'self' https://fastapi.tiangolo.com data:; "
+    # Inline script: the `SwaggerUIBundle({...})` initialiser is in the page.
+    "script-src 'self' 'unsafe-inline'; "
+    # Inline style: Swagger UI sets element styles as it renders.
+    "style-src 'self' 'unsafe-inline'; "
+    "font-src 'self' data:; "
+    "img-src 'self' data:; "
+    # The page fetches `openapi.json` from this origin, and "try it out" calls
+    # the API on it too.
     "connect-src 'self'; "
-    "worker-src 'self' blob:; "
     "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
 )
 
@@ -147,9 +153,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: NextCall) -> Response:
         response = await call_next(request)
+        # `scope["path"]`, not `request.url.path`: the latter includes the ASGI
+        # root_path, so behind a sub-path mount (`--root-path /audit`) it reads
+        # "/audit/docs" and matches no key here. The documentation pages then
+        # silently received the strict API policy and rendered blank, which is
+        # exactly how this was found in the shared-domain deployment.
+        #
         # Exact path match, not a prefix test: `startswith("/docs")` would also
         # relax a route like `/docs-export` if one were ever added.
-        csp = self._csp_overrides.get(request.url.path, API_CSP)
+        csp = self._csp_overrides.get(request.scope.get("path", ""), API_CSP)
         response.headers.setdefault("Content-Security-Policy", csp)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
@@ -295,12 +307,9 @@ def _rate_limit_identity(request: Request) -> str:
 
         return "svc:" + hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
-    auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer "):
-        import hashlib
-
-        return "usr:" + hashlib.sha256(auth[7:].encode()).hexdigest()[:16]
-
+    # No key: the request will be rejected by the authenticator, so bucket it by
+    # source address. That is what keeps a flood of unauthenticated requests
+    # from sharing one bucket and rate-limiting each other into noise.
     client = request.client
     return f"ip:{client.host if client else 'unknown'}"
 

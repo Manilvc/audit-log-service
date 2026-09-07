@@ -53,9 +53,13 @@ class QueryValidationError(ValueError):
 class TenantScope:
     """The authorised tenant boundary for one query.
 
-    Constructed only by the auth layer from verified token claims, never from
-    request parameters. `cross_tenant` requires the `audit:cross_tenant` scope
-    and is audited at CRITICAL severity every time it is used.
+    Built by `QueryService.resolve_scope` from the `x-audit-tenant-id` header,
+    never from a body field or a query parameter a caller can restate. The
+    header is shape-checked and taken as given: the backend in front of this
+    service resolved and authorised that tenant before calling.
+
+    `cross_tenant` requires the `audit:cross_tenant` scope and is audited at
+    CRITICAL severity every time it is used.
     """
 
     tenant_id: str | None

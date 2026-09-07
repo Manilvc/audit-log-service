@@ -70,7 +70,7 @@ audit/
 │   │   ├── config.py           typed settings + boot-time prod hardening
 │   │   ├── integrity.py        canonical JSON + hash chain (pure functions)
 │   │   ├── security/
-│   │   │   ├── auth.py         JWT / API key → Principal + scopes
+│   │   │   ├── auth.py         Service API key → Principal + scopes
 │   │   │   └── crypto.py       per-subject AES-GCM, crypto-shredding
 │   │   ├── middleware/stack.py request id, security headers, body limit, rate limit
 │   │   ├── exceptions.py       error types + global handlers
@@ -241,6 +241,7 @@ rather than starting and hoping.
 | `unit/test_integrity.py` | `core/integrity.py` — one test per attack class |
 | `unit/test_crypto_shredding.py` | `core/security/crypto.py` |
 | `unit/test_auth.py` | `core/security/auth.py` |
+| `unit/test_identity_headers.py` | `api/deps.py` — tenant, issuer and acting-user headers |
 | `unit/test_chain_allocator.py` | `queue/chain.py` incl. concurrency and leases |
 | `unit/test_ingest_and_schemas.py` | `services/ingest_service.py`, `schemas/api.py` |
 | `unit/test_legacy.py`, `unit/test_backfill.py` | `domain/legacy.py`, `tools/backfill.py` |

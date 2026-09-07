@@ -23,7 +23,7 @@ from app.api.deps import (
     IntegrityServiceDep,
     PrincipalDep,
     QueryServiceDep,
-    TenantHeaderDep,
+    TenantIdDep,
 )
 from app.core.logging import get_logger
 from app.core.responses import ORJSONResponse, success
@@ -61,7 +61,7 @@ async def verify_integrity(
     principal: PrincipalDep,
     integrity: IntegrityServiceDep,
     query: QueryServiceDep,
-    tenant_header: TenantHeaderDep,
+    tenant_header: TenantIdDep,
 ) -> ORJSONResponse:
     """Recompute the hash chain and report any discontinuity.
 
@@ -100,7 +100,7 @@ async def erase_subject(
     principal: PrincipalDep,
     erasure: ErasureServiceDep,
     query: QueryServiceDep,
-    tenant_header: TenantHeaderDep,
+    tenant_header: TenantIdDep,
 ) -> ORJSONResponse:
     """Crypto-shred one data subject's personal data.
 

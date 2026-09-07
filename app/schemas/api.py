@@ -15,7 +15,7 @@ time is not.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
@@ -40,6 +40,12 @@ from app.domain.events import (
 )
 
 Keyword = Annotated[str, StringConstraints(min_length=1, max_length=256, strip_whitespace=True)]
+
+#: Emitter name for an event that did not say where it came from. A sentinel
+#: rather than a real value: `AuditEventIn.to_domain` replaces it with the
+#: authenticated caller, so it survives into storage only when the request did
+#: not name a service either.
+UNKNOWN_SERVICE: Final[str] = "unknown"
 
 
 class AuditEventIn(BaseModel):
@@ -78,7 +84,10 @@ class AuditEventIn(BaseModel):
     http: HttpContext | None = None
     change: Change | None = None
 
-    service_name: Keyword = "unknown"
+    service_name: Keyword = UNKNOWN_SERVICE
+    """Emitter's own name. Left at the default, the authenticated caller's
+    `x-service-name` is recorded instead, so an event is never attributed to
+    "unknown" when the request said who it came from."""
     service_version: str | None = Field(default=None, max_length=64)
     labels: dict[str, Any] = Field(default_factory=dict)
 
@@ -105,12 +114,32 @@ class AuditEventIn(BaseModel):
             raise ValueError("timestamp must include a UTC offset")
         return value
 
-    def to_domain(self, *, tenant_id: str, max_clock_skew_seconds: int | None = None) -> AuditEvent:
+    def to_domain(
+        self,
+        *,
+        tenant_id: str,
+        issuer_id: str | None = None,
+        submitted_by: str | None = None,
+        on_behalf_of: str | None = None,
+        max_clock_skew_seconds: int | None = None,
+    ) -> AuditEvent:
         """Normalise into the strict domain event.
+
+        The three request-level identities fill gaps, never overwrite: an
+        emitter that named its own issuer, service or acting user knows more
+        about that event than the headers do, and silently replacing what it
+        asserted would make the record a worse description of what happened.
 
         Args:
             tenant_id: the resolved tenant, already reconciled against the
                 authenticated principal by the ingest service.
+            issuer_id: issuer from `x-audit-issuer-id`, used when the event
+                carries none of its own.
+            submitted_by: the authenticated caller (`x-service-name`), recorded
+                as `actor.service` and as `service.name` for an event that named
+                neither.
+            on_behalf_of: the user the caller is acting for
+                (`x-audit-on-behalf-of`), recorded as `actor.on_behalf_of`.
             max_clock_skew_seconds: tolerance between the emitter's claimed
                 `timestamp` and receipt time before the event is marked
                 clock-suspect. None disables the check.
@@ -146,13 +175,25 @@ class AuditEventIn(BaseModel):
                     "clock_skew_seconds": skew,
                 }
 
+        actor = self.actor or Actor()
+        if (submitted_by and not actor.service) or (on_behalf_of and not actor.on_behalf_of):
+            # `model_copy` rather than a rebuild: both values were length-checked
+            # at the request boundary, and re-running validation on an event that
+            # has already passed it buys nothing at 500 events a batch.
+            actor = actor.model_copy(
+                update={
+                    "service": actor.service or submitted_by,
+                    "on_behalf_of": actor.on_behalf_of or on_behalf_of,
+                }
+            )
+
         return AuditEvent(
             event_id=self.event_id or str(_new_uuid()),
             timestamp=occurred,
             ingested_at=received,
             tenant_id=tenant_id,
             tenant_name=self.tenant_name,
-            issuer_id=self.issuer_id,
+            issuer_id=self.issuer_id or issuer_id,
             action=self.action,
             category=category,
             type=self.type,
@@ -160,12 +201,16 @@ class AuditEventIn(BaseModel):
             severity=severity,
             message=self.message,
             reason=self.reason,
-            actor=self.actor or Actor(),
+            actor=actor,
             target=self.target or Target(),
             source=self.source or Source(),
             http=self.http or HttpContext(),
             change=change or Change(),
-            service_name=self.service_name,
+            service_name=(
+                submitted_by
+                if self.service_name == UNKNOWN_SERVICE and submitted_by
+                else self.service_name
+            ),
             service_version=self.service_version,
             labels=labels,
         )

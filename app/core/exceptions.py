@@ -48,6 +48,18 @@ class IngestRejected(AuditServiceError):
     message = "Audit event rejected."
 
 
+class InvalidHeader(AuditServiceError):
+    """An identity header is present but unusable.
+
+    400 rather than a silent truncation: these values become the attribution on
+    an immutable record, and a half-written actor id is worse than a rejected
+    request the caller can fix.
+    """
+
+    status_code = status.HTTP_400_BAD_REQUEST
+    message = "A request header is malformed."
+
+
 class RateLimited(AuditServiceError):
     """Caller exceeded the configured per-principal rate ceiling."""
 
@@ -92,11 +104,10 @@ def register_exception_handlers(app: FastAPI) -> None:
             request_id=_request_id(request),
             reason=str(exc),
         )
-        # WWW-Authenticate is required by RFC 7235 on a 401 so clients know how
-        # to retry, and it is the signal for a token-refresh flow.
-        response = _respond(status.HTTP_401_UNAUTHORIZED, "Authentication required.")
-        response.headers["WWW-Authenticate"] = "Bearer"
-        return response
+        # No WWW-Authenticate header: the credential is a custom header rather
+        # than an HTTP authentication scheme, and advertising `Bearer` here
+        # would tell a client to retry with a token this service cannot accept.
+        return _respond(status.HTTP_401_UNAUTHORIZED, "Authentication required.")
 
     @app.exception_handler(AuthorizationError)
     async def _authz_error(request: Request, exc: AuthorizationError) -> ORJSONResponse:
@@ -155,10 +166,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException) -> ORJSONResponse:
-        response = _respond(exc.status_code, str(exc.detail))
-        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
-            response.headers["WWW-Authenticate"] = "Bearer"
-        return response
+        return _respond(exc.status_code, str(exc.detail))
 
     @app.exception_handler(ESApiError)
     async def _es_api_error(request: Request, exc: ESApiError) -> ORJSONResponse:

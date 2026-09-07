@@ -175,10 +175,12 @@ def test_cross_tenant_scope_omits_the_filter_deliberately() -> None:
 
 
 def test_self_restriction_cannot_be_widened_by_criteria() -> None:
-    """An unscoped user token is pinned to its own events.
+    """A scope pinned to one actor cannot be widened by request criteria.
 
     Even when the caller asks for other actors, the scope's `actor.id` clause
-    remains, so the result set can only narrow.
+    remains, so the result set can only narrow. Nothing sets `actor_id` from
+    the credential today, but the clause is the mechanism any future
+    self-service view would rely on, so it stays covered.
     """
     scope = TenantScope(tenant_id="tenant-a", actor_id="me")
     query = build_query(
@@ -236,9 +238,9 @@ def test_issuer_scope_is_applied_and_not_overridable() -> None:
 def test_tenant_id_validation_rejects_hostile_values(hostile: str) -> None:
     """Tenant ids are interpolated into index names, so they are validated.
 
-    A tenant id arrives from a JWT claim or a header. Unvalidated, a comma or a
-    wildcard would let a caller widen a query to other tenants' indices - the
-    index-name equivalent of SQL injection.
+    A tenant id arrives from the `x-audit-tenant-id` header. Unvalidated, a
+    comma or a wildcard would let a caller widen a query to other tenants'
+    indices - the index-name equivalent of SQL injection.
     """
     with pytest.raises(InvalidTenantError):
         TenantRouter.validate_tenant_id(hostile)

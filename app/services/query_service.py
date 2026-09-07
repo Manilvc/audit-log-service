@@ -31,7 +31,7 @@ from app.schemas.api import (
 )
 from app.search.query import AuditSearchFilter, TenantScope
 from app.search.repository import AuditRepository
-from app.search.routing import TenantRouter
+from app.search.routing import InvalidTenantError, TenantRouter
 
 logger = get_logger(__name__)
 
@@ -99,10 +99,16 @@ class QueryService:
     ) -> TenantScope:
         """Derive the authorised query boundary for a principal.
 
+        The tenant comes from the `x-audit-tenant-id` header, which the caller
+        must send: a service key is not bound to a tenant, so there is nothing
+        else to scope the query by. `principal.tenant_id` holds that same header
+        value, captured at authentication time, and serves as the fallback for
+        call sites that do not thread the header through separately.
+
         Raises:
             AuthorizationError: cross-tenant access was requested without the
-                scope, a service named no tenant, or a tenant-scoped caller
-                asked for a tenant other than its own.
+                scope.
+            InvalidTenantError: no tenant was named on a tenant-scoped query.
         """
         if cross_tenant:
             if not principal.has(Scope.CROSS_TENANT):
@@ -111,29 +117,19 @@ class QueryService:
                 )
             return TenantScope(tenant_id=None, cross_tenant=True)
 
-        if principal.is_service:
-            tenant_id = requested_tenant_id or principal.tenant_id
-            if not tenant_id:
-                raise AuthorizationError(
-                    "a service must name the tenant it is querying via x-audit-tenant-id"
-                )
-        else:
-            tenant_id = principal.tenant_id
-            if not tenant_id:
-                raise AuthorizationError("token carries no tenant_id claim")
-            # A user token may never be redirected at another tenant, even by an
-            # admin: crossing a tenant boundary is what audit:cross_tenant is for.
-            if requested_tenant_id and requested_tenant_id != tenant_id:
-                raise AuthorizationError(
-                    "cannot query another tenant; use the audit:cross_tenant scope"
-                )
+        tenant_id = requested_tenant_id or principal.tenant_id
+        if not tenant_id:
+            # 400, not 403: the caller is authenticated and entitled to read -
+            # they simply did not say whose trail. Every tenant-scoped route
+            # takes `TenantIdDep` and fails before reaching this, so this is
+            # the guard for search and aggregate with `cross_tenant=false`.
+            raise InvalidTenantError(
+                "name the tenant you are querying via the x-audit-tenant-id header"
+            )
 
         return TenantScope(
             tenant_id=self._router.validate_tenant_id(tenant_id),
             cross_tenant=False,
-            # An unscoped user token sees only its own events. This is the
-            # narrow default that makes a plain platform token safe to accept.
-            actor_id=principal.subject if principal.restricted_to_self else None,
         )
 
     # ----------------------------------------------------------------- search
@@ -344,6 +340,7 @@ class QueryService:
                 "event_id": None,
                 "timestamp": datetime.now(UTC).isoformat(),
                 "tenant_id": tenant_id,
+                "issuer_id": scope.issuer_id,
                 "action": action.value,
                 "category": EventCategory.AUDIT.value,
                 "type": EventType.ACCESS.value,
@@ -356,7 +353,6 @@ class QueryService:
                 "actor": {
                     "type": principal.actor_type.value,
                     "id": principal.subject,
-                    "session_id": principal.session_id,
                     "on_behalf_of": principal.on_behalf_of,
                     "service": principal.subject if principal.is_service else None,
                 },

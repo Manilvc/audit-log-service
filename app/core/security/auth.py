@@ -1,44 +1,52 @@
 """Authentication and authorisation.
 
-Two kinds of caller
--------------------
-**Service principal** (`x-api-key`). The main backend and its siblings. They have
-already enforced RBAC on the user's behalf, so a service may write events and
-read within a tenant it names explicitly. The key is compared in constant time
-and matched against a list, so keys can be rotated with an overlap window.
+One kind of caller
+------------------
+**Service principal** (`x-api-key`). The main backend and its siblings. They
+have already enforced RBAC on the user's behalf, so a service may write events
+and read within the tenant it names explicitly via the `x-audit-tenant-id`
+header. The key is compared in constant time and matched against a list, so keys
+can be rotated with an overlap window.
 
-**User principal** (`Authorization: Bearer <jwt>`). A platform access token,
-validated with the same secret, issuer and audience the main backend uses, so no
-separate login exists for this service.
+There is no user credential. This service does not validate platform JWTs and
+has no login of its own: it is reachable only by callers holding a service key,
+and the tenant boundary for every call comes from the tenant header rather than
+from a token claim.
 
-Secure by default for user tokens
----------------------------------
-An ordinary platform token carries no audit scopes, and this service has no
-database access to resolve the platform's RBAC tables. Rather than guess, an
-unscoped token is granted exactly one thing: read access to *its own* events,
-with `actor_id` pinned so the filter cannot be widened. Broader access requires
-either a token minted with explicit `audit_scopes`, or a service call from the
-main backend which has already checked `require_permission`.
+Tenant scoping
+--------------
+A service key is not bound to a tenant, so `x-audit-tenant-id` is what decides
+which tenant's records a call may touch. Whoever holds a key can therefore name
+any tenant - the key is the trust boundary, and the caller in front of it (the
+main backend) is responsible for having checked `require_permission` first.
 
-The failure mode of guessing here would be one user reading another's audit
-trail, so the default is the narrowest useful grant rather than the most
-convenient one.
+The header is validated for *shape* only (`TenantRouter.validate_tenant_id`),
+and it is required on every route that touches one tenant's records. Existence
+is not checked, by design: the main backend resolves the tenant from its own
+request context and authorises the user against it before calling, so a lookup
+here would re-answer a question that has already been answered - and would put
+a network call to the caller in front of an audit write. The cost of that choice
+is that a wrong-but-well-formed tenant id is accepted and its events become
+unreachable by the tenant that should own them, which is a caller bug rather
+than a leak: a read for tenant A can still only ever return tenant A's events.
+
+Scope grant
+-----------
+A valid key receives every scope, including ERASE, ADMIN and CROSS_TENANT. That
+is a deliberate choice made when the user credential was removed: those
+operations - crypto-shredding personal data, provisioning streams, reading
+across tenant boundaries - would otherwise be unreachable, because nothing else
+can mint a scoped principal. The consequence is that a leaked key is enough to
+erase a data subject's personal data or read every tenant's trail, so the key
+must be treated as a high-value secret: distinct per environment, rotated on a
+schedule, and never shared with a component that only needs to write events.
 """
 
 from __future__ import annotations
 
 import hmac
-import json
-from dataclasses import dataclass, field
-from typing import Any, Final
-
-import jwt
-from jwt import (
-    ExpiredSignatureError,
-    InvalidAudienceError,
-    InvalidIssuerError,
-    InvalidTokenError,
-)
+from dataclasses import dataclass
+from typing import Final
 
 from app.core.config import Settings
 from app.core.logging import get_logger
@@ -46,22 +54,22 @@ from app.domain.enums import ActorType, Scope
 
 logger = get_logger(__name__)
 
-#: Claim carrying explicitly granted audit scopes, when the issuer sets one.
-_SCOPES_CLAIM: Final[str] = "audit_scopes"
-
-#: Header a service uses to name the tenant it is acting for.
+#: Header a service uses to name the tenant it is acting for. With no token to
+#: carry a `tenant_id` claim, this is the sole source of the tenant boundary.
 TENANT_HEADER: Final[str] = "x-audit-tenant-id"
-#: Header a service uses to record which human triggered the call. Recorded in
-#: the audit-of-the-audit trail so a service-mediated read is still attributable.
+#: Header a service uses to record which human triggered the call. Stamped onto
+#: every event the call ingests, and onto the audit-of-the-audit trail, so a
+#: service-mediated write or read is still attributable to a person.
 ON_BEHALF_HEADER: Final[str] = "x-audit-on-behalf-of"
+#: Header naming the issuer (sub-tenant) a call acts within, used as the batch
+#: default for `issuer_id` on events that do not carry their own.
+ISSUER_HEADER: Final[str] = "x-audit-issuer-id"
 API_KEY_HEADER: Final[str] = "x-api-key"
 
-#: Scopes a trusted internal service receives. Notably excludes ERASE and
-#: CROSS_TENANT: destroying personal data and reading across tenants are
-#: deliberate human decisions, not something a service key can do by itself.
-_SERVICE_SCOPES: Final[frozenset[Scope]] = frozenset(
-    {Scope.WRITE, Scope.READ, Scope.VERIFY, Scope.EXPORT}
-)
+#: Scopes a trusted internal service receives. Every scope this service defines:
+#: see the module docstring for why ERASE, ADMIN and CROSS_TENANT are included
+#: and what that means for how the key must be handled.
+_SERVICE_SCOPES: Final[frozenset[Scope]] = frozenset(Scope)
 
 
 class AuthenticationError(Exception):
@@ -77,18 +85,17 @@ class Principal:
     """The authenticated caller."""
 
     subject: str
-    """User UUID, or the service name for a service principal."""
+    """The service name, as the caller declared it for attribution."""
     actor_type: ActorType
     tenant_id: str | None
+    """Tenant named in the `x-audit-tenant-id` header, when one was sent.
+
+    Validated for shape, never for existence. `None` only on the routes that
+    need no tenant: the health probes, and a cross-tenant read.
+    """
     scopes: frozenset[Scope]
-    email: str | None = None
-    session_id: str | None = None
     on_behalf_of: str | None = None
     """The human a service call is acting for, when supplied."""
-    restricted_to_self: bool = False
-    """When true, reads are pinned to this principal's own events."""
-    claims: dict[str, Any] = field(default_factory=dict, repr=False)
-    """Raw token claims. Excluded from repr so they cannot leak into a log."""
 
     def require(self, *needed: Scope) -> None:
         """Assert the caller holds every required scope.
@@ -108,7 +115,12 @@ class Principal:
 
     @property
     def is_service(self) -> bool:
-        """True for machine principals authenticated with ``x-api-key``."""
+        """True for machine principals authenticated with ``x-api-key``.
+
+        Always true today - the service key is the only credential - but the
+        call sites that branch on it read more clearly than a bare `True`, and
+        it stays correct if a second principal kind is ever reintroduced.
+        """
         return self.actor_type is ActorType.SERVICE
 
     @property
@@ -157,121 +169,3 @@ class Authenticator:
             scopes=_SERVICE_SCOPES,
             on_behalf_of=on_behalf_of,
         )
-
-    # ------------------------------------------------------------------- JWT
-    def verify_jwt(self, token: str) -> Principal:
-        """Validate a platform access token and derive a principal.
-
-        Signature, expiry, audience and issuer are all verified. `require`
-        forces the claims to be present rather than merely consistent - a token
-        without `exp` would otherwise validate forever.
-
-        Raises:
-            AuthenticationError: the token is missing, malformed, expired, or
-                signed for a different audience or issuer.
-        """
-        try:
-            claims = jwt.decode(
-                token,
-                self._settings.JWT_SECRET_KEY.get_secret_value(),
-                algorithms=[self._settings.JWT_ALGORITHM],
-                audience=self._settings.JWT_AUDIENCE,
-                issuer=self._settings.JWT_ISSUER,
-                leeway=self._settings.JWT_LEEWAY_SECONDS,
-                options={
-                    "require": ["exp", "iat", "sub"],
-                    "verify_exp": True,
-                    "verify_aud": True,
-                    "verify_iss": True,
-                    "verify_signature": True,
-                },
-            )
-        except ExpiredSignatureError as exc:
-            raise AuthenticationError("token has expired") from exc
-        except InvalidAudienceError as exc:
-            raise AuthenticationError("token audience does not match this service") from exc
-        except InvalidIssuerError as exc:
-            raise AuthenticationError("token issuer is not recognised") from exc
-        except InvalidTokenError as exc:
-            # Deliberately generic: echoing the library's reason back to the
-            # caller helps an attacker tune a forgery attempt.
-            logger.warning("jwt_rejected", reason=str(exc))
-            raise AuthenticationError("token is invalid") from exc
-
-        identity = _parse_identity(claims.get("sub"))
-        subject = identity.get("uuid") or identity.get("id")
-        if not subject:
-            raise AuthenticationError("token subject carries no user identifier")
-
-        granted = _parse_scopes(claims.get(_SCOPES_CLAIM))
-        restricted = not granted
-        if restricted:
-            # No explicit grant: self-service history only.
-            granted = frozenset({Scope.READ})
-
-        return Principal(
-            subject=str(subject),
-            actor_type=(ActorType.ADMIN if Scope.ADMIN in granted else ActorType.USER),
-            tenant_id=_claim_str(claims.get("tenant_id")),
-            scopes=granted,
-            email=identity.get("email"),
-            session_id=_claim_str(claims.get("sid")),
-            restricted_to_self=restricted,
-            claims=claims,
-        )
-
-
-def _parse_identity(subject: Any) -> dict[str, Any]:
-    """Decode the platform's `sub` claim.
-
-    The main backend stores `json.dumps({"email": ..., "uuid": ...})` in `sub`,
-    but older tokens carry a bare string. Both are accepted so this service does
-    not force a fleet-wide re-login to deploy.
-    """
-    if isinstance(subject, dict):
-        return subject
-    if isinstance(subject, str):
-        text = subject.strip()
-        if text.startswith("{"):
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-        return {"uuid": text}
-    return {}
-
-
-def _parse_scopes(raw: Any) -> frozenset[Scope]:
-    """Parse the scopes claim, ignoring anything unrecognised.
-
-    Unknown scope strings are dropped rather than rejected: a newer issuer may
-    mint a scope this build predates, and failing the whole token would take the
-    service down during a rollout. Dropping is safe because an unknown scope
-    grants nothing.
-    """
-    if raw is None:
-        return frozenset()
-    if isinstance(raw, str):
-        candidates = raw.replace(",", " ").split()
-    elif isinstance(raw, (list, tuple)):
-        candidates = [str(item) for item in raw]
-    else:
-        return frozenset()
-
-    resolved: set[Scope] = set()
-    for candidate in candidates:
-        try:
-            resolved.add(Scope(candidate.strip()))
-        except ValueError:
-            logger.debug("unknown_scope_ignored", scope=candidate)
-    # ADMIN implies the ordinary read/verify/export grants, so an admin token
-    # does not have to enumerate them.
-    if Scope.ADMIN in resolved:
-        resolved |= {Scope.READ, Scope.VERIFY, Scope.EXPORT}
-    return frozenset(resolved)
-
-
-def _claim_str(value: Any) -> str | None:
-    return str(value) if value not in (None, "") else None

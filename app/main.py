@@ -20,9 +20,11 @@ from __future__ import annotations
 import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any, Final
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -45,6 +47,23 @@ from app.core.responses import ORJSONResponse
 from app.search.bootstrap import bootstrap_cluster
 
 logger = get_logger(__name__)
+
+#: Documentation routes. Declared here because three places must agree on them:
+#: the route itself, the CSP override that lets its assets load, and the link
+#: between the two pages.
+DOCS_PATH: Final[str] = "/docs"
+REDOC_PATH: Final[str] = "/redoc"
+
+#: Swagger UI options. `persistAuthorization` is deliberately absent: a valid
+#: key here carries every scope including erase, and keeping it in the browser's
+#: local storage after the tab closes is not a convenience worth that.
+_SWAGGER_UI_PARAMETERS: Final[dict[str, Any]] = {
+    "docExpansion": "list",
+    "defaultModelsExpandDepth": 0,
+    "displayRequestDuration": True,
+    "filter": True,
+    "tryItOutEnabled": True,
+}
 
 # Raw string: the shell examples end lines with a backslash continuation, and
 # in a normal literal Python reads backslash-newline as a line join and eats
@@ -96,25 +115,38 @@ curl -X POST "$AUDIT_URL/v1/audit/events/search" \
 
 # Authentication
 
-Two credentials are accepted and they are **mutually exclusive** - a request
-carrying both is rejected rather than resolved by precedence, because the trail
-has to attribute the call to exactly one identity.
+One credential: the service API key, sent as `x-api-key`. There is no user
+token path - this service validates no platform JWT and runs no login of its
+own, so every caller is an internal service that has already enforced RBAC on
+the user's behalf.
 
-| | Service API key | Platform JWT |
-|---|---|---|
-| Header | `x-api-key` | `Authorization: Bearer <token>` |
-| For | emitting services, machine readers | human callers from the platform UI |
-| Tenant | **you must send** `x-audit-tenant-id` | taken from the token claims |
-| Scopes | full ingest + read | from the token claims (listed below) |
+| | Service API key |
+|---|---|
+| Header | `x-api-key` |
+| For | emitting services, machine readers |
+| Tenant | **you must send** `x-audit-tenant-id` |
+| Scopes | all of them (see below) |
 
-JWT scopes: `audit:read`, `audit:write`, `audit:export`, `audit:erase`,
-`audit:verify`, `audit:admin`, `audit:cross_tenant`.
+A valid key carries every scope: `audit:read`, `audit:write`, `audit:export`,
+`audit:erase`, `audit:verify`, `audit:admin`, `audit:cross_tenant`. The key is
+therefore a high-value secret - it is enough to crypto-shred a data subject's
+personal data or read across every tenant - so keep it distinct per environment
+and rotate it on a schedule.
 
-A service key is not bound to a tenant, so `x-audit-tenant-id` is what tells the
-service which tenant the call acts for. On ingest, an event whose body
-`tenant_id` disagrees with that header is rejected rather than silently
-resolved. When a backend acts for a person, also send `x-audit-on-behalf-of`,
-so the trail attributes the action to the human rather than the service account.
+A key is not bound to a tenant, so `x-audit-tenant-id` is what tells the service
+which tenant the call acts for, and it is required on every tenant-scoped route.
+On ingest, an event whose body `tenant_id` disagrees with that header is rejected
+rather than silently resolved.
+
+Three more headers are recorded rather than checked, and each is stamped onto
+every event the call ingests unless the event already carries its own value:
+
+* `x-audit-on-behalf-of` - the service user, the person the backend is acting
+  for. Recorded as `actor.on_behalf_of`, so a service-mediated action is
+  attributed to the human and not to the service account.
+* `x-audit-issuer-id` - the issuer (sub-tenant), recorded as `tenant.issuer_id`
+  and filterable on search and aggregate.
+* `x-service-name` - the calling service, recorded as `actor.service`.
 
 <SecurityDefinitions />
 
@@ -143,10 +175,11 @@ another tenant returns `404` rather than the record. Pagination is
 cursor-based: pass the `cursor` from the previous response, and page 500 costs
 what page 1 costs.
 
-**Errors.** `401` no or ambiguous credentials, `403` missing scope or another
-tenant's data, `422` schema validation, `429` rate limited - reads are capped
-low because reads are the sensitive surface, ingest is capped high because
-throttling ingest means dropping evidence.
+**Errors.** `400` no tenant named, or an identity header wider than the field it
+is stored in, `401` no or unrecognised credential, `403` missing scope or another
+tenant's data, `422` schema validation, `429` rate limited - reads are capped low
+because reads are the sensitive surface, ingest is capped high because throttling
+ingest means dropping evidence.
 """
 
 
@@ -220,9 +253,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
         # Schema endpoints are off in production: the API shape describes the
         # whole platform's activity model and is reconnaissance value.
-        docs_url="/docs" if resolved.ENABLE_DOCS else None,
-        # ReDoc is served by `_install_docs` instead: the stock page pulls its
-        # bundle and fonts from third-party CDNs, which this one does not.
+        # Both documentation pages are served by `_install_docs` instead. The
+        # stock routes load Swagger UI and ReDoc from third-party CDNs, and an
+        # audit service is exactly the kind of deployment whose browser cannot
+        # reach one - the page then renders blank with no explanation.
+        docs_url=None,
         redoc_url=None,
         openapi_url="/openapi.json" if resolved.ENABLE_DOCS else None,
     )
@@ -242,6 +277,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+def _root_path(request: Request) -> str:
+    """Prefix every asset and schema URL on a documentation page needs.
+
+    Empty on a dedicated host; "/audit" behind the shared-domain mount, where
+    nginx strips the prefix before the app sees the request. An absolute
+    "/static/..." URL would then resolve against the domain root - which the
+    main backend owns - and 404.
+    """
+    return str(request.scope.get("root_path", "")).rstrip("/")
+
+
 def _install_docs(app: FastAPI, settings: Settings) -> None:
     """Serve the vendored ReDoc bundle and the branded reference page.
 
@@ -256,17 +302,37 @@ def _install_docs(app: FastAPI, settings: Settings) -> None:
     static_dir = Path(__file__).resolve().parent / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-    @app.get("/redoc", include_in_schema=False)
-    async def redoc() -> HTMLResponse:
+    @app.get(REDOC_PATH, include_in_schema=False)
+    async def redoc(request: Request) -> HTMLResponse:
         """The API reference, rendered from the schema this service publishes."""
+        root = _root_path(request)
         return HTMLResponse(
             redoc_html(
-                openapi_url=app.openapi_url or "/openapi.json",
+                openapi_url=f"{root}{app.openapi_url or '/openapi.json'}",
                 title=app.title,
-                script_url="/static/redoc.standalone.js",
+                script_url=f"{root}/static/redoc.standalone.js",
                 environment=settings.ENVIRONMENT.value,
-                swagger_url=app.docs_url,
+                swagger_url=f"{root}{DOCS_PATH}",
             )
+        )
+
+    @app.get(DOCS_PATH, include_in_schema=False)
+    async def swagger_ui(request: Request) -> HTMLResponse:
+        """The interactive console, built only from assets this origin serves.
+
+        FastAPI's own `/docs` hardcodes jsDelivr for the bundle and
+        fastapi.tiangolo.com for the favicon, with no setting to redirect them,
+        so the route is rebuilt here against the vendored copies in
+        `app/static`. The version is pinned in `static/swagger-ui.version`.
+        """
+        root = _root_path(request)
+        return get_swagger_ui_html(
+            openapi_url=f"{root}{app.openapi_url or '/openapi.json'}",
+            title=f"{app.title} - Console",
+            swagger_js_url=f"{root}/static/swagger-ui-bundle.js",
+            swagger_css_url=f"{root}/static/swagger-ui.css",
+            swagger_favicon_url=f"{root}/static/favicon.svg",
+            swagger_ui_parameters=_SWAGGER_UI_PARAMETERS,
         )
 
 
@@ -290,6 +356,7 @@ def _install_middleware(app: FastAPI, settings: Settings) -> None:
                 "Content-Type",
                 "x-api-key",
                 "x-audit-tenant-id",
+                "x-audit-issuer-id",
                 "x-audit-on-behalf-of",
                 "x-request-id",
                 "x-service-name",
@@ -308,9 +375,8 @@ def _install_middleware(app: FastAPI, settings: Settings) -> None:
     # production enforces, leaving the strict API policy everywhere.
     csp_overrides = (
         {
-            "/redoc": REDOC_CSP,
-            "/docs": SWAGGER_CSP,
-            "/docs/oauth2-redirect": SWAGGER_CSP,
+            REDOC_PATH: REDOC_CSP,
+            DOCS_PATH: SWAGGER_CSP,
         }
         if settings.ENABLE_DOCS
         else {}

@@ -137,10 +137,7 @@ jobs:
         working-directory: ${{ steps.dir.outputs.path }}
         env:
           ENVIRONMENT: local
-          # Obviously-fake CI values. The 32-byte floor on the JWT key is
-          # enforced at startup (RFC 7518 s.3.2).
-          JWT_SECRET_KEY: ci-only-signing-secret-0123456789abcdef
-          JWT_AUDIENCE: everycred-api
+          # Obviously-fake CI value; the service key is the only credential.
           SERVICE_API_KEYS: ci-only-service-key
           ES_HOSTS: http://localhost:9200
           ES_USERNAME: elastic

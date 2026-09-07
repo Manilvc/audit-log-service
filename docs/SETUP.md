@@ -61,9 +61,7 @@ Edit `.env` for a single-node Docker stack:
 | `ES_HOSTS` | `http://localhost:9200` | Compose publishes 9200 |
 | `REDIS_URL` | `redis://localhost:6379/0` | Compose publishes 6379 |
 | `S3_ENDPOINT_URL` | `http://localhost:9000` | MinIO; SSE headers are skipped automatically |
-| `SERVICE_API_KEYS` | any long secret | Emitters must send the same value as `x-api-key` |
-| `JWT_SECRET_KEY` | ≥32 bytes | Must match main backend `SIGNIN_SECRET_KEY` for JWT reads |
-| `JWT_AUDIENCE` | `everycred-api` | Must match main backend audience |
+| `SERVICE_API_KEYS` | any long secret | The only credential. Emitters send it as `x-api-key`; a valid key carries every scope |
 
 Losing `PII_MASTER_KEK` makes every encrypted field permanently unreadable.
 Do not commit `.env`.
@@ -79,8 +77,15 @@ AUDIT_DUAL_WRITE_ENABLED=true
 AUDIT_SERVICE_TIMEOUT_SECONDS=3.0
 ```
 
-JWT settings on this service must match the platform signing key / audience /
-issuer or Bearer tokens from the main API will fail validation here.
+`AUDIT_SERVICE_API_KEY` is the whole credential: this service accepts no
+platform token, so the main backend must also send `x-audit-tenant-id` naming
+the tenant each call acts for. One key is enough - `SERVICE_API_KEYS` is a list
+only so a rotation can keep the outgoing key valid during the cutover.
+
+Send `x-audit-on-behalf-of` (the service user) and `x-audit-issuer-id` with it:
+both are stamped onto every event in the call, which is what makes a
+service-mediated write attributable to a person and an issuer rather than to a
+service account alone.
 
 ---
 
@@ -278,6 +283,8 @@ curl -s http://localhost:8020/health/ready
 curl -s -X POST http://localhost:8020/v1/audit/events \
   -H "x-api-key: $SERVICE_API_KEY" \
   -H "x-audit-tenant-id: demo-tenant" \
+  -H "x-audit-issuer-id: demo-issuer" \
+  -H "x-audit-on-behalf-of: u-1" \
   -H "x-service-name: everycred-backend" \
   -H "Content-Type: application/json" \
   -d '{
@@ -375,7 +382,7 @@ Re-runs are idempotent on legacy row uuids (`event_id`).
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Settings validation error on boot | Missing `PII_MASTER_KEK` / short JWT secret | Generate KEK; JWT HS256 needs ≥32 bytes (enforced at startup, RFC 7518 §3.2) |
+| Settings validation error on boot | Missing `PII_MASTER_KEK` | Generate one with `audit-service generate-kek` |
 | ES yellow / replica unassigned | `INDEX_REPLICAS=1` on one node | Set `INDEX_REPLICAS=0` locally |
 | ES container exits: `unknown setting [xpack.ilm.enabled]` | That setting was **removed in ES 9.x** — ILM is always on | Drop it from compose / k8s env. Already fixed in `docker-compose.yml` |
 | **Integrity `prev_mismatch` on a fresh tenant** | **A stale worker generation is still running against the same Redis keyspace** — by far the most common cause | Stop *all* workers (see [Run exactly one worker generation](#run-exactly-one-worker-generation)), confirm one lease owner, clear `audit:chain:*`, retest on a new tenant id |
@@ -386,8 +393,11 @@ Re-runs are idempotent on legacy row uuids (`event_id`).
 | `archive_seal_failed` / KMS NotImplemented | SSE sent to MinIO | SSE is skipped automatically when `S3_ENDPOINT_URL` is set (`s3_worm.py`) |
 | Sealed segment vanished from `mc ls` / `s3 ls` | A plain `DeleteObject` wrote a delete marker; the locked version survives | Apply the bucket policy; recover by deleting the *marker* version |
 | Bucket exists without Object Lock | Created without `--with-lock` | New bucket name + re-run init — Object Lock **cannot** be added later |
-| JWT 401 from UI/main backend | Secret / audience / issuer mismatch | Copy values from main backend signing config |
-| JWT accepted but only own events visible | Token carries no `audit_scopes`, so it gets self-service read only | Mint the token with explicit scopes, or call via the backend's service key |
+| 401 from UI/main backend | Sending a Bearer token; this service accepts none | Send `x-api-key` with a value from `SERVICE_API_KEYS` |
+| 400 *the x-audit-tenant-id header is required* | Header missing on a tenant-scoped route | Add it; the key is not bound to a tenant, so nothing else scopes the call |
+| 400 *name the tenant you are querying* | Header missing on search/aggregate without `cross_tenant=true` | Add the header, or pass `cross_tenant=true` if you really mean every tenant |
+| 400 *x-audit-issuer-id must be at most 64 characters* | Issuer header wider than the stored field | Send the issuer UUID, not a composite key |
+| `/docs` or `/redoc` returns 200 but renders blank | A second `Content-Security-Policy` header from nginx; a browser enforces both, and the intersection with the docs policy is "load nothing" | Drop the server-level CSP for the docs paths (`deploy/nginx/audit-subpath.conf` explains it) - the app already sends the right policy per route |
 | Dual-write silent no-ops | Flag or key missing | `AUDIT_DUAL_WRITE_ENABLED=true` and matching API key |
 
 Redis **must** run with `appendonly yes` *and* `maxmemory-policy noeviction`

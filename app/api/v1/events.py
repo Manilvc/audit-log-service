@@ -1,8 +1,8 @@
 """Event ingest, search and export endpoints.
 
-Mounted under ``/v1/audit``. Every route requires an authenticated principal
-(service API key or platform JWT) and a resolved tenant scope — the query
-layer injects the tenant filter; callers cannot omit it.
+Mounted under ``/v1/audit``. Every route requires a valid ``x-api-key`` and a
+tenant named in ``x-audit-tenant-id`` — the query layer injects the tenant
+filter from that header; callers cannot omit it.
 
 Routes
 ------
@@ -27,9 +27,11 @@ from fastapi.responses import StreamingResponse
 
 from app.api.deps import (
     IngestServiceDep,
+    IssuerHeaderDep,
     PrincipalDep,
     QueryServiceDep,
     TenantHeaderDep,
+    TenantIdDep,
 )
 from app.core.exceptions import NotFound
 from app.core.logging import get_logger
@@ -57,7 +59,8 @@ async def ingest_events(
     payload: Annotated[IngestBatchIn, Body()],
     principal: PrincipalDep,
     service: IngestServiceDep,
-    tenant_header: TenantHeaderDep,
+    tenant_header: TenantIdDep,
+    issuer_header: IssuerHeaderDep,
 ) -> ORJSONResponse:
     """Record audit events.
 
@@ -73,6 +76,7 @@ async def ingest_events(
         payload.events,
         principal=principal,
         header_tenant_id=tenant_header,
+        header_issuer_id=issuer_header,
     )
     message = (
         f"{result.accepted} event(s) accepted."
@@ -129,7 +133,7 @@ async def get_event(
     event_id: Annotated[str, Path(max_length=64)],
     principal: PrincipalDep,
     service: QueryServiceDep,
-    tenant_header: TenantHeaderDep,
+    tenant_header: TenantIdDep,
 ) -> ORJSONResponse:
     """Fetch a single event by id.
 
@@ -178,7 +182,7 @@ async def export_events(
     payload: Annotated[ExportRequest, Body()],
     principal: PrincipalDep,
     service: QueryServiceDep,
-    tenant_header: TenantHeaderDep,
+    tenant_header: TenantIdDep,
 ) -> StreamingResponse:
     """Export matching events as newline-delimited JSON.
 

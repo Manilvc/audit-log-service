@@ -58,6 +58,7 @@ class IngestService:
         *,
         principal: Principal,
         header_tenant_id: str | None,
+        header_issuer_id: str | None = None,
     ) -> IngestAccepted:
         """Validate and enqueue a batch.
 
@@ -95,6 +96,13 @@ class IngestService:
             try:
                 event = incoming.to_domain(
                     tenant_id=tenant_id,
+                    issuer_id=header_issuer_id,
+                    # Who actually submitted this, taken from the request rather
+                    # than from the event body. An emitter that forgets to fill
+                    # in its own name or the user it is acting for still produces
+                    # an attributable record.
+                    submitted_by=principal.subject,
+                    on_behalf_of=principal.on_behalf_of,
                     max_clock_skew_seconds=self._settings.MAX_CLOCK_SKEW_SECONDS,
                 )
                 if event.labels.get("clock_skew_suspect"):
@@ -152,26 +160,28 @@ class IngestService:
         """Determine which tenant an event belongs to.
 
         Precedence:
-          1. A user principal's own `tenant_id` claim wins outright. A user
-             token cannot write into another tenant, full stop.
-          2. A service principal uses the `x-audit-tenant-id` header, since it
-             legitimately acts for many tenants.
-          3. A body-supplied `tenant_id` is accepted only when it agrees with
-             the resolved value, so it can never widen access - only confirm it.
+          1. The `x-audit-tenant-id` header, which is how a service names the
+             tenant it is acting for. A service legitimately writes for many
+             tenants, so the tenant is per-request rather than bound to the key.
+          2. A body-supplied `tenant_id`, used only when no header was sent, so
+             a batch can be self-describing. Unreachable over HTTP - the ingest
+             route takes `TenantIdDep` and refuses a call with no header - and
+             kept for callers that are not the route: the CLI, a backfill, a
+             replay.
+          3. When both are present they must agree: a body value can never
+             redirect the write, only confirm it. This is the rule that stays
+             live in production, and the one worth reading first.
 
         Raises:
             IngestRejected: no tenant could be resolved, or the body contradicts
-                the authenticated tenant.
+                the header.
         """
-        authoritative = principal.tenant_id or (header_tenant_id if principal.is_service else None)
-
-        if authoritative is None and principal.is_service:
-            authoritative = body_tenant_id
+        authoritative = header_tenant_id or principal.tenant_id or body_tenant_id
 
         if not authoritative:
             raise IngestRejected(
-                "cannot determine the tenant for this event: the token carries no "
-                "tenant_id and no x-audit-tenant-id header was supplied"
+                "cannot determine the tenant for this event: no x-audit-tenant-id "
+                "header was supplied and the event body carries no tenant_id"
             )
 
         if body_tenant_id and body_tenant_id != authoritative:
@@ -179,12 +189,12 @@ class IngestService:
             # logged at error level, because a correct emitter never does this.
             logger.error(
                 "tenant_mismatch_rejected",
-                authenticated_tenant=authoritative,
+                header_tenant=authoritative,
                 body_tenant=body_tenant_id,
                 principal=principal.audit_identity,
             )
             raise IngestRejected(
-                "tenant_id in the event body does not match the authenticated tenant"
+                "tenant_id in the event body does not match the x-audit-tenant-id header"
             )
 
         return self._router.validate_tenant_id(authoritative)

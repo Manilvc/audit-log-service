@@ -291,7 +291,6 @@ class ErasureService:
                 "actor": {
                     "type": principal.actor_type.value,
                     "id": principal.subject,
-                    "session_id": principal.session_id,
                     "on_behalf_of": principal.on_behalf_of,
                 },
                 "target": {

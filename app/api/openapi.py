@@ -5,11 +5,12 @@ models, and nothing about how a developer is meant to *use* the API. Three gaps
 matter enough to close here, because each one is invisible in the generated
 document and expensive to discover by trial and error:
 
-1. **Authentication is undocumented.** The credentials arrive through plain
-   ``Header`` dependencies, so the generated schema lists ``Authorization`` and
-   ``x-api-key`` as four unexplained optional headers with no security scheme
-   attached. A reader cannot tell that one of the two is mandatory, that they
-   are mutually exclusive, or which one they should be using.
+1. **Authentication is undocumented.** The credential and the tenant header
+   both arrive through plain ``Header`` dependencies, so the generated schema
+   lists them as unexplained optional headers with no security scheme attached.
+   A reader cannot tell that ``x-api-key`` is the credential, that
+   ``x-audit-tenant-id`` is mandatory alongside it on every tenant-scoped
+   route, or that the two do different jobs.
 2. **Tags carry no prose.** ReDoc renders a tag as a navigation heading, so an
    untagged description is a section with a title and no introduction.
 3. **No examples.** A schema tells you a field is a ``Keyword``; an example tells
@@ -28,19 +29,21 @@ from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 
 from app.core.config import Environment, Settings
-from app.core.security.auth import API_KEY_HEADER, ON_BEHALF_HEADER, TENANT_HEADER
+from app.core.security.auth import (
+    API_KEY_HEADER,
+    ISSUER_HEADER,
+    ON_BEHALF_HEADER,
+    TENANT_HEADER,
+)
 
 # ---------------------------------------------------------------------------
 # Security schemes
 # ---------------------------------------------------------------------------
-# Two credentials, deliberately exclusive. `current_principal` rejects a request
-# carrying both rather than picking one by precedence, because the audit trail
-# has to attribute the call to exactly one identity - and a guess would make
-# attribution unreliable for the one system that must never be unreliable.
-#
-# Expressed as two single-scheme entries in `security` rather than one entry
-# with two keys: OpenAPI reads a list as OR and the keys within an entry as AND,
-# so this is the difference between "either credential" and "both at once".
+# One credential, one tenant header, and only the first of them is a security
+# scheme. `x-audit-tenant-id` is not a credential - it grants nothing and is
+# checked only for shape - so describing it as one would tell a reader that
+# naming a tenant is what authorises the call. It is documented as an ordinary
+# required header instead, in `_HEADER_DESCRIPTIONS` below.
 SECURITY_SCHEMES: dict[str, dict[str, Any]] = {
     "ServiceApiKey": {
         "type": "apiKey",
@@ -54,51 +57,59 @@ SECURITY_SCHEMES: dict[str, dict[str, Any]] = {
             "allow-list, which is comma-separated so a key can be rotated with an "
             "overlap window: add the new key, redeploy every emitter, then drop the "
             "old one.\n\n"
+            "A valid key carries every audit scope - including `audit:erase` and "
+            "`audit:cross_tenant` - because it is the only credential this service "
+            "accepts. Treat it accordingly.\n\n"
             "A service principal is not bound to a tenant, so it **must** name the "
             f"tenant it is acting for via the `{TENANT_HEADER}` header."
         ),
     },
-    "PlatformJWT": {
-        "type": "http",
-        "scheme": "bearer",
-        "bearerFormat": "JWT",
-        "description": (
-            "**Human credential.** The same signed token the EveryCRED platform "
-            "already issues - this service validates it with the shared secret "
-            "rather than running its own login.\n\n"
-            "The tenant and the scopes come from the token claims, so a JWT caller "
-            f"cannot widen its own access by sending a different `{TENANT_HEADER}`.\n\n"
-            "Scopes: `audit:read`, `audit:write`, `audit:export`, `audit:erase`, "
-            "`audit:verify`, `audit:admin`, `audit:cross_tenant`."
-        ),
-    },
 }
 
-# Presented to the reader as "either of these", matching what the authenticator
-# actually accepts.
+# The service key is the only credential the authenticator accepts.
 SECURITY_REQUIREMENT: list[dict[str, list[str]]] = [
     {"ServiceApiKey": []},
-    {"PlatformJWT": []},
 ]
 
-# The two credential-bearing headers are described by the schemes above. Left in
-# the parameter list as well, they appear a second time as untyped optional
-# headers, which reads as though they were something else you might also send.
-_CREDENTIAL_HEADERS = frozenset({"authorization", API_KEY_HEADER.lower()})
+# The credential-bearing header is described by the scheme above. Left in the
+# parameter list as well, it appears a second time as an untyped optional
+# header, which reads as though it were something else you might also send.
+_CREDENTIAL_HEADERS = frozenset({API_KEY_HEADER.lower()})
 
-# These two are ordinary headers rather than credentials, so they stay - but the
-# generated schema gives them no description, and both are easy to get wrong.
+# These are ordinary headers rather than credentials, so they stay - but the
+# generated schema gives them no description, and each is easy to get wrong.
 _HEADER_DESCRIPTIONS: dict[str, str] = {
     TENANT_HEADER.lower(): (
-        "Tenant the call acts for. **Required for an API-key caller**, which has no "
-        "tenant of its own. Ignored for a JWT caller, whose tenant comes from the "
-        "token. On ingest, an event whose body `tenant_id` disagrees with this "
-        "header is rejected rather than silently resolved."
+        "Tenant the call acts for. **Required** on every tenant-scoped route: "
+        "the API key is not bound to a tenant, so this header is the only thing "
+        "that scopes the request. It may be omitted only on search and aggregate "
+        "with `cross_tenant=true`.\n\n"
+        "Send the tenant's UUID as your own system knows it. It is checked for "
+        "shape (`[A-Za-z0-9._-]`, 1-63 chars, alphanumeric first) and otherwise "
+        "trusted: **you** are expected to have resolved and authorised the tenant "
+        "before calling, because this service holds no tenant registry to check "
+        "against. A well-formed id for a tenant that does not exist is accepted, "
+        "and its events then belong to a tenant nobody can read.\n\n"
+        "On ingest, an event whose body `tenant_id` disagrees with this header is "
+        "rejected rather than silently resolved."
     ),
     ON_BEHALF_HEADER.lower(): (
-        "The end user a service is acting for, recorded as `actor.on_behalf_of`. "
+        "The end user a service is acting for - the service user id. Stamped "
+        "onto `actor.on_behalf_of` on every event the call ingests, and onto the "
+        "audit-of-the-audit record for every read.\n\n"
         "Set it whenever a backend performs work triggered by a person, so the "
-        "trail attributes the action to the human and not to the service account."
+        "trail attributes the action to the human and not to the service "
+        "account. An event that fills in `actor.on_behalf_of` itself keeps its "
+        "own value."
+    ),
+    ISSUER_HEADER.lower(): (
+        "Issuer (sub-tenant) the call acts within, recorded as `tenant.issuer_id` "
+        "and filterable on search and aggregate.\n\n"
+        "A batch default, not an override: an event carrying its own `issuer_id` "
+        "keeps it, so one call can span several issuers inside a tenant. Unlike "
+        "the tenant header this is descriptive rather than a boundary - reads are "
+        "not scoped by it unless you ask - so at most 64 characters is the only "
+        "constraint."
     ),
 }
 
@@ -248,6 +259,21 @@ _ERASURE_EXAMPLE: dict[str, Any] = {
     "confirm": True,
 }
 
+#: Operations whose route takes `TenantIdDep`, so the tenant header is
+#: mandatory. FastAPI cannot infer this: the dependency declares a `None`
+#: default on purpose, so a missing header produces an explanatory 400 instead
+#: of a bare 422 listing a header name. Curated here like the examples below,
+#: and `tests/unit/test_identity_headers.py` fails if it drifts from the routes.
+_TENANT_REQUIRED_OPERATIONS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("/v1/audit/events", "post"),
+        ("/v1/audit/events/{event_id}", "get"),
+        ("/v1/audit/events/export", "post"),
+        ("/v1/audit/compliance/integrity/verify", "post"),
+        ("/v1/audit/compliance/erasure", "post"),
+    }
+)
+
 #: Keyed by ``(path, method)``, applied to the request body after generation.
 _REQUEST_EXAMPLES: dict[tuple[str, str], dict[str, Any]] = {
     ("/v1/audit/events", "post"): _INGEST_EXAMPLE,
@@ -275,10 +301,25 @@ def _error_example(message: str) -> dict[str, Any]:
 
 
 _COMMON_ERRORS: dict[str, dict[str, Any]] = {
+    "400": {
+        "description": (
+            "No `x-audit-tenant-id` header on a route that acts for one tenant, a "
+            "tenant id that is not shaped like one, or a filter the query builder "
+            "refused. The message says which."
+        ),
+        "content": {
+            "application/json": {
+                "example": _error_example(
+                    "the x-audit-tenant-id header is required: it names the tenant "
+                    "this call acts for, and the API key is not bound to a tenant"
+                )
+            }
+        },
+    },
     "401": {
         "description": (
-            "No credential, an invalid one, or both an API key and a Bearer token "
-            "at once (ambiguous attribution is refused, not resolved)."
+            "No `x-api-key` header, or a key that is not on the allow-list. The "
+            "reason is deliberately not distinguished in the response."
         ),
         "content": {"application/json": {"example": _error_example("no credentials supplied")}},
     },
@@ -335,10 +376,12 @@ def _decorate_operation(path: str, method: str, operation: dict[str, Any]) -> No
         if param.get("in") == "header" and name in _HEADER_DESCRIPTIONS:
             param["description"] = _HEADER_DESCRIPTIONS[name]
             # `str | None` generates an anyOf whose auto-titles render as
-            # "X-Audit-Tenant-Id (string) or X-Audit-Tenant-Id (null)". The
-            # header is an optional string; saying so plainly is both accurate
-            # and readable, and `required` already carries the optionality.
+            # "X-Audit-Tenant-Id (string) or X-Audit-Tenant-Id (null)". It is a
+            # string; saying so plainly is both accurate and readable, and
+            # `required` below carries the optionality.
             param["schema"] = {"type": "string"}
+            if name == TENANT_HEADER.lower():
+                param["required"] = (path, method) in _TENANT_REQUIRED_OPERATIONS
         params.append(param)
     if params:
         operation["parameters"] = params

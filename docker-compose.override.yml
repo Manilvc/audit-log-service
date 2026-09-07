@@ -20,3 +20,30 @@ services:
     # to bind ordering. That is a worse problem than the one being solved.
     ports: !override
       - "6380:6379"
+
+  elasticsearch:
+    # A native Elasticsearch 9.5.2 install on this machine
+    # (C:\Users\Maniljayswal\elasticsearch-9.5.2) already holds host port 9200
+    # and has live connections, so the container cannot publish there.
+    #
+    # Nothing inside the stack needs this published: audit-api and audit-worker
+    # reach Elasticsearch over the compose network as `elasticsearch:9200`. The
+    # host binding is developer convenience only, so it moves to 9201 rather
+    # than fighting the native install.
+    ports: !override
+      - "9201:9200"
+
+  # --- Local workaround for a broken console script in the image ---------------
+  # The Dockerfile builds the venv at /build/.venv and copies it to /app/.venv,
+  # but does not relocate the console script's shebang, so
+  # /app/.venv/bin/audit-service still starts with `#!/build/.venv/bin/python3`
+  # and the container dies with "exec ...: no such file or directory".
+  #
+  # These entrypoints call the same click group through the interpreter directly,
+  # which sidesteps the shebang. The real fix belongs in the Dockerfile (build
+  # the venv at its final path, e.g. ENV UV_PROJECT_ENVIRONMENT=/app/.venv).
+  api:
+    entrypoint: ["/app/.venv/bin/python", "-c", "from app.cli import cli; cli()"]
+
+  worker:
+    entrypoint: ["/app/.venv/bin/python", "-c", "from app.cli import cli; cli()"]

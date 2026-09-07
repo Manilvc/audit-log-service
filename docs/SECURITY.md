@@ -23,7 +23,7 @@ organised around those two facts.
 | T2 | Attacker edits or deletes records to hide activity | Hash chain + WORM checkpoints + no `delete` privilege |
 | T3 | Audit log becomes a PII exfiltration channel | PII encrypted per subject, never indexed |
 | T4 | Forged events inserted to mislead an investigation | Tenant reconciliation on ingest; server-assigned integrity |
-| T5 | Credential theft (service key / JWT) | Constant-time compare, rotatable keys, scope separation |
+| T5 | Service key theft | Constant-time compare, rotatable key list, per-environment keys |
 | T6 | Reads of the audit trail go unnoticed | Audit-of-the-audit on every search and export |
 | T7 | Denial of service via expensive queries | Typed filters only, bounded windows, rate limits |
 | T8 | Secrets leak through logs or error responses | Sink-level redaction; no internals in responses |
@@ -36,48 +36,48 @@ organised around those two facts.
 
 `app/core/security/auth.py`
 
-Two caller types, deliberately distinct:
+One caller type: the **service principal**.
 
 ### Service principal — `x-api-key`
 
-For emitting services that have already enforced RBAC.
+For emitting services that have already enforced RBAC. There is no user
+credential — this service validates no platform token and runs no login of its
+own.
 
 - Compared with `hmac.compare_digest` against a **list**, so keys rotate with an
   overlap window (add new → redeploy emitters → drop old).
 - The loop always runs to completion, so neither the value nor the *position* of
   a matching key is recoverable from response timing.
-- Granted `write`, `read`, `verify`, `export` — deliberately **not** `erase` or
-  `cross_tenant`. Destroying personal data and reading across tenants are human
-  decisions; a leaked service key must not be able to do either.
-
-### User principal — `Authorization: Bearer <JWT>`
-
-A platform access token, validated with the same secret, issuer and audience as
-the main backend, so there is no separate login for this service.
-
-Verified on every request: signature, `exp`, `aud`, `iss`. `options={"require":
-["exp", "iat", "sub"]}` forces the claims to be **present**, not merely
-consistent — a token without `exp` would otherwise validate forever.
+- An empty allow-list denies everything; it never degrades to allow-all
+  (`test_no_key_is_accepted_when_none_are_configured`).
+- A request with no `x-api-key` is rejected before any other work.
 
 | Attack | Defence | Test |
 |---|---|---|
-| `alg: none` | Algorithms pinned in `jwt.decode` | `test_unsigned_token_is_rejected` |
-| Forged signature | HS256 with the platform secret | `test_invalid_tokens_are_rejected` |
-| Token minted for another service | `aud` verified | same |
-| Untrusted issuer | `iss` verified | same |
-| Non-expiring token | `exp` required | `test_token_without_expiry_is_rejected` |
-| Unattributable principal | `sub` must yield a user id | `test_token_without_a_user_identifier_is_rejected` |
+| Guessed key | Full-length constant-time compare, no prefix or case folding | `test_invalid_api_key_is_rejected` |
+| Timing oracle on key position | Loop always runs to completion | `test_valid_api_key_is_accepted` |
+| Dropped `SERVICE_API_KEYS` opening the service | Empty list denies | `test_no_key_is_accepted_when_none_are_configured` |
+| Stale key after rotation | Comma-separated list; drop the old entry to revoke | `test_valid_api_key_is_accepted` |
 
-A weak HMAC key is a startup failure, not a warning: HS256 requires ≥32 bytes
-(RFC 7518 §3.2), enforced in `config.py`. PyJWT only warns; for a service holding
-audit evidence that is not enough.
+No `WWW-Authenticate` header is sent on a 401: the credential is a custom header
+rather than an HTTP authentication scheme, and advertising `Bearer` would tell a
+client to retry with a token this service cannot accept.
 
-**Both credentials present is rejected**, not resolved by precedence — it is
-ambiguous which identity to record in the audit trail, and guessing would make
-attribution unreliable.
+### What the key is worth
 
-Rejection messages are deliberately generic (`"token is invalid"`). Echoing the
-library's reason back helps an attacker tune a forgery attempt.
+A valid key carries **every** scope, including `audit:erase` and
+`audit:cross_tenant`. Those operations were previously reachable only through a
+scoped user token; with that path removed, nothing else can mint a principal
+that holds them.
+
+The consequence is that key custody *is* the access-control boundary:
+
+- A leaked key is enough to crypto-shred a data subject's personal data or read
+  every tenant's trail.
+- Keys must be distinct per environment, rotated on a schedule, and never shared
+  with a component that only needs to write events.
+- The service must not be reachable from outside the cluster; the nginx config
+  in `deploy/` is what enforces that.
 
 ---
 
@@ -98,18 +98,36 @@ library's reason back helps an attacker tune a forgery attempt.
 Checks live in services, not routes, so the CLI and worker get the same
 enforcement without going through HTTP.
 
-### The secure default for unscoped tokens
+### Every scope on one credential
 
-An ordinary platform token carries no audit scopes, and this service has no
-database access to resolve the platform's RBAC tables. Rather than guess, an
-unscoped token is granted exactly one thing: **read access to its own events**,
-with `actor_id` pinned in the query scope so the filter cannot be widened.
+A valid service key holds all seven scopes. The scope checks in the service
+layer are still real — they keep the CLI, the worker and any future credential
+honest, and they are what a second key tier would hook into — but with a single
+credential they no longer separate one caller from another.
 
-This is the narrowest useful grant. Guessing wrong in the other direction would
-let any logged-in user read their whole tenant's audit trail.
+Read `principal.require(...)` as a statement of what an operation costs, not as
+a boundary between callers. The boundary is the key itself.
 
-`audit:admin` implies read/verify/export, but **not** `erase` or `cross_tenant` —
-both stay explicit.
+### Tenant scoping
+
+A key is not bound to a tenant, so `x-audit-tenant-id` is the sole source of the
+tenant boundary on every request. A caller holding a key may therefore name any
+tenant; the caller in front of it (the main backend) is responsible for having
+checked `require_permission` first.
+
+**Required, shape-checked, not verified.** Every route that touches one tenant's
+records takes `require_tenant_id` (`app/api/deps.py`), so a call that names no
+tenant is refused with a 400 at the boundary rather than failing differently on
+each route. What is validated is the *shape* — the same regex that keeps the
+value safe inside an index name. Existence is not checked, and that is a
+decision rather than an omission:
+
+| | |
+|---|---|
+| Why not | The caller has already resolved the tenant from its own request context and authorised the user against it. Re-deriving it here needs a second credential or a tenant registry; looking it up needs a synchronous call **to the caller** in front of every audit write, which couples audit availability to backend availability and can drop evidence during a blip. |
+| Residual risk | A well-formed id for a tenant that does not exist is accepted. Its events land in the shared stream under a tenant nobody reads. |
+| Why that is tolerable | It is a caller bug, not a disclosure. The tenant filter is still applied on every read, so a wrong id makes events *unreachable*, never visible to the wrong tenant. |
+| If it stops being tolerable | The place to add it is `_validated_tenant`, behind a Redis-cached lookup: fail **open** on ingest (never drop evidence) and **closed** on read, export and erasure. |
 
 ---
 
@@ -136,13 +154,18 @@ Additional layers:
 |---|---|
 | Storage | Dedicated streams map `tenant.id` as `constant_keyword`, so **Elasticsearch itself rejects** a document with the wrong tenant id |
 | Index naming | Tenant ids are regex-validated before reaching an index name — rejects `*`, `,`, `..`, spaces and other index-name metacharacters |
+| API boundary | `require_tenant_id` refuses a tenant-scoped call that names no tenant (400), and normalises the one it accepts, so `" t1"` and `"t1"` cannot become two partitions |
 | Single-event fetch | `GET /events/{id}` is a filtered **search**, not a document GET, so id-guessing cannot cross a tenant |
-| Ingest | A body `tenant_id` may only *confirm* the authenticated tenant, never widen it; a mismatch is logged at error level |
+| Ingest | A body `tenant_id` may only *confirm* the `x-audit-tenant-id` header, never redirect the write; a mismatch is logged at error level |
 | Cross-tenant | Requires `audit:cross_tenant` and is itself audited as `audit_log.cross_tenant_access` at CRITICAL |
 
 `tests/unit/test_tenant_isolation.py` — 86 tests — asserts the tenant clause is
 present, singular and top-level across every filter permutation and pairwise
 combination, and that hostile tenant ids are rejected.
+`tests/unit/test_identity_headers.py` covers the boundary itself: a call naming
+no tenant is refused on every tenant-scoped route, malformed ids never reach an
+index name, the issuer and acting-user headers are length-bounded, and the
+OpenAPI document cannot drift from what the routes enforce.
 
 ---
 
@@ -264,7 +287,7 @@ Supporting properties:
 | Secrets typed `SecretStr`, so a stray f-string prints `**********` | `core/config.py` |
 | 33 credential-shaped keys redacted from `labels` and `change` diffs at the API boundary | `domain/events.py` → `REDACT_KEYS` |
 | Redaction at the **log sink**, not the call site | `core/logging.py` |
-| Substring matching catches `db_password`, `jwt_secret_key`, `api_key_value` | `core/logging.py` |
+| Substring matching catches `db_password`, `service_api_key`, `api_key_value` | `core/logging.py` |
 | Redaction is depth-bounded | A cyclic or hostile payload cannot turn a log call into a stack overflow |
 | `Principal.claims` excluded from `repr` | Token claims cannot reach a log line accidentally |
 | Rate-limit keys hash the credential | The raw key never appears in Redis, visible to `MONITOR` or a keyspace dump |

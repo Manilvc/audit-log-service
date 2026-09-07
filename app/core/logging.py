@@ -27,7 +27,7 @@ from app.domain.events import REDACT_KEYS, REDACTED_PLACEHOLDER
 _configured = False
 
 #: Substrings that mark a key as sensitive even when it is not an exact match
-#: in REDACT_KEYS - catches `db_password`, `jwt_secret_key`, `api_key_value`.
+#: in REDACT_KEYS - catches `db_password`, `service_api_key`, `api_key_value`.
 _SENSITIVE_SUBSTRINGS = ("password", "secret", "token", "api_key", "apikey", "private")
 
 

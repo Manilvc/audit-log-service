@@ -69,7 +69,6 @@ a different major version.
 | `elasticsearch[async]` | `>=9,<10` | 9.5.0 | Async ES client |
 | `redis[hiredis]` | `>=5` | 8.1.0 | Streams client (`>=5` for `XAUTOCLAIM`) |
 | `aioboto3` | `>=13` | 15.5.0 | Async S3 for the WORM archive |
-| `pyjwt` | `>=2.9` | 2.13.0 | Platform token verification |
 | `cryptography` | `>=43` | 50.0.1 | AES-256-GCM, HKDF |
 | `structlog` | `>=24.4` | 26.1.0 | Structured logging + redaction |
 | `prometheus-client` | `>=0.21` | 0.26.0 | Metrics |
@@ -277,8 +276,8 @@ data-leak bug, not a style problem.
 
 | Contract | Value |
 |---|---|
-| JWT algorithm | HS256, key shared with `SIGNIN_SECRET_KEY` |
-| JWT claims read | `sub` (JSON `{email, uuid}`), `tenant_id`, `sid`, `aud`, `iss` |
+| Credential | Service API key in `x-api-key`, matched in constant time |
+| Tenant scoping | `x-audit-tenant-id` header, required on every request |
 | Service auth | `x-api-key`, constant-time compare against a rotatable list |
 | Tenant header | `x-audit-tenant-id` |
 | Attribution header | `x-audit-on-behalf-of` |
