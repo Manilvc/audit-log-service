@@ -130,6 +130,32 @@ SWAGGER_CSP = (
 )
 
 
+def _route_path(request: Request) -> str:
+    """The path the routes matched on, whatever prefix the deployment adds.
+
+    Three values disagree behind a sub-path mount, and which of them is the
+    route path depends on the proxy:
+
+    * `request.url.path` always carries the prefix - "/audit/docs".
+    * `scope["path"]` carries it only when the proxy forwards the full path.
+      nginx `proxy_pass http://upstream;` forwards it; the same directive with a
+      trailing slash strips it, and the app then sees "/docs".
+    * `scope["root_path"]` is the prefix itself, from uvicorn `--root-path`.
+
+    Matching on either raw path is wrong under one of those two nginx styles,
+    and the failure is silent: a documentation route falls through to the strict
+    API policy, and the page returns 200 and renders nothing. FastAPI strips the
+    prefix before matching routes, so the same is done here.
+    """
+    path = str(request.scope.get("path", ""))
+    root = str(request.scope.get("root_path", "")).rstrip("/")
+    # The boundary check matters: without it a root_path of "/audit" would also
+    # rewrite an unrelated "/auditlog" route.
+    if root and (path == root or path.startswith(f"{root}/")):
+        return path[len(root) :] or "/"
+    return path
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Adds defensive response headers.
 
@@ -153,15 +179,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: NextCall) -> Response:
         response = await call_next(request)
-        # `scope["path"]`, not `request.url.path`: the latter includes the ASGI
-        # root_path, so behind a sub-path mount (`--root-path /audit`) it reads
-        # "/audit/docs" and matches no key here. The documentation pages then
-        # silently received the strict API policy and rendered blank, which is
-        # exactly how this was found in the shared-domain deployment.
+        # Keyed on the route path rather than the request path: behind the
+        # shared-domain mount the request is "/audit/docs", which matches no key
+        # here, and the documentation pages then silently received the strict API
+        # policy and rendered blank. See `_route_path`.
         #
         # Exact path match, not a prefix test: `startswith("/docs")` would also
         # relax a route like `/docs-export` if one were ever added.
-        csp = self._csp_overrides.get(request.scope.get("path", ""), API_CSP)
+        csp = self._csp_overrides.get(_route_path(request), API_CSP)
         response.headers.setdefault("Content-Security-Policy", csp)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")

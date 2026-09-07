@@ -9,9 +9,15 @@ practice, and neither is visible from the route definitions:
 * every asset URL has to carry the ASGI root_path.
 
 Both failed in the shared-domain deployment (`--root-path /audit`), where the
-page returned 200 and rendered blank: `request.url.path` includes the root_path,
-so the CSP override keyed on "/docs" never matched, and the asset URLs resolved
-against the domain root, which another service owns.
+page returned 200 and rendered blank: the CSP override keyed on "/docs" never
+matched the request path, and the asset URLs resolved against the domain root,
+which another service owns.
+
+The mount is parameterised because the prefix reaches the app differently
+depending on one character in the nginx config: `proxy_pass http://upstream;`
+forwards "/audit/docs", while the same line with a trailing slash strips it and
+the app sees "/docs". Both must work - the first is what production runs, and
+it is the case the original fix still got wrong.
 """
 
 from __future__ import annotations
@@ -42,19 +48,24 @@ def _assets(html: str) -> list[str]:
     return sorted(set(re.findall(r'(?:src|href)="([^"]+)"', html)))
 
 
+#: (root_path, prefix the proxy leaves on the request). The third case is
+#: production: nginx forwards the full path and uvicorn is told the prefix.
+MOUNTS = [("", ""), ("/audit", ""), ("/audit", "/audit")]
+
+
 @pytest.mark.usefixtures("container_stub")
-@pytest.mark.parametrize("root_path", ["", "/audit"])
+@pytest.mark.parametrize(("root_path", "prefix"), MOUNTS)
 @pytest.mark.parametrize("path", [DOCS_PATH, REDOC_PATH])
-def test_docs_page_renders_with_its_own_csp(root_path: str, path: str) -> None:
+def test_docs_page_renders_with_its_own_csp(root_path: str, prefix: str, path: str) -> None:
     """The strict API policy on a docs route is a blank page, not an error."""
     client = TestClient(app, root_path=root_path)
-    response = client.get(path)
+    response = client.get(f"{prefix}{path}")
 
     assert response.status_code == 200
     csp = response.headers["content-security-policy"]
     assert csp != API_CSP, (
-        f"{path} under root_path={root_path!r} got the API policy; its assets "
-        "cannot load and the page renders blank"
+        f"{prefix}{path} under root_path={root_path!r} got the API policy; its "
+        "assets cannot load and the page renders blank"
     )
     assert "script-src 'self'" in csp
 
@@ -69,16 +80,16 @@ def test_docs_pages_load_nothing_from_a_third_party(path: str) -> None:
 
 
 @pytest.mark.usefixtures("container_stub")
-@pytest.mark.parametrize("root_path", ["", "/audit"])
+@pytest.mark.parametrize(("root_path", "prefix"), MOUNTS)
 @pytest.mark.parametrize("path", [DOCS_PATH, REDOC_PATH])
-def test_every_asset_a_docs_page_names_is_fetchable(root_path: str, path: str) -> None:
+def test_every_asset_a_docs_page_names_is_fetchable(root_path: str, prefix: str, path: str) -> None:
     """Each URL in the page resolves under the same mount that produced it.
 
     This is what catches a missing root_path: the page still renders, but its
     bundle 404s against the domain root and the page is blank.
     """
     client = TestClient(app, root_path=root_path)
-    html = client.get(path).text
+    html = client.get(f"{prefix}{path}").text
 
     references = _assets(html)
     assert references, f"{path} referenced no assets at all"
