@@ -239,14 +239,24 @@ def build_search_body(
     source_fields: list[str] | None = None,
     timeout: str = "20s",
     ascending: bool = False,
+    sort_date_format: str | None = "strict_date_optional_time",
 ) -> dict[str, Any]:
-    """Full search body, tuned for the audit access pattern."""
+    """Full search body, tuned for the audit access pattern.
+
+    `sort_date_format` comes from the backend: Elasticsearch formats the sort
+    value (and therefore the `search_after` cursor), while OpenSearch rejects
+    the key. The default keeps Elasticsearch behaviour for any caller that does
+    not thread it through.
+    """
     order = "asc" if ascending else "desc"
+    timestamp_sort: dict[str, Any] = {"order": order}
+    if sort_date_format is not None:
+        timestamp_sort["format"] = sort_date_format
     body: dict[str, Any] = {
         "query": build_query(scope, criteria, max_window_days=max_window_days),
         "size": size,
         "sort": [
-            {"@timestamp": {"order": order, "format": "strict_date_optional_time"}},
+            {"@timestamp": timestamp_sort},
             {SORT_TIEBREAKER: {"order": order}},
         ],
         "track_total_hits": track_total_hits,

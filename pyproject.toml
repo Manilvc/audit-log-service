@@ -26,7 +26,6 @@ dependencies = [
     "pydantic[email]>=2.9",
     "pydantic-settings>=2.5",
     "python-multipart>=0.0.12",
-
     # --- Elasticsearch -----------------------------------------------------
     # Pinned to the 8.x line to match the deployed cluster (8.19.20). The
     # client sends an `Accept: ...compatible-with=<major>` header and an 8.x
@@ -34,26 +33,22 @@ dependencies = [
     # or 7"). An 8.x client is still accepted by a 9.x node, so this is the
     # safe side to sit on until the server is upgraded; bump both together.
     "elasticsearch[async]>=8.19,<9",
-
     # --- Durable ingest buffer (Redis Streams) -----------------------------
     # >=5 for XAUTOCLAIM support, which the stale-entry recovery path needs.
     "redis[hiredis]>=5",
-
     # --- WORM archive (S3 Object Lock) -------------------------------------
     "aioboto3>=13",
-
     # --- Security / crypto -------------------------------------------------
     "cryptography>=43",
-
     # --- Observability -----------------------------------------------------
     "structlog>=24.4",
     "prometheus-client>=0.21",
-
     # --- Misc --------------------------------------------------------------
     "click>=8.1",
     "orjson>=3.10",
     "httpx>=0.27",
     "python-dotenv>=1.0",
+    "opensearch-py[async]>=2.8,<3",
 ]
 
 [project.optional-dependencies]

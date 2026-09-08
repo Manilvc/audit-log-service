@@ -4,23 +4,33 @@ Runs on startup and from `audit-service bootstrap`. Applying the topology from
 code rather than a runbook means a new environment cannot drift, and a template
 change ships with the deploy that needs it.
 
-Ordering is not incidental. The ILM policy must exist before a template
+Ordering is not incidental. The retention policy must exist before a template
 references it, and the template must exist before the first document creates a
 data stream - a stream created without a template gets dynamic mapping, which
 would defeat `dynamic: strict` and quietly index PII.
+
+Engine-agnostic: the provisioning steps are the same on both stores, and the
+two that differ in shape - the retention policy document and the field types -
+are rendered by the backend.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from elasticsearch import AsyncElasticsearch, BadRequestError, NotFoundError
-
 from app.core.config import Settings
+from app.core.constants import API_KEY_INDEX_SUFFIX
 from app.core.logging import get_logger
+from app.search.backends import (
+    RetentionPolicy,
+    SearchBackend,
+    SearchConflict,
+    SearchNotFound,
+    SearchRejected,
+)
 from app.search.mappings import (
+    api_key_index_settings,
     dedicated_index_template,
-    ilm_policy,
     keyring_index_settings,
     shared_index_template,
 )
@@ -54,60 +64,84 @@ def keyring_index_name(settings: Settings) -> str:
     return f"{settings.INDEX_PREFIX}-keyring-v1"
 
 
+def api_key_index_name(settings: Settings) -> str:
+    """Stable name of the issued-API-key index for this deployment."""
+    return f"{settings.INDEX_PREFIX}-{API_KEY_INDEX_SUFFIX}"
+
+
 async def bootstrap_cluster(
-    client: AsyncElasticsearch,
+    backend: SearchBackend,
     settings: Settings,
     router: TenantRouter,
 ) -> dict[str, Any]:
-    """Apply ILM policy, index templates, the keyring index and data streams.
+    """Apply the retention policy, templates, keyring index and data streams.
 
     Returns a summary of what was applied, which the startup log records so a
     deploy leaves evidence of the topology it created.
     """
     summary: dict[str, Any] = {}
 
-    # 1. ILM policy -----------------------------------------------------------
-    policy = ilm_policy(
-        retention_days=settings.RETENTION_DAYS,
-        rollover_max_primary_shard_size=settings.ROLLOVER_MAX_PRIMARY_SHARD_SIZE,
-        rollover_max_age=settings.ROLLOVER_MAX_AGE,
+    # 1. Retention policy -----------------------------------------------------
+    await backend.ensure_lifecycle_policy(
+        name=settings.ILM_POLICY_NAME,
+        retention=RetentionPolicy(
+            retention_days=settings.RETENTION_DAYS,
+            rollover_max_primary_shard_size=settings.ROLLOVER_MAX_PRIMARY_SHARD_SIZE,
+            rollover_max_age=settings.ROLLOVER_MAX_AGE,
+        ),
+        # Both audit patterns, so an engine that attaches retention by pattern
+        # covers the shared stream and every dedicated one.
+        index_patterns=(router.shared_pattern(), router.dedicated_pattern()),
     )
-    await client.ilm.put_lifecycle(name=settings.ILM_POLICY_NAME, policy=policy["policy"])
-    summary["ilm_policy"] = settings.ILM_POLICY_NAME
+    summary["engine"] = backend.name
+    summary["lifecycle_policy"] = settings.ILM_POLICY_NAME
 
     # 2. Index templates ------------------------------------------------------
     shared = shared_index_template(
         name_pattern=router.shared_pattern(),
         shards=settings.SHARED_SHARD_COUNT,
         replicas=settings.INDEX_REPLICAS,
-        ilm_policy_name=settings.ILM_POLICY_NAME,
+        backend=backend,
+        policy_name=settings.ILM_POLICY_NAME,
     )
     shared_name = shared_template_name(settings)
-    await client.indices.put_index_template(name=shared_name, **shared)
+    await backend.put_index_template(name=shared_name, template=shared)
 
     dedicated = dedicated_index_template(
         name_pattern=router.dedicated_pattern(),
         shards=settings.DEDICATED_SHARD_COUNT,
         replicas=settings.INDEX_REPLICAS,
-        ilm_policy_name=settings.ILM_POLICY_NAME,
+        backend=backend,
+        policy_name=settings.ILM_POLICY_NAME,
     )
     dedicated_name = dedicated_template_name(settings)
-    await client.indices.put_index_template(name=dedicated_name, **dedicated)
+    await backend.put_index_template(name=dedicated_name, template=dedicated)
     summary["templates"] = [shared_name, dedicated_name]
 
     # 3. Keyring index --------------------------------------------------------
     keyring = keyring_index_name(settings)
-    if not await client.indices.exists(index=keyring):
+    if not await backend.index_exists(index=keyring):
         try:
-            await client.indices.create(
+            await backend.create_index(
                 index=keyring, **keyring_index_settings(replicas=settings.INDEX_REPLICAS)
             )
             logger.info("keyring_index_created", index=keyring)
-        except BadRequestError as exc:
-            # Another replica won the race between exists() and create().
-            if "resource_already_exists_exception" not in str(exc):
-                raise
+        except SearchConflict:
+            # Another replica won the race between the check and the create.
+            logger.info("keyring_index_race_lost", index=keyring)
     summary["keyring_index"] = keyring
+
+    # 3b. Issued API key index ------------------------------------------------
+    api_keys = api_key_index_name(settings)
+    if not await backend.index_exists(index=api_keys):
+        try:
+            await backend.create_index(
+                index=api_keys, **api_key_index_settings(replicas=settings.INDEX_REPLICAS)
+            )
+            logger.info("api_key_index_created", index=api_keys)
+        except SearchConflict:
+            logger.info("api_key_index_race_lost", index=api_keys)
+    summary["api_key_index"] = api_keys
 
     # 4. Data streams ---------------------------------------------------------
     # Created eagerly so a search before the first write returns an empty
@@ -117,7 +151,7 @@ async def bootstrap_cluster(
         router.shared_pattern(),
         *(router.dedicated_stream_name(tenant) for tenant in sorted(settings.dedicated_tenant_set)),
     ):
-        if await _ensure_data_stream(client, stream):
+        if await _ensure_data_stream(backend, stream):
             created.append(stream)
     summary["data_streams_created"] = created
 
@@ -125,23 +159,15 @@ async def bootstrap_cluster(
     return summary
 
 
-async def _ensure_data_stream(client: AsyncElasticsearch, name: str) -> bool:
+async def _ensure_data_stream(backend: SearchBackend, name: str) -> bool:
     """Create a data stream if absent. Returns True when it was created.
 
-    The existence check inspects the response *body*, not just the status code.
-    Elasticsearch 9.x answers ``GET /_data_stream/<name>`` for a stream that does
-    not exist with **HTTP 200 and an empty ``data_streams`` list**, not a 404.
-    Relying on ``NotFoundError`` alone therefore reports every missing stream as
-    already present, and nothing is ever created - which defeats the point of
-    pre-provisioning a tenant's stream off the write path. The NotFoundError
-    branch is kept because older versions do return 404.
+    The engine quirk this used to carry - a missing stream answered with 200 and
+    an empty list rather than a 404 - now lives in the adapter, where it belongs:
+    it is a property of Elasticsearch, not of provisioning.
     """
-    try:
-        existing = await client.indices.get_data_stream(name=name)
-        if existing.get("data_streams"):
-            return False
-    except NotFoundError:
-        pass
+    if await backend.data_stream_exists(name=name):
+        return False
 
     # A concrete index occupying the data stream's name is a dead end: the two
     # namespaces are shared, so the stream can never be created while it exists,
@@ -150,7 +176,7 @@ async def _ensure_data_stream(client: AsyncElasticsearch, name: str) -> bool:
     # (a bootstrap failure followed by ingest), because ES then auto-creates a
     # plain index. Detected here so the operator gets an actionable message
     # instead of having to decode a cluster-state error.
-    if await client.indices.exists(index=name, expand_wildcards="all"):
+    if await backend.index_exists(index=name, include_hidden=True):
         raise RuntimeError(
             f"a concrete index named {name!r} exists, which blocks creating the "
             "data stream of the same name. This happens when audit events are "
@@ -159,21 +185,20 @@ async def _ensure_data_stream(client: AsyncElasticsearch, name: str) -> bool:
         )
 
     try:
-        await client.indices.create_data_stream(name=name)
+        await backend.create_data_stream(name=name)
         logger.info("data_stream_created", stream=name)
         return True
-    except BadRequestError as exc:
-        message = str(exc)
-        if "resource_already_exists_exception" in message:
-            return False
+    except SearchConflict:
+        return False
+    except (SearchRejected, SearchNotFound) as exc:
         # The usual cause is a missing matching index template, which would
         # otherwise show up much later as a mapping surprise.
-        logger.error("data_stream_create_failed", stream=name, error=message)
+        logger.error("data_stream_create_failed", stream=name, error=str(exc))
         raise
 
 
 async def ensure_tenant_stream(
-    client: AsyncElasticsearch,
+    backend: SearchBackend,
     router: TenantRouter,
     tenant_id: str,
 ) -> str:
@@ -185,5 +210,5 @@ async def ensure_tenant_stream(
     """
     validated = router.validate_tenant_id(tenant_id)
     stream = router.dedicated_stream_name(validated)
-    await _ensure_data_stream(client, stream)
+    await _ensure_data_stream(backend, stream)
     return stream

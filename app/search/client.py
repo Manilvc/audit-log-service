@@ -1,4 +1,10 @@
-"""Elasticsearch client construction and lifecycle.
+"""Elasticsearch client construction.
+
+Elasticsearch-specific by design - `ElasticsearchBackend` wraps what this
+builds, and the integration suite uses it directly to assert on guarantees the
+*engine* enforces. Everything engine-agnostic lives behind the port in
+`app.search.backends`; the lifecycle of the client (info, ping, close) belongs
+to the adapter, not here.
 
 One `AsyncElasticsearch` instance per process, shared by every request. The
 client owns a connection pool, so building one per request would exhaust
@@ -15,8 +21,6 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
-
-_client: AsyncElasticsearch | None = None
 
 
 def build_client(settings: Settings) -> AsyncElasticsearch:
@@ -55,23 +59,6 @@ def build_client(settings: Settings) -> AsyncElasticsearch:
     )
 
 
-def get_client(settings: Settings) -> AsyncElasticsearch:
-    """Return the process-wide client, creating it on first use."""
-    global _client
-    if _client is None:
-        _client = build_client(settings)
-    return _client
-
-
-async def close_client() -> None:
-    """Release the connection pool on shutdown."""
-    global _client
-    if _client is not None:
-        await _client.close()
-        _client = None
-        logger.info("elasticsearch_client_closed")
-
-
 async def ping(client: AsyncElasticsearch) -> bool:
     """Liveness check used by the readiness probe.
 
@@ -84,26 +71,3 @@ async def ping(client: AsyncElasticsearch) -> bool:
     except Exception as exc:
         logger.warning("elasticsearch_ping_failed", error=str(exc))
         return False
-
-
-async def cluster_info(client: AsyncElasticsearch) -> dict[str, Any]:
-    """Version and cluster identity, surfaced by the health endpoint.
-
-    The major-version check is not cosmetic: the 9.x Python client refuses to
-    talk to a 7.x cluster, and a silent mismatch would only surface as
-    confusing errors at query time.
-    """
-    info = await client.info()
-    version = str(info.get("version", {}).get("number", "unknown"))
-    major = version.split(".")[0] if version[:1].isdigit() else "unknown"
-    if major not in {"9", "unknown"}:
-        logger.warning(
-            "elasticsearch_version_mismatch",
-            cluster_version=version,
-            expected_major="9",
-            detail="the pinned elasticsearch-py 9.x client requires a 9.x cluster",
-        )
-    return {
-        "cluster_name": info.get("cluster_name"),
-        "version": version,
-    }

@@ -36,8 +36,9 @@ from app.api.deps import (
 )
 from app.api.openapi import _TENANT_REQUIRED_OPERATIONS, build_openapi
 from app.core.config import Settings, get_settings
+from app.core.constants import ON_BEHALF_HEADER
 from app.core.exceptions import InvalidHeader
-from app.core.security.auth import ON_BEHALF_HEADER, AuthorizationError, Principal
+from app.core.security.auth import AuthorizationError, Principal
 from app.domain.enums import ActorType, Scope
 from app.schemas.api import SearchResponse
 from app.search.routing import InvalidTenantError, TenantRouter

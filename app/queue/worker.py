@@ -601,6 +601,10 @@ def _is_permanent(reason: str) -> bool:
         # document carries the wrong tenant id - a routing bug, not a blip, and
         # retrying it would spin forever.
         "document_parsing_exception",
+        # The same bug caught before the write, by the repository's own guard.
+        # Engine-independent, so it is the marker that matters on OpenSearch,
+        # where no field type refuses a foreign tenant id.
+        "tenant_mismatch",
         "status=400",
     )
     lowered = reason.lower()

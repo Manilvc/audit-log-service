@@ -114,7 +114,7 @@ def bootstrap() -> None:
 
         container = build_container(settings)
         try:
-            summary = await bootstrap_cluster(container.es, settings, container.router)
+            summary = await bootstrap_cluster(container.search, settings, container.router)
             click.echo("Cluster bootstrap complete:")
             for key, value in summary.items():
                 click.echo(f"  {key}: {value}")

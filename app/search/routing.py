@@ -64,10 +64,15 @@ class TenantRouter:
         shared_stream: str,
         index_prefix: str,
         dedicated_tenants: frozenset[str],
+        custom_routing: bool = True,
     ) -> None:
         self._shared = shared_stream
         self._prefix = index_prefix
         self._dedicated = dedicated_tenants
+        # Whether the configured engine accepts a routing value on a data stream
+        # write. `SearchBackend.supports_custom_routing` is the authority; the
+        # default keeps every existing caller on Elasticsearch behaviour.
+        self._custom_routing = custom_routing
 
     # ------------------------------------------------------------- validation
     @staticmethod
@@ -130,8 +135,11 @@ class TenantRouter:
             read_targets=(self._shared,),
             dedicated=False,
             # Pins the tenant to one shard, so its searches fan out to a single
-            # shard instead of all of them.
-            routing_key=validated,
+            # shard instead of all of them - where the engine allows it. An
+            # OpenSearch data stream rejects a routed write outright, so the key
+            # is omitted there and searches fan out. Isolation is unaffected:
+            # that comes from the mandatory tenant filter, not from routing.
+            routing_key=validated if self._custom_routing else None,
         )
 
     def cross_tenant_read_targets(self) -> tuple[str, ...]:

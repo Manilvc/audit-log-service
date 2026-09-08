@@ -212,7 +212,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # cannot reach Elasticsearch yet must still come up and buffer writes,
         # which is the whole point of the queue. Readiness reports the problem.
         try:
-            await bootstrap_cluster(container.es, resolved, container.router)
+            await bootstrap_cluster(container.search, resolved, container.router)
         except Exception as exc:
             logger.error("cluster_bootstrap_failed", error=str(exc))
 

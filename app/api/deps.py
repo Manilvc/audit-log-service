@@ -11,22 +11,29 @@ on the credential presented.
 
 from __future__ import annotations
 
-from typing import Annotated, Final
+from typing import Annotated
 
 from fastapi import Depends, Header, Request
 
 from app.core.config import Settings, get_settings
-from app.core.exceptions import InvalidHeader
-from app.core.security.auth import (
+from app.core.constants import (
     API_KEY_HEADER,
     ISSUER_HEADER,
+    MAX_IDENTITY_HEADER_LENGTH,
     ON_BEHALF_HEADER,
+    SERVICE_NAME_HEADER,
     TENANT_HEADER,
+)
+from app.core.exceptions import InvalidHeader, ServiceUnavailable
+from app.core.security.auth import (
     AuthenticationError,
     Authenticator,
+    AuthorizationError,
     Principal,
 )
+from app.search.api_key_store import ApiKeyRecord
 from app.search.routing import InvalidTenantError, TenantRouter
+from app.services.api_key_service import ApiKeyService, to_scopes
 from app.services.compliance_service import ErasureService, IntegrityService
 from app.services.ingest_service import IngestService
 from app.services.query_service import QueryService
@@ -71,22 +78,33 @@ def get_erasure_service(request: Request) -> ErasureService:
     return _container(request).erasure
 
 
+def get_api_key_service(request: Request) -> ApiKeyService:
+    """Resolve issued-key management.
+
+    Raises:
+        ServiceUnavailable: `API_KEY_PEPPER` is unset, so keys cannot be minted
+            or verified. The message names the setting, because the fix is one
+            line of configuration and a restart.
+    """
+    service = _container(request).api_keys
+    if service is None:
+        raise ServiceUnavailable(
+            "API key management is not configured: set API_KEY_PEPPER and restart. "
+            "Until then only the keys in SERVICE_API_KEYS authenticate."
+        )
+    return service
+
+
 IngestServiceDep = Annotated[IngestService, Depends(get_ingest_service)]
 QueryServiceDep = Annotated[QueryService, Depends(get_query_service)]
 IntegrityServiceDep = Annotated[IntegrityService, Depends(get_integrity_service)]
 ErasureServiceDep = Annotated[ErasureService, Depends(get_erasure_service)]
+ApiKeyServiceDep = Annotated[ApiKeyService, Depends(get_api_key_service)]
 
 
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
-#: Ceiling for an identity header, matching the `Uuid36` bound on the domain
-#: fields these values land in. Checked here rather than per event: an over-long
-#: header would otherwise reject all 500 events in a batch, one at a time, with
-#: a validation error that never names the header at fault.
-_MAX_IDENTITY_LENGTH: Final[int] = 64
-
-
 def _validated_identity(value: str | None, *, header: str) -> str | None:
     """Normalise an identity header, or None when it was not sent.
 
@@ -96,8 +114,8 @@ def _validated_identity(value: str | None, *, header: str) -> str | None:
     if value is None or not value.strip():
         return None
     candidate = value.strip()
-    if len(candidate) > _MAX_IDENTITY_LENGTH:
-        raise InvalidHeader(f"{header} must be at most {_MAX_IDENTITY_LENGTH} characters")
+    if len(candidate) > MAX_IDENTITY_HEADER_LENGTH:
+        raise InvalidHeader(f"{header} must be at most {MAX_IDENTITY_HEADER_LENGTH} characters")
     return candidate
 
 
@@ -121,6 +139,57 @@ def _validated_tenant(tenant_id: str | None) -> str | None:
     return TenantRouter.validate_tenant_id(tenant_id)
 
 
+def _assert_key_tenant_matches_header(record: ApiKeyRecord, requested: str | None) -> None:
+    """An issued key may only act for the tenant it was issued to.
+
+    The header stays legal - every emitter sends it - but it can only agree.
+    Naming a different tenant is an attempt to write into someone else's trail,
+    so it is refused rather than quietly resolved in the key's favour.
+
+    Raises:
+        AuthorizationError: the header names a different tenant.
+    """
+    if requested is not None and requested != record.tenant_id:
+        raise AuthorizationError(
+            f"this API key is bound to a different tenant than the {TENANT_HEADER} header names"
+        )
+
+
+async def _principal_from_issued_key(
+    service: ApiKeyService | None,
+    presented: str,
+    *,
+    requested_tenant: str | None,
+    acting_for: str | None,
+    authenticator: Authenticator,
+) -> Principal:
+    """Authenticate an issued key and build its principal.
+
+    Every failure answers the same way. Whether the key is malformed, unknown,
+    revoked, expired or simply mistyped is in the log, not in the response: a
+    credential endpoint that distinguishes them is an oracle for guessing.
+
+    Raises:
+        AuthenticationError: the key is not usable, for any reason.
+        AuthorizationError: it is usable but bound to another tenant.
+    """
+    if service is None:
+        raise AuthenticationError("invalid service API key")
+
+    record = await service.verify(presented)
+    if record is None:
+        raise AuthenticationError("invalid service API key")
+
+    _assert_key_tenant_matches_header(record, requested_tenant)
+    return authenticator.issued_key_principal(
+        key_id=record.key_id,
+        domain=record.domain,
+        tenant_id=record.tenant_id,
+        scopes=to_scopes(record),
+        on_behalf_of=acting_for,
+    )
+
+
 async def current_principal(
     request: Request,
     api_key: Annotated[str | None, Header(alias=API_KEY_HEADER)] = None,
@@ -129,42 +198,55 @@ async def current_principal(
 ) -> Principal:
     """Authenticate the caller.
 
-    Two headers make up an authenticated call, and they answer different
-    questions. `x-api-key` answers *may you talk to this service at all* - it is
-    matched against the allow-list and is the whole security boundary.
-    `x-audit-tenant-id` answers *whose trail are you touching* - it is the tenant
-    boundary, and it is carried on the principal so every downstream scope,
-    filter and audit-of-the-audit record derives from one value captured here.
+    Two kinds of credential arrive in `x-api-key`, and which one it is decides
+    where the tenant comes from:
 
-    The tenant id is trusted as given, after a shape check. The caller in front
-    of this service (the main backend) has already resolved the tenant from its
-    own request context and authorised the user against it; re-deriving that
-    here would mean either a second credential or a tenant registry, and this
-    service is deliberately built with neither.
+    * **An env-configured key** (`SERVICE_API_KEYS`). The admin plane: every
+      scope, not bound to a tenant, so `x-audit-tenant-id` names the tenant and
+      is trusted as given after a shape check. The caller in front of this
+      service resolved and authorised that tenant already.
+    * **An issued key** (`evcaud_...`). Bound to one tenant when it was minted,
+      so the tenant comes from the key and the header may only agree with it.
+      Its scopes are whatever that key was granted - normally write only - and
+      its `subject` is the verified domain it was issued to rather than the
+      unchecked `x-service-name` claim.
+
+    Env keys are tried first: that comparison is in memory and costs nothing,
+    while an issued key falls through to one cached lookup.
 
     Raises:
-        AuthenticationError: no key was presented, or it is not on the
-            allow-list.
+        AuthenticationError: no key was presented, or it is usable as neither
+            kind of credential.
+        AuthorizationError: an issued key was used for another tenant.
         InvalidTenantError: a tenant header was sent but is malformed.
     """
-    authenticator: Authenticator = _container(request).authenticator
-
     if not api_key:
         raise AuthenticationError("no credentials supplied")
-    if not authenticator.verify_api_key(api_key):
-        raise AuthenticationError("invalid service API key")
 
-    principal = authenticator.service_principal(
-        # The calling service names itself for attribution. It is unverified, so
-        # it is recorded as a claim rather than trusted for authorisation - the
-        # API key is what grants access.
-        service_name=request.headers.get("x-service-name", "unknown-service"),
-        tenant_id=_validated_tenant(tenant_header),
-        # The human this call is for. Stamped onto every event the call ingests
-        # (`actor.on_behalf_of`), so a service-mediated write stays attributable
-        # to a person and not just to the service account.
-        on_behalf_of=_validated_identity(on_behalf_of, header=ON_BEHALF_HEADER),
-    )
+    container = _container(request)
+    requested_tenant = _validated_tenant(tenant_header)
+    # The human this call is for. Stamped onto every event the call ingests
+    # (`actor.on_behalf_of`), so a service-mediated write stays attributable to
+    # a person and not just to the service account.
+    acting_for = _validated_identity(on_behalf_of, header=ON_BEHALF_HEADER)
+
+    if container.authenticator.verify_api_key(api_key):
+        principal = container.authenticator.service_principal(
+            # The calling service names itself for attribution. It is
+            # unverified, so it is recorded as a claim rather than trusted for
+            # authorisation - the API key is what grants access.
+            service_name=request.headers.get(SERVICE_NAME_HEADER, "unknown-service"),
+            tenant_id=requested_tenant,
+            on_behalf_of=acting_for,
+        )
+    else:
+        principal = await _principal_from_issued_key(
+            container.api_keys,
+            api_key,
+            requested_tenant=requested_tenant,
+            acting_for=acting_for,
+            authenticator=container.authenticator,
+        )
 
     # Stashed so the error handlers and access log can attribute a failure
     # without re-authenticating.

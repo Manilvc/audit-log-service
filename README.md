@@ -213,6 +213,21 @@ Base path `/v1`. Responses use the platform envelope
 | `POST` | `/v1/audit/admin/tenants/{id}/dedicate` | `audit:admin` | Provision a dedicated stream |
 | `GET` | `/health`, `/health/live`, `/health/ready`, `/metrics` | — | Unversioned |
 
+### Search store
+
+`SEARCH_BACKEND` selects the engine at deploy time: `elasticsearch` (the
+default, and what every existing deployment runs) or `opensearch`. One process
+talks to one store — the difference is absorbed by an adapter in
+`app/search/backends/`, not by configuration scattered through the code.
+
+The query DSL, pagination, bulk writes and idempotency are identical on both.
+What differs — retention (ILM vs ISM), three field types, and the
+point-in-time API — lives inside the adapters. See
+[`docs/OPENSEARCH_DEPLOYMENT.md`](docs/OPENSEARCH_DEPLOYMENT.md), and note one
+security consequence: Elastic's `constant_keyword` backstop has no OpenSearch
+equivalent, so the write path now refuses a wrong-tenant document itself, on
+both engines.
+
 ### Authentication
 
 One credential: **`x-api-key`**, for emitting services that have already
@@ -254,6 +269,30 @@ rather than silently resolved.
 
 One key is enough. `SERVICE_API_KEYS` is a list only so a rotation can keep the
 outgoing key valid during the cutover.
+
+### Two kinds of API key
+
+| | Admin plane | Ingest plane |
+|---|---|---|
+| Where from | `SERVICE_API_KEYS` in the environment | `POST /v1/audit/admin/api-keys` |
+| Looks like | whatever you generated | `evcaud_<id>_<secret>` |
+| Bound to a tenant | No — names one per request via the header | **Yes**, at the moment it is minted |
+| Scopes | All of them | `audit:write` by default; `erase`, `admin` and `cross_tenant` can never be delegated |
+| Rotation | Redeploy | Issue a new one, revoke the old one |
+
+An issued key takes its tenant from the key itself, so `x-audit-tenant-id` may
+only *agree* with it — naming a different tenant is a 403, not a silent
+resolution in the key's favour. Its `subject` is the verified domain it was
+issued to (`hrms.acme.example`), which is stronger than the `x-service-name`
+header it replaces: that one is an unchecked claim.
+
+That split is what makes per-emitter credentials safe to hand out. A leaked
+ingest key can write events for one tenant and nothing else — it cannot read
+the trail it fills, cannot erase a data subject, and cannot mint more of itself.
+
+Minting needs `API_KEY_PEPPER` to be set. Unset, the service still runs and
+still accepts the env keys; it just refuses to issue new ones rather than
+protecting them with a guessable value.
 
 ### What the request records about the caller
 

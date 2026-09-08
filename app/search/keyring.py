@@ -24,25 +24,29 @@ import base64
 from datetime import UTC, datetime
 from typing import Any
 
-from elasticsearch import AsyncElasticsearch, ConflictError, NotFoundError
-
 from app.core.logging import get_logger
 from app.core.security.crypto import KeyRingError
+from app.search.backends import SearchBackend, SearchConflict, SearchNotFound
 
 logger = get_logger(__name__)
 
 
-class ElasticKeyRing:
-    """Durable store for wrapped data keys, with a small in-process cache."""
+class SearchKeyRing:
+    """Durable store for wrapped data keys, with a small in-process cache.
+
+    Backed by whichever search store is configured: the operations it needs -
+    get, create-if-absent, partial update - behave identically on both engines,
+    so this stays engine-agnostic behind the port.
+    """
 
     def __init__(
         self,
-        client: AsyncElasticsearch,
+        backend: SearchBackend,
         *,
         index: str,
         cache_size: int = 2048,
     ) -> None:
-        self._client = client
+        self._store = backend
         self._index = index
         self._cache_size = cache_size
         # A cache is worth it because a single ingest batch typically carries
@@ -60,13 +64,13 @@ class ElasticKeyRing:
             return cached
 
         try:
-            response = await self._client.get(
+            response = await self._store.get_document(
                 index=self._index,
-                id=key_id,
+                doc_id=key_id,
                 # Only the fields needed; skips decompressing the rest.
                 source_includes=["wrapped", "shredded"],
             )
-        except NotFoundError:
+        except SearchNotFound:
             return None
         except Exception as exc:
             raise KeyRingError(f"keyring read failed for {key_id}: {exc}") from exc
@@ -98,9 +102,9 @@ class ElasticKeyRing:
             "shredded": False,
         }
         try:
-            await self._client.index(
+            await self._store.index_document(
                 index=self._index,
-                id=key_id,
+                doc_id=key_id,
                 document=document,
                 op_type="create",
                 # The very next operation reads this key back to encrypt with
@@ -108,7 +112,7 @@ class ElasticKeyRing:
                 refresh="wait_for",
             )
             self._remember(key_id, wrapped)
-        except ConflictError:
+        except SearchConflict:
             # Lost the race. Drop the locally generated key and let the caller
             # re-read the winning one.
             logger.info("keyring_create_conflict", key_id=key_id)
@@ -142,18 +146,18 @@ class ElasticKeyRing:
             "shred_request_id": request_id,
         }
         try:
-            response = await self._client.update(
+            response = await self._store.update_document(
                 index=self._index,
-                id=key_id,
+                doc_id=key_id,
                 doc=tombstone,
                 refresh="wait_for",
             )
-        except NotFoundError:
+        except SearchNotFound:
             # Never existed, or already hard-deleted. Record the tombstone so a
             # later lookup still reports "erased" rather than "unknown".
-            await self._client.index(
+            await self._store.index_document(
                 index=self._index,
-                id=key_id,
+                doc_id=key_id,
                 document={**tombstone, "kek_version": None, "created_at": None},
                 refresh="wait_for",
             )
@@ -177,10 +181,10 @@ class ElasticKeyRing:
         if key_id in self._shredded:
             return True
         try:
-            response = await self._client.get(
-                index=self._index, id=key_id, source_includes=["shredded"]
+            response = await self._store.get_document(
+                index=self._index, doc_id=key_id, source_includes=["shredded"]
             )
-        except NotFoundError:
+        except SearchNotFound:
             return False
         except Exception:
             return False

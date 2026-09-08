@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1 import compliance, events, ops
+from app.api.v1 import api_keys, compliance, events, ops
 
 v1_router = APIRouter()
 v1_router.include_router(events.router)
 v1_router.include_router(compliance.router)
+v1_router.include_router(api_keys.router)
 v1_router.include_router(ops.admin_router)
 
 # Health and metrics sit outside the versioned prefix: an orchestrator's probe

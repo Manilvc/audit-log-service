@@ -152,7 +152,8 @@ Additional layers:
 
 | Layer | Control |
 |---|---|
-| Storage | Dedicated streams map `tenant.id` as `constant_keyword`, so **Elasticsearch itself rejects** a document with the wrong tenant id |
+| Write path | `AuditRepository.bulk_index` refuses a document whose `tenant.id` disagrees with its route, on **every engine and both streams** — logged as `bulk_index_tenant_mismatch` and dead-lettered, never retried |
+| Storage | On Elasticsearch, dedicated streams map `tenant.id` as `constant_keyword`, so **the engine itself rejects** a wrong-tenant document. OpenSearch has no dependable equivalent (availability varies by 2.x minor), which is why the write-path guard above exists rather than relying on it |
 | Index naming | Tenant ids are regex-validated before reaching an index name — rejects `*`, `,`, `..`, spaces and other index-name metacharacters |
 | API boundary | `require_tenant_id` refuses a tenant-scoped call that names no tenant (400), and normalises the one it accepts, so `" t1"` and `"t1"` cannot become two partitions |
 | Single-event fetch | `GET /events/{id}` is a filtered **search**, not a document GET, so id-guessing cannot cross a tenant |
@@ -162,6 +163,10 @@ Additional layers:
 `tests/unit/test_tenant_isolation.py` — 86 tests — asserts the tenant clause is
 present, singular and top-level across every filter permutation and pairwise
 combination, and that hostile tenant ids are rejected.
+`tests/unit/test_opensearch_backend.py` covers the write-path guard, and
+`tests/integration/test_end_to_end.py` asserts the Elastic storage layer is
+still present rather than silently lost when the guard was added.
+
 `tests/unit/test_identity_headers.py` covers the boundary itself: a call naming
 no tenant is refused on every tenant-scoped route, malformed ids never reach an
 index name, the issuer and acting-user headers are length-bounded, and the

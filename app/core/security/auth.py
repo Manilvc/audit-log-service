@@ -54,18 +54,6 @@ from app.domain.enums import ActorType, Scope
 
 logger = get_logger(__name__)
 
-#: Header a service uses to name the tenant it is acting for. With no token to
-#: carry a `tenant_id` claim, this is the sole source of the tenant boundary.
-TENANT_HEADER: Final[str] = "x-audit-tenant-id"
-#: Header a service uses to record which human triggered the call. Stamped onto
-#: every event the call ingests, and onto the audit-of-the-audit trail, so a
-#: service-mediated write or read is still attributable to a person.
-ON_BEHALF_HEADER: Final[str] = "x-audit-on-behalf-of"
-#: Header naming the issuer (sub-tenant) a call acts within, used as the batch
-#: default for `issuer_id` on events that do not carry their own.
-ISSUER_HEADER: Final[str] = "x-audit-issuer-id"
-API_KEY_HEADER: Final[str] = "x-api-key"
-
 #: Scopes a trusted internal service receives. Every scope this service defines:
 #: see the module docstring for why ERASE, ADMIN and CROSS_TENANT are included
 #: and what that means for how the key must be handled.
@@ -96,6 +84,12 @@ class Principal:
     scopes: frozenset[Scope]
     on_behalf_of: str | None = None
     """The human a service call is acting for, when supplied."""
+    api_key_id: str | None = None
+    """Which issued key authenticated this call, when one did.
+
+    None for the env-configured service keys, which have no record to point at.
+    Recorded so a compromised key's activity can be read straight off the trail.
+    """
 
     def require(self, *needed: Scope) -> None:
         """Assert the caller holds every required scope.
@@ -161,11 +155,47 @@ class Authenticator:
         tenant_id: str | None,
         on_behalf_of: str | None,
     ) -> Principal:
-        """Build the principal for an authenticated internal service."""
+        """Build the principal for a caller holding an env-configured key.
+
+        The admin plane: every scope, and the tenant comes from the header
+        because the credential is not bound to one.
+        """
         return Principal(
             subject=service_name,
             actor_type=ActorType.SERVICE,
             tenant_id=tenant_id,
             scopes=_SERVICE_SCOPES,
             on_behalf_of=on_behalf_of,
+        )
+
+    def issued_key_principal(
+        self,
+        *,
+        key_id: str,
+        domain: str,
+        tenant_id: str,
+        scopes: frozenset[Scope],
+        on_behalf_of: str | None,
+    ) -> Principal:
+        """Build the principal for a caller holding an issued key.
+
+        Three differences from the admin plane, and each one is the point of
+        issuing keys at all:
+
+        * the tenant comes from the **key**, not from a header, so the caller
+          cannot name someone else's;
+        * the scopes are whatever that key was granted, normally write only;
+        * `subject` is the domain the key was issued to - a verified identity,
+          unlike the `x-service-name` header, which is an unchecked claim.
+
+        Takes primitives rather than the stored record, so this module stays
+        free of any dependency on how keys are persisted.
+        """
+        return Principal(
+            subject=domain,
+            actor_type=ActorType.SERVICE,
+            tenant_id=tenant_id,
+            scopes=scopes,
+            on_behalf_of=on_behalf_of,
+            api_key_id=key_id,
         )

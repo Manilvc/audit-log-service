@@ -18,6 +18,11 @@ from typing import Annotated, Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from app.core.constants import (
+    DEFAULT_API_KEY_CACHE_TTL_SECONDS,
+    DEFAULT_API_KEY_EXPIRY_DAYS,
+)
+
 #: `NoDecode` switches off pydantic-settings' automatic JSON decoding for a
 #: list-typed field. Without it the settings *source* tries `json.loads` on the
 #: raw env string and fails before any validator runs, so a plain
@@ -34,6 +39,20 @@ class Environment(StrEnum):
     DEV = "dev"
     STAGING = "staging"
     PROD = "prod"
+
+
+class SearchEngine(StrEnum):
+    """Which search store backs the audit trail.
+
+    A deploy-time choice: one process talks to one store. The engines differ in
+    lifecycle management, three field types and the point-in-time API, and the
+    `elasticsearch` client refuses to talk to a non-Elastic server outright -
+    so the difference is absorbed by an adapter in `app.search.backends`, not
+    by configuration.
+    """
+
+    ELASTICSEARCH = "elasticsearch"
+    OPENSEARCH = "opensearch"
 
 
 class Settings(BaseSettings):
@@ -80,6 +99,12 @@ class Settings(BaseSettings):
     # hand it to a component that only needs to write events.
     SERVICE_API_KEYS: CsvSecretList = Field(default_factory=list)
 
+    # ----------------------------------------------------------- search store
+    # Which engine `app.search.backends.build_backend` constructs. The ES_*
+    # settings below are shared: hosts, timeouts and TLS mean the same thing to
+    # both engines, and only the auth mechanism differs.
+    SEARCH_BACKEND: SearchEngine = SearchEngine.ELASTICSEARCH
+
     # ---------------------------------------------------------- elasticsearch
     ES_HOSTS: CsvList = Field(default_factory=lambda: ["https://localhost:9200"])
     # API-key auth is preferred over basic auth: scoped, revocable, and no
@@ -91,6 +116,31 @@ class Settings(BaseSettings):
     ES_VERIFY_CERTS: bool = True
     ES_REQUEST_TIMEOUT: float = 20.0
     ES_MAX_RETRIES: int = 3
+
+    # ----------------------------------------------------------- issued keys
+    # Pepper for the digest of an issued key's secret. It is what stops a
+    # database dump from being enough to test candidate keys offline: an
+    # attacker needs the process environment too.
+    #
+    # No default, and no fallback. Unset, the service still runs and still
+    # accepts the SERVICE_API_KEYS above - it simply refuses to mint new keys,
+    # rather than protecting them with a value anyone could guess.
+    API_KEY_PEPPER: SecretStr | None = None
+
+    # How long a verified key stays in the process cache. Also the worst-case
+    # delay before a revocation reaches an already-warm replica.
+    API_KEY_CACHE_TTL_SECONDS: int = DEFAULT_API_KEY_CACHE_TTL_SECONDS
+
+    # Lifetime of an issued key when the caller does not ask for a shorter one.
+    API_KEY_DEFAULT_EXPIRY_DAYS: int = DEFAULT_API_KEY_EXPIRY_DAYS
+
+    # --------------------------------------------------------------- opensearch
+    # Sign requests with the host's IAM credentials instead of a username and
+    # password - the right choice on a managed AWS domain, because nothing
+    # long-lived then sits on the audit host. Ignored unless
+    # SEARCH_BACKEND=opensearch. The ES_* settings above are shared: hosts,
+    # timeouts and TLS mean the same thing to both engines.
+    OPENSEARCH_AWS_SIGV4: bool = False
 
     # --------------------------------------------------------- index topology
     INDEX_PREFIX: str = "audit"
@@ -239,7 +289,17 @@ class Settings(BaseSettings):
             if problems:
                 raise ValueError("Unsafe production configuration: " + "; ".join(problems))
 
-        if self.ES_API_KEY is None and not (self.ES_USERNAME and self.ES_PASSWORD):
+        if self.SEARCH_BACKEND is SearchEngine.OPENSEARCH:
+            # SigV4 needs no credential in the settings at all - it signs with
+            # the instance role - so the Elasticsearch rule below would reject a
+            # correctly configured AWS domain.
+            if not (self.OPENSEARCH_AWS_SIGV4 or (self.ES_USERNAME and self.ES_PASSWORD)):
+                raise ValueError(
+                    "OpenSearch credentials missing: set OPENSEARCH_AWS_SIGV4=true "
+                    "(preferred on a managed AWS domain, no stored password) or "
+                    "ES_USERNAME + ES_PASSWORD for fine-grained access control"
+                )
+        elif self.ES_API_KEY is None and not (self.ES_USERNAME and self.ES_PASSWORD):
             raise ValueError(
                 "Elasticsearch credentials missing: set ES_API_KEY (preferred) "
                 "or ES_USERNAME + ES_PASSWORD"

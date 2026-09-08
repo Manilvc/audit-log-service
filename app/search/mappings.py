@@ -12,14 +12,14 @@ Why the mapping looks like this
     queue and raise an alert, so the failure is loud instead of being discovered
     during an incident. Free-form emitter data has a home already: ``labels``.
 
-``flattened`` for ``labels`` / ``change.before`` / ``change.after``
+``FieldTypes.subtree`` for ``labels`` / ``change.before`` / ``change.after``
     These hold arbitrary business fields. Mapped as objects they would be a
     mapping explosion - one emitter logging a per-record diff could add
     thousands of fields to a shared index and eventually break the cluster.
     ``flattened`` indexes the whole subtree as one field: still queryable by
     exact key/value, with a fixed mapping cost.
 
-``constant_keyword`` for ``tenant.id`` on dedicated streams
+``FieldTypes.pinned_tenant`` for ``tenant.id`` on dedicated streams
     Doubles as a storage-layer isolation guarantee. A backing index adopts the
     tenant id of its first document, and any later document with a different
     tenant id is *rejected by Elasticsearch*. Cross-tenant contamination in a
@@ -51,6 +51,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.search.backends.base import FieldTypes, SearchBackend
+
 # ---------------------------------------------------------------------------
 # Reusable mapping fragments
 # ---------------------------------------------------------------------------
@@ -78,7 +80,7 @@ _KEYWORD_SORTABLE_ID: dict[str, Any] = {
 }
 
 
-def _event_mapping(tenant_id_field: dict[str, Any]) -> dict[str, Any]:
+def _event_mapping(types: FieldTypes, tenant_id_field: dict[str, Any]) -> dict[str, Any]:
     """Build the audit document mapping.
 
     Args:
@@ -166,8 +168,8 @@ def _event_mapping(tenant_id_field: dict[str, Any]) -> dict[str, Any]:
                 "dynamic": "strict",
                 "properties": {
                     "fields": _KEYWORD,
-                    "before": {"type": "flattened"},
-                    "after": {"type": "flattened"},
+                    "before": types.subtree,
+                    "after": types.subtree,
                 },
             },
             "service": {
@@ -177,8 +179,8 @@ def _event_mapping(tenant_id_field: dict[str, Any]) -> dict[str, Any]:
             # `match_only_text` is the log-optimised text type: no norms and no
             # term frequencies, so ~10% smaller than `text` with the same
             # match/phrase behaviour. Only populated when PII encryption is off.
-            "message": {"type": "match_only_text"},
-            "labels": {"type": "flattened"},
+            "message": types.log_text,
+            "labels": types.subtree,
             "integrity": {
                 "dynamic": "strict",
                 "properties": {
@@ -208,77 +210,11 @@ def _event_mapping(tenant_id_field: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def ilm_policy(
-    *,
-    retention_days: int,
-    rollover_max_primary_shard_size: str,
-    rollover_max_age: str,
-) -> dict[str, Any]:
-    """Hot -> warm -> cold -> delete lifecycle.
-
-    The delete phase is the *maximum* retention permitted, not the mechanism for
-    honouring erasure requests - those are served by crypto-shredding, which
-    leaves the record in place. Deleting a record early would break the hash
-    chain and destroy audit evidence.
-
-    HIPAA 164.316(b)(2)(i) sets the six-year floor that `retention_days`
-    defaults to.
-    """
-    return {
-        "policy": {
-            "_meta": {
-                "description": (
-                    "EveryCRED audit retention. Delete phase is the regulatory "
-                    "maximum; erasure requests are served by crypto-shredding."
-                ),
-                "managed_by": "everycred-audit-service",
-            },
-            "phases": {
-                "hot": {
-                    "actions": {
-                        "rollover": {
-                            "max_primary_shard_size": rollover_max_primary_shard_size,
-                            "max_age": rollover_max_age,
-                        },
-                        # Cap segment count on the hot tier so search stays fast
-                        # while the index is still receiving writes.
-                        "set_priority": {"priority": 100},
-                    }
-                },
-                "warm": {
-                    "min_age": "30d",
-                    "actions": {
-                        # Read-only + a single segment: best possible search
-                        # latency and disk footprint for immutable data.
-                        "forcemerge": {"max_num_segments": 1},
-                        "readonly": {},
-                        "set_priority": {"priority": 50},
-                    },
-                },
-                "cold": {
-                    "min_age": "180d",
-                    "actions": {
-                        # Replicas drop to 0 in cold: durability comes from the
-                        # S3 WORM archive and cluster snapshots, so paying for a
-                        # second copy of five-year-old data is waste.
-                        "allocate": {"number_of_replicas": 0},
-                        "set_priority": {"priority": 0},
-                    },
-                },
-                "delete": {
-                    "min_age": f"{retention_days}d",
-                    "actions": {"delete": {"delete_searchable_snapshot": False}},
-                },
-            },
-        }
-    }
-
-
 def _base_settings(
     *,
     shards: int,
     replicas: int,
-    ilm_policy_name: str,
+    lifecycle: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "index": {
@@ -286,7 +222,10 @@ def _base_settings(
             "number_of_replicas": replicas,
             # Allows a later `shrink` down to any divisor without a reindex.
             "number_of_routing_shards": 30,
-            "lifecycle": {"name": ilm_policy_name},
+            # How a new index joins the retention policy. Elasticsearch names an
+            # ILM policy here; another engine may need nothing at all, so the
+            # backend supplies it.
+            **lifecycle,
             "codec": "best_compression",
             # Newest-first is the dominant access pattern; a descending index
             # sort lets Lucene stop early instead of scanning whole segments.
@@ -311,7 +250,8 @@ def shared_index_template(
     name_pattern: str,
     shards: int,
     replicas: int,
-    ilm_policy_name: str,
+    backend: SearchBackend,
+    policy_name: str,
     priority: int = 200,
 ) -> dict[str, Any]:
     """Template for the multi-tenant shared data stream.
@@ -327,13 +267,19 @@ def shared_index_template(
         # automatically. Every write to the shared stream must therefore supply
         # a routing value, which `TenantRouter.resolve` guarantees by returning
         # the tenant id as `routing_key` for shared tenants.
-        "data_stream": {"allow_custom_routing": True},
+        #
+        # Omitted on an engine whose data streams refuse routed writes, where
+        # the router issues no key either - the two have to agree, or every
+        # write to the shared stream fails.
+        "data_stream": ({"allow_custom_routing": True} if backend.supports_custom_routing else {}),
         "priority": priority,
         "template": {
             "settings": _base_settings(
-                shards=shards, replicas=replicas, ilm_policy_name=ilm_policy_name
+                shards=shards,
+                replicas=replicas,
+                lifecycle=backend.lifecycle_index_settings(policy_name),
             ),
-            "mappings": _event_mapping(_KEYWORD),
+            "mappings": _event_mapping(backend.field_types, _KEYWORD),
         },
         "_meta": {"managed_by": "everycred-audit-service", "isolation": "shared"},
     }
@@ -344,14 +290,17 @@ def dedicated_index_template(
     name_pattern: str,
     shards: int,
     replicas: int,
-    ilm_policy_name: str,
+    backend: SearchBackend,
+    policy_name: str,
     priority: int = 300,
 ) -> dict[str, Any]:
     """Template for per-tenant dedicated data streams.
 
     Higher priority than the shared template so `audit-t-<uuid>-*` wins over
     any broader pattern. `tenant.id` becomes `constant_keyword`, which makes
-    Elasticsearch itself reject a document carrying the wrong tenant id.
+    the *engine* reject a document carrying the wrong tenant id - on an engine
+    without that type it degrades to `keyword`, and the check has to move into
+    the worker.
     """
     return {
         "index_patterns": [name_pattern],
@@ -365,11 +314,61 @@ def dedicated_index_template(
         "priority": priority,
         "template": {
             "settings": _base_settings(
-                shards=shards, replicas=replicas, ilm_policy_name=ilm_policy_name
+                shards=shards,
+                replicas=replicas,
+                lifecycle=backend.lifecycle_index_settings(policy_name),
             ),
-            "mappings": _event_mapping({"type": "constant_keyword"}),
+            "mappings": _event_mapping(backend.field_types, backend.field_types.pinned_tenant),
         },
         "_meta": {"managed_by": "everycred-audit-service", "isolation": "dedicated"},
+    }
+
+
+# ---------------------------------------------------------------------------
+# API key index - deliberately NOT a data stream
+# ---------------------------------------------------------------------------
+def api_key_index_settings(*, replicas: int) -> dict[str, Any]:
+    """Mapping for issued ingest credentials.
+
+    A normal index, because a key record is mutable state: it gets revoked, and
+    its last-used timestamp moves. A data stream is append-only and could
+    express neither.
+
+    No secret is mapped, because none is stored - only a peppered digest, which
+    is `index: False` since it is never searched, only compared. The fields that
+    are indexed are the ones an operator filters a key list by.
+    """
+    return {
+        "settings": {
+            "index": {
+                "number_of_shards": 1,
+                "number_of_replicas": replicas,
+                # Verification reads a key by id the moment after it is issued.
+                "refresh_interval": "1s",
+                "codec": "best_compression",
+            }
+        },
+        "mappings": {
+            "dynamic": "strict",
+            "properties": {
+                "key_id": _KEYWORD,
+                "tenant_id": _KEYWORD,
+                # The emitting system the key was issued to.
+                "domain": _KEYWORD_1024,
+                "label": _KEYWORD_1024,
+                # Compared, never searched: no index, no doc values.
+                "secret_digest": {"type": "keyword", "index": False, "doc_values": False},
+                "digest_scheme": _KEYWORD,
+                "scopes": _KEYWORD,
+                "status": _KEYWORD,
+                "created_at": {"type": "date"},
+                "created_by": _KEYWORD_1024,
+                "expires_at": {"type": "date"},
+                "revoked_at": {"type": "date"},
+                "revoked_by": _KEYWORD_1024,
+                "last_used_at": {"type": "date"},
+            },
+        },
     }
 
 

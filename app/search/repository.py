@@ -1,8 +1,12 @@
-"""Elasticsearch data access for audit events.
+"""Search-store data access for audit events.
 
-The only module that talks to the cluster about audit documents. Callers pass a
+The only module that talks to the store about audit documents. Callers pass a
 `TenantScope`; they never pass an index name, so a wrong-tenant read is not
 expressible through this API.
+
+Engine-agnostic: every call goes through `SearchBackend`, and the query bodies
+are plain DSL that Elasticsearch and OpenSearch both accept. Nothing here names
+an engine.
 """
 
 from __future__ import annotations
@@ -10,10 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from elasticsearch import AsyncElasticsearch, NotFoundError
-
 from app.core.logging import get_logger
 from app.core.metrics import EVENTS_DUPLICATE
+from app.search.backends import SearchBackend, SearchNotFound
 from app.search.query import (
     AuditSearchFilter,
     TenantScope,
@@ -83,13 +86,13 @@ class AuditRepository:
 
     def __init__(
         self,
-        client: AsyncElasticsearch,
+        backend: SearchBackend,
         router: TenantRouter,
         *,
         max_window_days: int,
         search_timeout: str,
     ) -> None:
-        self._client = client
+        self._store = backend
         self._router = router
         self._max_window_days = max_window_days
         self._search_timeout = search_timeout
@@ -108,8 +111,26 @@ class AuditRepository:
         if not items:
             return BulkOutcome()
 
+        outcome = BulkOutcome()
         operations: list[dict[str, Any]] = []
+        writable: list[tuple[RouteDecision, dict[str, Any]]] = []
         for route, document in items:
+            mismatch = _tenant_mismatch(document, route)
+            if mismatch is not None:
+                # Refused before it reaches the store. On a dedicated stream
+                # Elasticsearch would reject this itself via `constant_keyword`,
+                # but OpenSearch has no equivalent and the shared stream has no
+                # such guard on either engine - so the invariant is enforced
+                # here, where every write passes, rather than left to whichever
+                # engine happens to be configured.
+                logger.error(
+                    "bulk_index_tenant_mismatch",
+                    route_tenant=route.tenant_id,
+                    write_target=route.write_target,
+                    event_id=_event_id_of(document),
+                )
+                outcome.failed.append((document, mismatch))
+                continue
             action: dict[str, Any] = {
                 "create": {
                     "_index": route.write_target,
@@ -120,18 +141,23 @@ class AuditRepository:
                 action["create"]["routing"] = route.routing_key
             operations.append(action)
             operations.append(document)
+            writable.append((route, document))
 
-        response = await self._client.bulk(
-            operations=operations,
+        if not writable:
+            logger.error("bulk_index_nothing_writable", rejected=len(outcome.failed))
+            return outcome
+
+        response = await self._store.bulk(
+            operations,
             # Wait for the write to be searchable? No - `refresh=False` keeps
             # ingest throughput high, and the 1s refresh interval means an
             # event is queryable well within any human timeframe.
             refresh=False,
         )
 
-        outcome = BulkOutcome(took_ms=int(response.get("took", 0)))
+        outcome.took_ms = int(response.get("took", 0))
         if not response.get("errors"):
-            outcome.succeeded = len(items)
+            outcome.succeeded = len(writable)
             return outcome
 
         for position, entry in enumerate(response.get("items", [])):
@@ -147,7 +173,7 @@ class AuditRepository:
                 # redelivery and its reservation must not advance the chain.
                 outcome.succeeded += 1
                 outcome.duplicates += 1
-                _, duplicate_document = items[position]
+                _, duplicate_document = writable[position]
                 duplicate_id = _event_id_of(duplicate_document)
                 if duplicate_id:
                     outcome.duplicate_event_ids.append(duplicate_id)
@@ -161,7 +187,7 @@ class AuditRepository:
             # `worker._is_permanent` matches on it - so it must be captured.
             error_type = str(error.get("type", "unknown"))
             reason = str(error.get("reason", "unknown error"))
-            _, document = items[position]
+            _, document = writable[position]
             outcome.failed.append((document, f"status={status} type={error_type} {reason}"))
 
         if outcome.failed:
@@ -195,9 +221,10 @@ class AuditRepository:
             track_total_hits=with_total,
             source_fields=source_fields,
             timeout=self._search_timeout,
+            sort_date_format=self._store.sort_date_format,
         )
 
-        response = await self._client.search(
+        response = await self._store.search(
             index=",".join(targets),
             body=body,
             routing=routing,
@@ -207,7 +234,7 @@ class AuditRepository:
             # Correctness over availability: a partial result set in a
             # compliance report is worse than an explicit failure, because the
             # reader cannot tell that records are missing.
-            allow_partial_search_results=False,
+            allow_partial_results=False,
             # Skips shards whose @timestamp range cannot match, which is the
             # single biggest win when querying a narrow window over years of
             # backing indices.
@@ -239,12 +266,12 @@ class AuditRepository:
             interval=interval,
             size=size,
         )
-        response = await self._client.search(
+        response = await self._store.search(
             index=",".join(targets),
             body=body,
             routing=routing,
             ignore_unavailable=True,
-            allow_partial_search_results=False,
+            allow_partial_results=False,
             pre_filter_shard_size=1,
         )
         return dict(response.get("aggregations", {}))
@@ -261,7 +288,7 @@ class AuditRepository:
         if not scope.cross_tenant:
             filters.append({"term": {"tenant.id": scope.tenant_id}})
 
-        response = await self._client.search(
+        response = await self._store.search(
             index=",".join(targets),
             body={
                 "query": {"bool": {"filter": filters}},
@@ -283,12 +310,7 @@ class AuditRepository:
         rather than a snapshot - unusable as evidence. A PIT freezes the view.
         """
         targets, _ = self._resolve_read(scope)
-        response = await self._client.open_point_in_time(
-            index=",".join(targets),
-            keep_alive=keep_alive,
-            ignore_unavailable=True,
-        )
-        return str(response["id"])
+        return await self._store.open_pit(index=",".join(targets), keep_alive=keep_alive)
 
     async def search_pit(
         self,
@@ -312,9 +334,10 @@ class AuditRepository:
             # Ascending for exports: chronological order is what a reviewer
             # expects, and it matches hash-chain order for verification.
             ascending=True,
+            sort_date_format=self._store.sort_date_format,
         )
         body["pit"] = {"id": pit_id, "keep_alive": keep_alive}
-        response = await self._client.search(body=body)
+        response = await self._store.search(body=body)
         return _to_page(response)
 
     async def close_pit(self, pit_id: str) -> None:
@@ -324,8 +347,8 @@ class AuditRepository:
         must run even on the error path - hence swallowing NotFoundError.
         """
         try:
-            await self._client.close_point_in_time(id=pit_id)
-        except NotFoundError:
+            await self._store.close_pit(pit_id)
+        except SearchNotFound:
             pass
         except Exception as exc:
             logger.warning("close_pit_failed", error=str(exc))
@@ -346,7 +369,7 @@ class AuditRepository:
         """
         scope = TenantScope(tenant_id=tenant_id)
         targets, routing = self._resolve_read(scope)
-        response = await self._client.search(
+        response = await self._store.search(
             index=",".join(targets),
             body={
                 "query": {
@@ -364,7 +387,7 @@ class AuditRepository:
             },
             routing=routing,
             ignore_unavailable=True,
-            allow_partial_search_results=False,
+            allow_partial_results=False,
         )
         return [dict(hit["_source"]) for hit in response.get("hits", {}).get("hits", [])]
 
@@ -377,7 +400,7 @@ class AuditRepository:
         """
         scope = TenantScope(tenant_id=tenant_id)
         targets, routing = self._resolve_read(scope)
-        response = await self._client.count(
+        return await self._store.count(
             index=",".join(targets),
             body={
                 "query": {
@@ -392,7 +415,6 @@ class AuditRepository:
             routing=routing,
             ignore_unavailable=True,
         )
-        return int(response.get("count", 0))
 
     # ------------------------------------------------------------------ helpers
     def _resolve_read(self, scope: TenantScope) -> tuple[tuple[str, ...], str | None]:
@@ -424,6 +446,30 @@ def _to_page(response: Any) -> SearchPage:
         took_ms=int(response.get("took", 0)),
         timed_out=bool(response.get("timed_out", False)),
     )
+
+
+def _tenant_mismatch(document: dict[str, Any], route: RouteDecision) -> str | None:
+    """Why this document must not be written to this route, or None if it may.
+
+    The one invariant the whole isolation model rests on: a document lands in
+    the stream belonging to the tenant it names. Everything else - the
+    mandatory query filter, dedicated streams, `constant_keyword` - protects
+    reads or depends on the engine. This protects the write, on every engine.
+
+    A mismatch is a routing bug, never a transient fault, so the reason is
+    phrased to be classified as permanent by `worker._is_permanent` and
+    dead-lettered for a human rather than retried forever.
+    """
+    tenant = document.get("tenant")
+    named = tenant.get("id") if isinstance(tenant, dict) else None
+    if not named:
+        return "tenant_mismatch: document carries no tenant.id"
+    if str(named) != route.tenant_id:
+        return (
+            f"tenant_mismatch: document tenant.id={named!r} does not belong to "
+            f"the route for {route.tenant_id!r} ({route.write_target})"
+        )
+    return None
 
 
 def _event_id_of(document: dict[str, Any]) -> str | None:

@@ -11,8 +11,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from elasticsearch import ApiError as ESApiError
-from elasticsearch import TransportError as ESTransportError
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -21,6 +19,7 @@ from app.core.logging import get_logger
 from app.core.responses import ORJSONResponse, envelope
 from app.core.security.auth import AuthenticationError, AuthorizationError
 from app.core.security.crypto import KeyRingError
+from app.search.backends import SearchError, SearchRejected, SearchUnavailable
 from app.search.query import QueryValidationError
 from app.search.routing import InvalidTenantError
 
@@ -168,14 +167,16 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def _http_error(request: Request, exc: StarletteHTTPException) -> ORJSONResponse:
         return _respond(exc.status_code, str(exc.detail))
 
-    @app.exception_handler(ESApiError)
-    async def _es_api_error(request: Request, exc: ESApiError) -> ORJSONResponse:
-        # Never echoed: an ES error body carries index names, mappings and
+    # The three search-store handlers are registered on the port's errors, not
+    # on a client library's, so they hold whichever engine is configured. The
+    # adapter in `app.search.backends` does the translation.
+    @app.exception_handler(SearchRejected)
+    async def _store_rejected(request: Request, exc: SearchRejected) -> ORJSONResponse:
+        # Never echoed: a store error body carries index names, mappings and
         # sometimes document content from another tenant.
         logger.error(
-            "elasticsearch_api_error",
+            "search_store_rejected",
             request_id=_request_id(request),
-            status=getattr(exc, "status_code", None),
             error=str(exc),
         )
         return _respond(
@@ -183,16 +184,32 @@ def register_exception_handlers(app: FastAPI) -> None:
             "The audit store rejected this request. It has been logged for investigation.",
         )
 
-    @app.exception_handler(ESTransportError)
-    async def _es_transport_error(request: Request, exc: ESTransportError) -> ORJSONResponse:
+    @app.exception_handler(SearchUnavailable)
+    async def _store_unavailable(request: Request, exc: SearchUnavailable) -> ORJSONResponse:
         logger.error(
-            "elasticsearch_unreachable",
+            "search_store_unreachable",
             request_id=_request_id(request),
             error=str(exc),
         )
         return _respond(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "The audit store is temporarily unavailable.",
+        )
+
+    @app.exception_handler(SearchError)
+    async def _store_error(request: Request, exc: SearchError) -> ORJSONResponse:
+        # A `SearchNotFound` or `SearchConflict` reaching here is a bug - both
+        # are meant to be handled where the decision belongs - so it is logged
+        # as one rather than translated into a plausible-looking answer.
+        logger.error(
+            "search_store_error_unhandled",
+            request_id=_request_id(request),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        return _respond(
+            status.HTTP_502_BAD_GATEWAY,
+            "The audit store could not complete this request.",
         )
 
     @app.exception_handler(Exception)

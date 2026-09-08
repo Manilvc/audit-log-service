@@ -29,7 +29,7 @@ from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 
 from app.core.config import Environment, Settings
-from app.core.security.auth import (
+from app.core.constants import (
     API_KEY_HEADER,
     ISSUER_HEADER,
     ON_BEHALF_HEADER,

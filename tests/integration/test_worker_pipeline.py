@@ -26,7 +26,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from elasticsearch import AsyncElasticsearch
 from redis.asyncio import Redis
 
 from app.core.config import Settings, get_settings
@@ -35,19 +34,28 @@ from app.core.security.crypto import PiiCipher
 from app.queue.chain import ChainAllocator
 from app.queue.stream import IngestQueue
 from app.queue.worker import IngestWorker
+from app.search.backends import (
+    ElasticsearchBackend,
+    OpenSearchBackend,
+    build_backend,
+)
 from app.search.bootstrap import (
     bootstrap_cluster,
     dedicated_template_name,
     keyring_index_name,
     shared_template_name,
 )
-from app.search.client import build_client, ping
-from app.search.keyring import ElasticKeyRing
+from app.search.keyring import SearchKeyRing
 from app.search.query import AuditSearchFilter, TenantScope
 from app.search.repository import AuditRepository
 from app.search.routing import TenantRouter
 
 pytestmark = pytest.mark.integration
+
+#: Same union as the end-to-end suite: the pipeline forces a refresh between
+#: phases, which is an operational call on the engine rather than part of the
+#: port the service uses.
+SearchStore = ElasticsearchBackend | OpenSearchBackend
 
 RUN = uuid.uuid4().hex[:8]
 
@@ -86,22 +94,38 @@ def wsettings() -> Iterator[Settings]:
 
 
 @pytest.fixture(scope="module")
-def wrouter(wsettings: Settings) -> TenantRouter:
+async def wes(wsettings: Settings) -> AsyncIterator[SearchStore]:
+    backend = build_backend(wsettings)
+    assert isinstance(backend, ElasticsearchBackend | OpenSearchBackend)
+    if not await backend.ping():
+        await backend.close()
+        pytest.skip(
+            f"{wsettings.SEARCH_BACKEND.value} is not reachable at {wsettings.ES_HOSTS}; "
+            "run `docker compose up -d`"
+        )
+    yield backend
+    await backend.close()
+
+
+@pytest.fixture(scope="module")
+def wrouter(wsettings: Settings, wes: SearchStore) -> TenantRouter:
+    """Built from the store: an OpenSearch data stream refuses a routed write."""
     return TenantRouter(
         shared_stream=wsettings.SHARED_DATA_STREAM,
         index_prefix=wsettings.INDEX_PREFIX,
         dedicated_tenants=wsettings.dedicated_tenant_set,
+        custom_routing=wes.supports_custom_routing,
     )
 
 
-@pytest.fixture(scope="module")
-async def wes(wsettings: Settings, wrouter: TenantRouter) -> AsyncIterator[AsyncElasticsearch]:
-    client = build_client(wsettings)
-    if not await ping(client):
-        await client.close()
-        pytest.skip("Elasticsearch is not reachable; run `docker compose up -d`")
-    await bootstrap_cluster(client, wsettings, wrouter)
-    yield client
+@pytest.fixture(scope="module", autouse=True)
+async def _wtopology(
+    wes: SearchStore, wsettings: Settings, wrouter: TenantRouter
+) -> AsyncIterator[None]:
+    await bootstrap_cluster(wes, wsettings, wrouter)
+    backend = wes
+    client = wes.client
+    yield
 
     with contextlib.suppress(Exception):
         await client.indices.delete_data_stream(name=wrouter.shared_pattern())
@@ -110,9 +134,14 @@ async def wes(wsettings: Settings, wrouter: TenantRouter) -> AsyncIterator[Async
     for template in (shared_template_name(wsettings), dedicated_template_name(wsettings)):
         with contextlib.suppress(Exception):
             await client.indices.delete_index_template(name=template)
+    # The retention policy lives in a different place on each engine.
     with contextlib.suppress(Exception):
-        await client.ilm.delete_lifecycle(name=wsettings.ILM_POLICY_NAME)
-    await client.close()
+        if isinstance(backend, ElasticsearchBackend):
+            await backend.client.ilm.delete_lifecycle(name=wsettings.ILM_POLICY_NAME)
+        else:
+            await backend.client.transport.perform_request(
+                "DELETE", f"/_plugins/_ism/policies/{wsettings.ILM_POLICY_NAME}"
+            )
 
 
 @pytest.fixture(scope="module")
@@ -139,14 +168,18 @@ class _Pipeline:
         self,
         *,
         settings: Settings,
-        es: AsyncElasticsearch,
+        store: SearchStore,
         redis: Redis,
         router: TenantRouter,
     ) -> None:
         self.settings = settings
         self.router = router
+        # The raw client is kept alongside the repository: these tests force a
+        # refresh between phases, which is an operational call on the engine
+        # rather than part of the port the service uses.
+        self.store = store
         self.repository = AuditRepository(
-            es,
+            store,
             router,
             max_window_days=settings.MAX_QUERY_WINDOW_DAYS,
             search_timeout=settings.SEARCH_TIMEOUT,
@@ -161,7 +194,7 @@ class _Pipeline:
         self.chains = ChainAllocator(redis)
         self.cipher = PiiCipher(
             settings.PII_MASTER_KEK.get_secret_value(),
-            keyring=ElasticKeyRing(es, index=keyring_index_name(settings)),
+            keyring=SearchKeyRing(store, index=keyring_index_name(settings)),
             enabled=settings.PII_ENCRYPTION_ENABLED,
         )
         self.worker = IngestWorker(
@@ -226,7 +259,7 @@ class _Pipeline:
 
     async def _count(self) -> int:
         with contextlib.suppress(Exception):
-            await self.repository._client.indices.refresh(
+            await self.store.client.indices.refresh(
                 index=self.router.shared_pattern(), ignore_unavailable=True
             )
         page = await self.repository.search(
@@ -244,7 +277,7 @@ class _Pipeline:
         partition = self.router.partition_for(tenant_id, self.settings.STREAM_PARTITIONS)
         chain_id = self.router.chain_id(tenant_id, partition)
         with contextlib.suppress(Exception):
-            await self.repository._client.indices.refresh(
+            await self.store.client.indices.refresh(
                 index=self.router.shared_pattern(), ignore_unavailable=True
             )
         return await self.repository.fetch_chain_slice(
@@ -254,9 +287,9 @@ class _Pipeline:
 
 @pytest.fixture
 def pipeline(
-    wsettings: Settings, wes: AsyncElasticsearch, wredis: Redis, wrouter: TenantRouter
+    wsettings: Settings, wes: SearchStore, wredis: Redis, wrouter: TenantRouter
 ) -> _Pipeline:
-    return _Pipeline(settings=wsettings, es=wes, redis=wredis, router=wrouter)
+    return _Pipeline(settings=wsettings, store=wes, redis=wredis, router=wrouter)
 
 
 def _chain_id_of(pipeline: _Pipeline, tenant_id: str) -> str:
@@ -353,7 +386,7 @@ async def test_restarting_the_worker_continues_the_chain(
     # A brand-new worker, as after a deploy.
     second = _Pipeline(
         settings=pipeline.settings,
-        es=pipeline.repository._client,
+        store=pipeline.store,
         redis=pipeline.chains._redis,
         router=pipeline.router,
     )

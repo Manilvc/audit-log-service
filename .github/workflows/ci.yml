@@ -70,14 +70,30 @@ jobs:
           uv run pip-audit
 
   # The integration suite is a separate job because it needs live services. It is
-  # not optional coverage: the guarantees it checks are enforced by Elasticsearch
-  # itself (constant_keyword rejecting a wrong-tenant document, `enabled: false`
-  # making ciphertext unsearchable, op_type:create deduplicating a replay) or
-  # emerge from the worker/Redis/ES interaction (a gap-free, correctly linked hash
-  # chain). Mocks cannot observe any of them, and every one of those checks has
-  # already caught a real defect.
+  # not optional coverage: the guarantees it checks are enforced by the search
+  # engine itself (a strict mapping rejecting an undeclared field, `enabled:
+  # false` making ciphertext unsearchable, op_type:create deduplicating a
+  # replay) or emerge from the worker/Redis/store interaction (a gap-free,
+  # correctly linked hash chain). Mocks cannot observe any of them, and every
+  # one of those checks has already caught a real defect.
+  #
+  # It runs once per engine. Both containers start on both legs, which costs a
+  # minute of boot time and buys a job definition with no conditional services
+  # in it - the alternative is templating `services:` from the matrix, where a
+  # setting one engine rejects (OpenSearch refuses unknown `xpack.*` settings)
+  # fails as an unexplained boot timeout.
   integration:
     runs-on: ubuntu-latest
+    strategy:
+      # One engine failing must not hide the other's result.
+      fail-fast: false
+      matrix:
+        include:
+          - engine: elasticsearch
+            hosts: http://localhost:9200
+          - engine: opensearch
+            hosts: http://localhost:9202
+    name: integration (${{ matrix.engine }})
     services:
       elasticsearch:
         # Must track the client major version pinned in pyproject.toml.
@@ -90,6 +106,23 @@ jobs:
           ES_JAVA_OPTS: -Xms1g -Xmx1g
         ports:
           - 9200:9200
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+      opensearch:
+        # Pinned here, unlike the moving `2` tag docker-compose defaults to: CI
+        # must fail on a version bump rather than drift onto it silently.
+        image: opensearchproject/opensearch:2.19.1
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          DISABLE_INSTALL_DEMO_CONFIG: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+        ports:
+          - 9202:9200
         options: >-
           --health-cmd "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s"
           --health-interval 10s
@@ -139,7 +172,11 @@ jobs:
           ENVIRONMENT: local
           # Obviously-fake CI value; the service key is the only credential.
           SERVICE_API_KEYS: ci-only-service-key
-          ES_HOSTS: http://localhost:9200
+          # The engine under test, and where it listens. The ES_* names are
+          # shared by both adapters: hosts, timeouts and TLS mean the same thing
+          # to either store.
+          SEARCH_BACKEND: ${{ matrix.engine }}
+          ES_HOSTS: ${{ matrix.hosts }}
           ES_USERNAME: elastic
           ES_PASSWORD: ci-only-password
           ES_VERIFY_CERTS: "false"

@@ -1,14 +1,20 @@
-"""End-to-end tests against live Elasticsearch and Redis.
+"""End-to-end tests against a live search store and Redis.
 
-    docker compose up -d elasticsearch redis
+    docker compose up -d elasticsearch redis     # SEARCH_BACKEND=elasticsearch
+    docker compose up -d opensearch redis        # SEARCH_BACKEND=opensearch
     uv run pytest -m integration
 
-These cover what unit tests structurally cannot: that the mapping Elasticsearch
-actually installs behaves as intended. Several of the isolation and privacy
-guarantees are enforced *by the cluster* rather than by application code -
-`constant_keyword` rejecting a wrong-tenant document, `enabled: false` making
-ciphertext unsearchable, `op_type: create` rejecting a duplicate. A mock cannot
-verify any of those.
+The suite runs against whichever engine `SEARCH_BACKEND` names, because these
+cover what unit tests structurally cannot: that the mapping the engine actually
+installs behaves as intended. Several of the isolation and privacy guarantees
+are enforced *by the store* rather than by application code - `enabled: false`
+making ciphertext unsearchable, `op_type: create` rejecting a duplicate,
+`dynamic: strict` rejecting an undeclared field. A mock cannot verify any of
+those, and neither can the other engine: that is the point of running twice.
+
+Where the engines genuinely differ - the retention policy document, and
+Elastic's `constant_keyword` backstop - the test forks explicitly rather than
+asserting one engine's shape on both.
 """
 
 from __future__ import annotations
@@ -21,24 +27,34 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from elasticsearch import AsyncElasticsearch, BadRequestError
+from elasticsearch import BadRequestError
 
 from app.core.config import Settings, get_settings
 from app.core.integrity import GENESIS_HASH, compute_hash, verify_chain
 from app.queue.worker import _is_permanent
+from app.search.backends import (
+    ElasticsearchBackend,
+    OpenSearchBackend,
+    build_backend,
+)
 from app.search.bootstrap import (
     bootstrap_cluster,
     dedicated_template_name,
     keyring_index_name,
     shared_template_name,
 )
-from app.search.client import build_client, ping
 from app.search.mappings import dedicated_index_template, shared_index_template
 from app.search.query import AuditSearchFilter, TenantScope
 from app.search.repository import AuditRepository
 from app.search.routing import TenantRouter
 
 pytestmark = pytest.mark.integration
+
+#: The suite runs against whichever engine `SEARCH_BACKEND` names, so CI can
+#: run it twice. Typed as the union rather than the port because a handful of
+#: assertions deliberately reach past the port to the raw client: they check
+#: what the *engine* enforces, which is the whole reason this suite exists.
+SearchStore = ElasticsearchBackend | OpenSearchBackend
 
 # A unique prefix per run, so a test run never collides with real data or with a
 # previous run's leftovers.
@@ -82,23 +98,46 @@ def itest_settings() -> Iterator[Settings]:
 
 
 @pytest.fixture(scope="module")
-def router(itest_settings: Settings) -> TenantRouter:
+async def store(itest_settings: Settings) -> AsyncIterator[SearchStore]:
+    """The configured engine, connected but not yet provisioned."""
+    backend = build_backend(itest_settings)
+    assert isinstance(backend, ElasticsearchBackend | OpenSearchBackend)
+    if not await backend.ping():
+        await backend.close()
+        pytest.skip(
+            f"{itest_settings.SEARCH_BACKEND.value} is not reachable at "
+            f"{itest_settings.ES_HOSTS}; run `docker compose up -d`"
+        )
+    yield backend
+    await backend.close()
+
+
+@pytest.fixture(scope="module")
+def router(itest_settings: Settings, store: SearchStore) -> TenantRouter:
+    """Built from the store, exactly as `build_container` does.
+
+    The routing capability is the reason for the dependency: an OpenSearch data
+    stream rejects a routed write, so the router must issue no routing key
+    there. A router built without asking the engine would fail every write to
+    the shared stream on that engine.
+    """
     return TenantRouter(
         shared_stream=itest_settings.SHARED_DATA_STREAM,
         index_prefix=itest_settings.INDEX_PREFIX,
         dedicated_tenants=itest_settings.dedicated_tenant_set,
+        custom_routing=store.supports_custom_routing,
     )
 
 
-@pytest.fixture(scope="module")
-async def es(itest_settings: Settings, router: TenantRouter) -> AsyncIterator[AsyncElasticsearch]:
-    client = build_client(itest_settings)
-    if not await ping(client):
-        await client.close()
-        pytest.skip("Elasticsearch is not reachable; run `docker compose up -d`")
-
-    await bootstrap_cluster(client, itest_settings, router)
-    yield client
+@pytest.fixture(scope="module", autouse=True)
+async def _topology(
+    store: SearchStore, itest_settings: Settings, router: TenantRouter
+) -> AsyncIterator[None]:
+    """Apply the topology once per module, and remove it afterwards."""
+    await bootstrap_cluster(store, itest_settings, router)
+    backend = store
+    client = store.client
+    yield
 
     # Tear down everything this run created. Audit indices are append-only in
     # production, but a test run must not leave state behind.
@@ -122,17 +161,25 @@ async def es(itest_settings: Settings, router: TenantRouter) -> AsyncIterator[As
     ):
         with contextlib.suppress(Exception):
             await client.indices.delete_index_template(name=template)
+    # The retention policy lives in a different place on each engine.
     with contextlib.suppress(Exception):
-        await client.ilm.delete_lifecycle(name=itest_settings.ILM_POLICY_NAME)
-    await client.close()
+        if isinstance(backend, ElasticsearchBackend):
+            await backend.client.ilm.delete_lifecycle(name=itest_settings.ILM_POLICY_NAME)
+        else:
+            await backend.client.transport.perform_request(
+                "DELETE", f"/_plugins/_ism/policies/{itest_settings.ILM_POLICY_NAME}"
+            )
 
 
 @pytest.fixture
 def repository(
-    es: AsyncElasticsearch, router: TenantRouter, itest_settings: Settings
+    store: SearchStore, router: TenantRouter, itest_settings: Settings
 ) -> AuditRepository:
+    # The configured backend, so these tests exercise the same path the service
+    # uses. `store.client` stays available to the few tests that assert on what
+    # the *engine* enforces.
     return AuditRepository(
-        es,
+        store,
         router,
         max_window_days=itest_settings.MAX_QUERY_WINDOW_DAYS,
         search_timeout=itest_settings.SEARCH_TIMEOUT,
@@ -179,9 +226,9 @@ def _document(
     return document
 
 
-async def _refresh(es: AsyncElasticsearch, router: TenantRouter) -> None:
+async def _refresh(store: SearchStore, router: TenantRouter) -> None:
     """Make writes visible. Only needed in tests: production reads tolerate 1s."""
-    await es.indices.refresh(
+    await store.client.indices.refresh(
         index=f"{router.shared_pattern()},{router.dedicated_pattern()}",
         ignore_unavailable=True,
     )
@@ -191,33 +238,53 @@ async def _refresh(es: AsyncElasticsearch, router: TenantRouter) -> None:
 # Bootstrap
 # ---------------------------------------------------------------------------
 async def test_bootstrap_creates_the_expected_topology(
-    es: AsyncElasticsearch, itest_settings: Settings, router: TenantRouter
+    store: SearchStore, itest_settings: Settings, router: TenantRouter
 ) -> None:
-    """The topology is applied from code, so a fresh cluster cannot drift."""
-    policy = await es.ilm.get_lifecycle(name=itest_settings.ILM_POLICY_NAME)
-    phases = policy[itest_settings.ILM_POLICY_NAME]["policy"]["phases"]
-    assert set(phases) == {"hot", "warm", "cold", "delete"}
-    # Six years (HIPAA 164.316(b)(2)(i)).
-    assert phases["delete"]["min_age"] == f"{itest_settings.RETENTION_DAYS}d"
+    """The topology is applied from code, so a fresh cluster cannot drift.
 
-    assert await es.indices.exists(index=keyring_index_name(itest_settings))
-    streams = await es.indices.get_data_stream(name=router.shared_pattern())
+    The retention policy is the one piece with no common shape: ILM has phases
+    keyed by name, ISM has a list of states. Both must exist and both must end
+    at the same six-year ceiling, which is what this asserts per engine.
+    """
+    retention_days = itest_settings.RETENTION_DAYS
+    if isinstance(store, ElasticsearchBackend):
+        policy = await store.client.ilm.get_lifecycle(name=itest_settings.ILM_POLICY_NAME)
+        phases = policy[itest_settings.ILM_POLICY_NAME]["policy"]["phases"]
+        assert set(phases) == {"hot", "warm", "cold", "delete"}
+        # Six years (HIPAA 164.316(b)(2)(i)).
+        assert phases["delete"]["min_age"] == f"{retention_days}d"
+    else:
+        document = await store.client.transport.perform_request(
+            "GET", f"/_plugins/_ism/policies/{itest_settings.ILM_POLICY_NAME}"
+        )
+        policy_body = document["policy"]
+        states = {state["name"]: state for state in policy_body["states"]}
+        assert set(states) == {"hot", "warm", "cold", "delete"}
+        assert (
+            states["cold"]["transitions"][0]["conditions"]["min_index_age"] == f"{retention_days}d"
+        )
+        # The policy has to claim the audit patterns, or a rolled-over backing
+        # index silently ages out of retention management.
+        assert policy_body["ism_template"][0]["index_patterns"]
+
+    assert await store.client.indices.exists(index=keyring_index_name(itest_settings))
+    streams = await store.client.indices.get_data_stream(name=router.shared_pattern())
     assert streams["data_streams"]
 
 
 async def test_bootstrap_is_idempotent(
-    es: AsyncElasticsearch, itest_settings: Settings, router: TenantRouter
+    store: SearchStore, itest_settings: Settings, router: TenantRouter
 ) -> None:
     """It runs on every startup, so a second pass must be a no-op."""
-    await bootstrap_cluster(es, itest_settings, router)
-    await bootstrap_cluster(es, itest_settings, router)
+    await bootstrap_cluster(store, itest_settings, router)
+    await bootstrap_cluster(store, itest_settings, router)
 
 
 # ---------------------------------------------------------------------------
 # Write path
 # ---------------------------------------------------------------------------
 async def test_write_and_read_round_trip(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: TenantRouter
 ) -> None:
     route = router.resolve(TENANT_A)
     outcome = await repository.bulk_index(
@@ -226,13 +293,13 @@ async def test_write_and_read_round_trip(
     assert outcome.all_succeeded, outcome.failed
     assert outcome.succeeded == 5
 
-    await _refresh(es, router)
+    await _refresh(store, router)
     page = await repository.search(TenantScope(tenant_id=TENANT_A), AuditSearchFilter(), size=10)
     assert len(page.events) == 5
 
 
 async def test_duplicate_event_id_is_rejected_giving_exactly_once(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: TenantRouter
 ) -> None:
     """The property that makes the at-least-once queue safe.
 
@@ -252,7 +319,7 @@ async def test_duplicate_event_id_is_rejected_giving_exactly_once(
     assert second.all_succeeded
     assert second.succeeded == 1
 
-    await _refresh(es, router)
+    await _refresh(store, router)
     page = await repository.search(
         TenantScope(tenant_id=TENANT_A),
         AuditSearchFilter(event_ids=(event_id,)),
@@ -288,7 +355,7 @@ async def test_unmapped_field_is_rejected_by_strict_mapping(
 # Tenant isolation, enforced by the cluster
 # ---------------------------------------------------------------------------
 async def test_tenant_cannot_read_another_tenants_events(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: TenantRouter
 ) -> None:
     """The isolation guarantee, verified against a real index."""
     await repository.bulk_index(
@@ -297,7 +364,7 @@ async def test_tenant_cannot_read_another_tenants_events(
     await repository.bulk_index(
         [(router.resolve(TENANT_B), _document(TENANT_B, seq=300, actor_id="bob"))]
     )
-    await _refresh(es, router)
+    await _refresh(store, router)
 
     a_page = await repository.search(TenantScope(tenant_id=TENANT_A), AuditSearchFilter(), size=100)
     a_tenants = {event["tenant"]["id"] for event in a_page.events}
@@ -313,7 +380,7 @@ async def test_tenant_cannot_read_another_tenants_events(
 
 
 async def test_get_event_by_id_is_tenant_filtered(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: TenantRouter
 ) -> None:
     """Guessing an event id must not cross a tenant boundary.
 
@@ -324,26 +391,48 @@ async def test_get_event_by_id_is_tenant_filtered(
     await repository.bulk_index(
         [(router.resolve(TENANT_B), _document(TENANT_B, seq=400, event_id=event_id))]
     )
-    await _refresh(es, router)
+    await _refresh(store, router)
 
     assert await repository.get_event(TenantScope(tenant_id=TENANT_B), event_id)
     assert await repository.get_event(TenantScope(tenant_id=TENANT_A), event_id) is None
 
 
-async def test_dedicated_stream_rejects_a_wrong_tenant_document(
-    es: AsyncElasticsearch, router: TenantRouter
+async def test_a_wrong_tenant_document_never_reaches_the_store(
+    repository: AuditRepository, router: TenantRouter
 ) -> None:
-    """`constant_keyword` makes cross-tenant contamination impossible.
+    """The write-path guarantee, on whichever engine is configured.
+
+    A document must land in the stream belonging to the tenant it names. The
+    repository refuses the write itself, so the invariant does not depend on a
+    field type only one engine has - and it covers the shared stream too, which
+    neither engine guards.
+    """
+    route = router.resolve(DEDICATED_TENANT)
+    outcome = await repository.bulk_index([(route, _document("some-other-tenant", seq=99))])
+
+    assert outcome.succeeded == 0
+    assert "tenant_mismatch" in outcome.failed[0][1]
+
+
+async def test_elasticsearch_also_rejects_it_at_the_storage_layer(
+    store: SearchStore, router: TenantRouter
+) -> None:
+    """The second layer, where the engine provides one.
 
     A dedicated stream's backing index adopts the tenant id of its first
-    document; Elasticsearch then refuses any document with a different one. This
-    is a storage-layer guarantee, not an application check, so it holds even if
-    the routing code is wrong.
+    document, and `constant_keyword` then refuses any document carrying a
+    different one - a guarantee that holds even if the routing code is wrong.
+    OpenSearch has no dependable equivalent, which is why the repository guard
+    above exists; this test asserts the extra layer is still there on Elastic
+    rather than silently lost.
     """
+    if not isinstance(store, ElasticsearchBackend):
+        pytest.skip("constant_keyword is Elasticsearch-only; the guard above covers both")
+
     stream = router.dedicated_stream_name(DEDICATED_TENANT)
 
     # First document establishes the constant value.
-    await es.index(
+    await store.client.index(
         index=stream,
         document=_document(DEDICATED_TENANT, seq=0),
         op_type="create",
@@ -351,7 +440,7 @@ async def test_dedicated_stream_rejects_a_wrong_tenant_document(
     )
 
     with pytest.raises(BadRequestError) as caught:
-        await es.index(
+        await store.client.index(
             index=stream,
             document=_document("some-other-tenant", seq=1),
             op_type="create",
@@ -362,14 +451,32 @@ async def test_dedicated_stream_rejects_a_wrong_tenant_document(
 
 
 async def test_dedicated_tenant_reads_both_streams(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository,
+    store: SearchStore,
+    router: TenantRouter,
+    itest_settings: Settings,
 ) -> None:
-    """History written before promotion must stay visible."""
-    # An event in the shared stream, as if written before promotion.
-    shared_route = router.resolve(TENANT_A)
+    """History written before promotion must stay visible.
+
+    The setup has to be honest about how that history got there. Before the
+    promotion the router knew of no dedicated tenants, so `resolve` returned a
+    *shared* route that still carried this tenant's own id - which is what is
+    reconstructed here. Borrowing another tenant's route to reach the shared
+    stream would be a routing bug, and the repository's tenant guard refuses it.
+    """
+    before_promotion = TenantRouter(
+        shared_stream=itest_settings.SHARED_DATA_STREAM,
+        index_prefix=itest_settings.INDEX_PREFIX,
+        dedicated_tenants=frozenset(),
+        custom_routing=store.supports_custom_routing,
+    )
+    shared_route = before_promotion.resolve(DEDICATED_TENANT)
+    assert shared_route.write_target == router.shared_pattern()
+
     pre_promotion = _document(DEDICATED_TENANT, seq=500)
-    await repository.bulk_index([(shared_route, pre_promotion)])
-    await _refresh(es, router)
+    outcome = await repository.bulk_index([(shared_route, pre_promotion)])
+    assert outcome.succeeded == 1, outcome.failed
+    await _refresh(store, router)
 
     page = await repository.search(
         TenantScope(tenant_id=DEDICATED_TENANT), AuditSearchFilter(), size=100
@@ -382,7 +489,7 @@ async def test_dedicated_tenant_reads_both_streams(
 # Privacy, enforced by the mapping
 # ---------------------------------------------------------------------------
 async def test_ciphertext_is_not_searchable(
-    es: AsyncElasticsearch, router: TenantRouter, repository: AuditRepository
+    store: SearchStore, router: TenantRouter, repository: AuditRepository
 ) -> None:
     """`pii_ct` is mapped `enabled: false`, so encrypted blobs cannot be queried.
 
@@ -395,7 +502,7 @@ async def test_ciphertext_is_not_searchable(
 
     outcome = await repository.bulk_index([(router.resolve(TENANT_A), document)])
     assert outcome.all_succeeded, outcome.failed
-    await _refresh(es, router)
+    await _refresh(store, router)
 
     # The value is retrievable from _source...
     stored = await repository.get_event(TenantScope(tenant_id=TENANT_A), document["event"]["id"])
@@ -405,7 +512,7 @@ async def test_ciphertext_is_not_searchable(
     # ...but not searchable. `enabled: false` means the subfields are unmapped,
     # so a term query matches nothing rather than confirming the value exists.
     # That is the guarantee: no oracle over encrypted content.
-    response = await es.search(
+    response = await store.client.search(
         index=router.shared_pattern(),
         body={
             "query": {"term": {"pii_ct.actor.email": "v1:nonce:ciphertextblob"}},
@@ -417,7 +524,7 @@ async def test_ciphertext_is_not_searchable(
 
 
 async def test_pii_fields_are_absent_from_the_mapping(
-    es: AsyncElasticsearch, itest_settings: Settings
+    store: SearchStore, itest_settings: Settings
 ) -> None:
     """`actor.email` is deliberately unmapped.
 
@@ -428,7 +535,8 @@ async def test_pii_fields_are_absent_from_the_mapping(
         name_pattern="x",
         shards=1,
         replicas=0,
-        ilm_policy_name=itest_settings.ILM_POLICY_NAME,
+        backend=store,
+        policy_name=itest_settings.ILM_POLICY_NAME,
     )
     actor_properties = template["template"]["mappings"]["properties"]["actor"]["properties"]
     assert "email" not in actor_properties
@@ -441,12 +549,19 @@ async def test_pii_fields_are_absent_from_the_mapping(
 
 
 def test_shared_and_dedicated_templates_differ_only_where_intended(
-    itest_settings: Settings,
+    store: SearchStore,
 ) -> None:
-    """The dedicated template's higher priority and constant_keyword matter."""
-    shared = shared_index_template(name_pattern="a", shards=3, replicas=0, ilm_policy_name="p")
+    """Higher priority on the dedicated template, and a pinned tenant id.
+
+    The pinned type is whatever the configured engine offers - Elastic's
+    `constant_keyword`, or `keyword` where there is nothing to pin with - so
+    this asserts the shape rather than one engine's field name.
+    """
+    shared = shared_index_template(
+        name_pattern="a", shards=3, replicas=0, backend=store, policy_name="p"
+    )
     dedicated = dedicated_index_template(
-        name_pattern="b", shards=1, replicas=0, ilm_policy_name="p"
+        name_pattern="b", shards=1, replicas=0, backend=store, policy_name="p"
     )
     assert dedicated["priority"] > shared["priority"]
     assert (
@@ -454,8 +569,8 @@ def test_shared_and_dedicated_templates_differ_only_where_intended(
         == "keyword"
     )
     assert (
-        dedicated["template"]["mappings"]["properties"]["tenant"]["properties"]["id"]["type"]
-        == "constant_keyword"
+        dedicated["template"]["mappings"]["properties"]["tenant"]["properties"]["id"]
+        == store.field_types.pinned_tenant
     )
 
 
@@ -463,7 +578,7 @@ def test_shared_and_dedicated_templates_differ_only_where_intended(
 # Pagination, export and integrity over real data
 # ---------------------------------------------------------------------------
 async def test_cursor_pagination_covers_every_event_exactly_once(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: TenantRouter
 ) -> None:
     """`search_after` must neither skip nor repeat a row.
 
@@ -477,7 +592,7 @@ async def test_cursor_pagination_covers_every_event_exactly_once(
         for document in (_document(tenant, seq=index) for index in range(25))
     }
     await repository.bulk_index([(route, doc) for doc in expected.values()])
-    await _refresh(es, router)
+    await _refresh(store, router)
 
     seen: list[str] = []
     cursor: list[Any] | None = None
@@ -500,13 +615,13 @@ async def test_cursor_pagination_covers_every_event_exactly_once(
 
 
 async def test_point_in_time_export_is_a_consistent_snapshot(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: TenantRouter
 ) -> None:
     """A PIT freezes the view, so an export is a snapshot rather than a smear."""
     tenant = f"{TENANT_A}-pit"
     route = router.resolve(tenant)
     await repository.bulk_index([(route, _document(tenant, seq=index)) for index in range(10)])
-    await _refresh(es, router)
+    await _refresh(store, router)
 
     pit_id = await repository.open_pit(TenantScope(tenant_id=tenant))
     try:
@@ -514,7 +629,7 @@ async def test_point_in_time_export_is_a_consistent_snapshot(
         await repository.bulk_index(
             [(route, _document(tenant, seq=index)) for index in range(10, 20)]
         )
-        await _refresh(es, router)
+        await _refresh(store, router)
 
         collected: list[dict[str, Any]] = []
         cursor: list[Any] | None = None
@@ -539,7 +654,7 @@ async def test_point_in_time_export_is_a_consistent_snapshot(
 
 
 async def test_chain_written_to_the_cluster_verifies_after_round_trip(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: TenantRouter
 ) -> None:
     """The hash must survive storage and retrieval.
 
@@ -560,7 +675,7 @@ async def test_chain_written_to_the_cluster_verifies_after_round_trip(
 
     outcome = await repository.bulk_index([(route, doc) for doc in documents])
     assert outcome.all_succeeded, outcome.failed
-    await _refresh(es, router)
+    await _refresh(store, router)
 
     retrieved = await repository.fetch_chain_slice(
         chain_id=chain_id, tenant_id=tenant, start_seq=0, limit=100
@@ -573,7 +688,7 @@ async def test_chain_written_to_the_cluster_verifies_after_round_trip(
 
 
 async def test_aggregation_returns_buckets(
-    repository: AuditRepository, es: AsyncElasticsearch, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: TenantRouter
 ) -> None:
     tenant = f"{TENANT_A}-agg"
     route = router.resolve(tenant)
@@ -584,7 +699,7 @@ async def test_aggregation_returns_buckets(
             (route, _document(tenant, seq=2, action="credential.revoke")),
         ]
     )
-    await _refresh(es, router)
+    await _refresh(store, router)
 
     aggregations = await repository.aggregate(
         TenantScope(tenant_id=tenant), AuditSearchFilter(), group_by="event.action"
@@ -595,7 +710,7 @@ async def test_aggregation_returns_buckets(
 
 
 async def test_dedicated_stream_does_not_require_routing(
-    es: AsyncElasticsearch, router: TenantRouter
+    store: SearchStore, router: TenantRouter
 ) -> None:
     """Regression guard for the `allow_custom_routing` / `_routing` coupling.
 
@@ -608,14 +723,17 @@ async def test_dedicated_stream_does_not_require_routing(
 
     This asserts the cluster-side facts, so re-adding the flag fails here.
     """
+    if not store.supports_custom_routing:
+        pytest.skip("this engine has no custom routing to couple `_routing` to")
+
     stream = router.dedicated_stream_name(DEDICATED_TENANT)
-    streams = await es.indices.get_data_stream(name=stream)
+    streams = await store.client.indices.get_data_stream(name=stream)
     assert streams["data_streams"][0].get("allow_custom_routing") is False
 
     backing = streams["data_streams"][0]["indices"][0]["index_name"]
-    mapping = await es.indices.get_mapping(index=backing)
+    mapping = await store.client.indices.get_mapping(index=backing)
     assert mapping[backing]["mappings"].get("_routing") is None
 
     # And the shared stream, which does supply routing, has it required.
-    shared = await es.indices.get_data_stream(name=router.shared_pattern())
+    shared = await store.client.indices.get_data_stream(name=router.shared_pattern())
     assert shared["data_streams"][0].get("allow_custom_routing") is True

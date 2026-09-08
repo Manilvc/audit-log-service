@@ -19,6 +19,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
+from app.core.constants import DOMAIN_PATTERN, MAX_DOMAIN_LENGTH, MAX_KEY_LABEL_LENGTH
 from app.domain.enums import (
     ActorType,
     EntityType,
@@ -465,3 +466,77 @@ def _redact_mapping(value: dict[str, Any], *, depth: int) -> dict[str, Any]:
         else:
             redacted[key] = item
     return redacted
+
+
+# ---------------------------------------------------------------------------
+# Issued API keys
+# ---------------------------------------------------------------------------
+class ApiKeyIssueRequest(BaseModel):
+    """Ask for an ingest credential for one emitting system.
+
+    No `tenant_id` field: the tenant comes from `x-audit-tenant-id`, so a key
+    can only be bound to the tenant the request itself named.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    domain: Annotated[
+        str,
+        StringConstraints(
+            min_length=1,
+            max_length=MAX_DOMAIN_LENGTH,
+            pattern=DOMAIN_PATTERN,
+            strip_whitespace=True,
+        ),
+    ]
+    """The emitting system, e.g. `hrms.acme.example`. A hostname, not a URL:
+    this is the identity stamped onto every event the key writes, not an
+    address anything calls back."""
+
+    label: Annotated[str, StringConstraints(max_length=MAX_KEY_LABEL_LENGTH)] = ""
+    """Free text for whoever has to recognise this key in six months."""
+
+    scopes: list[str] | None = None
+    """Defaults to `audit:write` alone. `audit:erase`, `audit:admin` and
+    `audit:cross_tenant` are refused however they are asked for."""
+
+    expires_in_days: int | None = Field(default=None, ge=1, le=3650)
+    """Shorter than the configured default, never longer."""
+
+
+class ApiKeySummary(BaseModel):
+    """A stored key, as a management view sees it. Carries no secret."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str
+    tenant_id: str
+    domain: str
+    label: str
+    scopes: list[str]
+    status: str
+    created_at: datetime
+    created_by: str
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
+    last_used_at: datetime | None = None
+
+
+class ApiKeyIssued(ApiKeySummary):
+    """A freshly minted key. The only response that ever carries the secret."""
+
+    api_key: str
+    """The credential, in full. It is not stored and cannot be retrieved again -
+    the record keeps a peppered digest, which is one way."""
+
+    hint: str
+    """Last few characters, matching what the listing shows, so an operator can
+    tell later which key this was."""
+
+
+class ApiKeyListResponse(BaseModel):
+    """Every key issued to one tenant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    keys: list[ApiKeySummary]

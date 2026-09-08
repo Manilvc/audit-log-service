@@ -28,7 +28,6 @@ from app.core.metrics import QUEUE_DEAD_LETTER_TOTAL, QUEUE_DEPTH
 from app.core.responses import ORJSONResponse, success
 from app.domain.enums import Scope
 from app.search.bootstrap import ensure_tenant_stream
-from app.search.client import cluster_info, ping
 
 logger = get_logger(__name__)
 
@@ -57,13 +56,13 @@ async def liveness() -> ORJSONResponse:
 async def readiness(request: Request, response: Response) -> Any:
     """Can the service serve traffic?
 
-    Readiness *does* check dependencies, because a replica that cannot reach
-    Redis cannot accept an audit event and should be taken out of rotation.
+        Readiness *does* check dependencies, because a replica that cannot reach
+        Redis cannot accept an audit event and should be taken out of rotation.
 
-    Elasticsearch being down is reported but does **not** fail readiness: the
-    queue absorbs writes during an ES outage, which is the entire reason it
-    exists. Failing readiness there would stop ingest and lose the events the
-    design is meant to protect.
+    The search store being down is reported but does **not** fail readiness: the
+        queue absorbs writes during an outage, which is the entire reason it exists.
+        Failing readiness there would stop ingest and lose the events the design is
+        meant to protect.
     """
     container = request.app.state.container
     checks: dict[str, object] = {}
@@ -76,8 +75,10 @@ async def readiness(request: Request, response: Response) -> Any:
         checks["redis"] = f"unavailable: {exc}"
         redis_ok = False
 
-    es_ok = await ping(container.es)
-    checks["elasticsearch"] = "ok" if es_ok else "unavailable (writes still buffered)"
+    store_ok = await container.search.ping()
+    # Keyed by the engine's own name, so the report says which store answered
+    # and today's response shape is unchanged.
+    checks[container.search.name] = "ok" if store_ok else "unavailable (writes still buffered)"
 
     if not redis_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -101,9 +102,9 @@ async def health(request: Request, settings: SettingsDep) -> ORJSONResponse:
     }
 
     try:
-        report["elasticsearch"] = await cluster_info(container.es)
+        report[container.search.name] = await container.search.info()
     except Exception as exc:
-        report["elasticsearch"] = {"error": str(exc)}
+        report[container.search.name] = {"error": str(exc)}
 
     try:
         report["queue"] = await container.queue.depth()
@@ -161,7 +162,7 @@ async def dedicate_tenant(
     """
     principal.require(Scope.ADMIN)
     container = request.app.state.container
-    stream = await ensure_tenant_stream(container.es, container.router, tenant_id)
+    stream = await ensure_tenant_stream(container.search, container.router, tenant_id)
 
     already_routed = tenant_id in settings.dedicated_tenant_set
     logger.warning(

@@ -91,6 +91,21 @@ service account alone.
 
 ## 3. Infrastructure
 
+### Which search store
+
+`SEARCH_BACKEND` picks the engine, and it is a **deploy-time** choice — one
+process talks to one store:
+
+| | `elasticsearch` (default) | `opensearch` |
+|---|---|---|
+| Local port | 9200 | 9202 |
+| Compose service | `elasticsearch` | `opensearch` |
+| Retention | ILM | ISM |
+| Notes | What every existing deployment runs | [`OPENSEARCH_DEPLOYMENT.md`](OPENSEARCH_DEPLOYMENT.md) |
+
+Both containers can run at once, which is how the integration suite is checked
+against either engine without tearing the other down.
+
 Start only the data plane (API and worker run on the host via `uv`):
 
 ```bash

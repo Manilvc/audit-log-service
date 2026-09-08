@@ -242,6 +242,9 @@ rather than starting and hoping.
 | `unit/test_crypto_shredding.py` | `core/security/crypto.py` |
 | `unit/test_auth.py` | `core/security/auth.py` |
 | `unit/test_identity_headers.py` | `api/deps.py` — tenant, issuer and acting-user headers |
+| `unit/test_search_backends.py` | `search/backends/elastic.py` — the port contract and ILM |
+| `unit/test_opensearch_backend.py` | `search/backends/opensearch.py`, ISM, and the tenant write guard |
+| `unit/test_docs_pages.py` | `main.py` — both documentation pages under every mount |
 | `unit/test_chain_allocator.py` | `queue/chain.py` incl. concurrency and leases |
 | `unit/test_ingest_and_schemas.py` | `services/ingest_service.py`, `schemas/api.py` |
 | `unit/test_legacy.py`, `unit/test_backfill.py` | `domain/legacy.py`, `tools/backfill.py` |

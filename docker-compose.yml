@@ -48,6 +48,55 @@ services:
       start_period: 60s
 
   # ---------------------------------------------------------------------------
+  # OpenSearch - the alternative search store (SEARCH_BACKEND=opensearch)
+  #
+  # Runs alongside Elasticsearch rather than instead of it, on 9201, so the
+  # integration suite can be pointed at either engine without tearing the other
+  # down. Start only what you need:
+  #   docker compose up -d elasticsearch redis    # the default engine
+  #   docker compose up -d opensearch redis       # the alternative
+  # ---------------------------------------------------------------------------
+  opensearch:
+    # Not pinned to a patch: OpenSearch publishes a moving `2` tag, and CI pins
+    # an exact version through OPENSEARCH_IMAGE_TAG so a local run and a CI run
+    # can differ deliberately rather than by accident.
+    image: opensearchproject/opensearch:${OPENSEARCH_IMAGE_TAG:-2}
+    container_name: audit-opensearch
+    environment:
+      - node.name=audit-opensearch
+      - discovery.type=single-node
+      # Security is DISABLED for local development only, which is also what
+      # keeps the endpoint on plain http. A managed AWS domain is the opposite:
+      # fine-grained access control, TLS enforced, and the service refuses to
+      # start with an http:// host when ENVIRONMENT=prod.
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      # 1 GB heap is enough for development. Production sizing is the same rule
+      # as Elasticsearch: 50% of container memory, never above ~31 GB.
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - bootstrap.memory_lock=true
+      - cluster.routing.allocation.disk.threshold_enabled=true
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ports:
+      # 9202 outside, 9200 inside: both engines can be up at once. Not 9201 -
+      # `docker-compose.override.yml` moves Elasticsearch there on a machine
+      # where a native install already holds 9200, and two services claiming
+      # one host port fails the whole `compose up`.
+      - "9202:9200"
+    healthcheck:
+      # `status=yellow` is correct for a single node: replicas cannot be
+      # allocated with one node, so green is unreachable.
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
   # Redis - the durable ingest buffer
   # ---------------------------------------------------------------------------
   redis:
@@ -151,5 +200,6 @@ services:
 
 volumes:
   es-data:
+  opensearch-data:
   redis-data:
   minio-data:
