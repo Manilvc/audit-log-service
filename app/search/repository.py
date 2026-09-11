@@ -91,10 +91,15 @@ class AuditRepository:
         *,
         max_window_days: int,
         search_timeout: str,
+        default_window_days: int = 1,
     ) -> None:
         self._store = backend
         self._router = router
         self._max_window_days = max_window_days
+        # Applied when the caller names neither bound. Clamped to the maximum,
+        # so a misconfiguration cannot widen the ceiling the max is there to
+        # enforce.
+        self._default_window_days = max(1, min(default_window_days, max_window_days))
         self._search_timeout = search_timeout
 
     # ------------------------------------------------------------------ write
@@ -217,6 +222,7 @@ class AuditRepository:
             criteria,
             size=size,
             max_window_days=self._max_window_days,
+            default_window_days=self._default_window_days,
             search_after=search_after,
             track_total_hits=with_total,
             source_fields=source_fields,
@@ -263,6 +269,7 @@ class AuditRepository:
             criteria,
             group_by=group_by,
             max_window_days=self._max_window_days,
+            default_window_days=self._default_window_days,
             interval=interval,
             size=size,
         )
@@ -328,6 +335,7 @@ class AuditRepository:
             criteria,
             size=size,
             max_window_days=self._max_window_days,
+            default_window_days=self._default_window_days,
             search_after=search_after,
             track_total_hits=False,
             timeout=self._search_timeout,

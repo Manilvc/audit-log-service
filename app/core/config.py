@@ -169,6 +169,11 @@ class Settings(BaseSettings):
     # Refuse unbounded time ranges - an audit search with no window is a
     # full-retention scan across six years of data.
     MAX_QUERY_WINDOW_DAYS: int = 400
+    # Window applied when a caller names neither `start` nor `end`. One day
+    # keeps a careless "show me everything" cheap, but a console that lists
+    # recent activity without asking the user for dates needs more, so it is
+    # configuration rather than a constant. Capped by MAX_QUERY_WINDOW_DAYS.
+    DEFAULT_QUERY_WINDOW_DAYS: int = 1
     SEARCH_TIMEOUT: str = "20s"
 
     # ------------------------------------------------------------ redis queue

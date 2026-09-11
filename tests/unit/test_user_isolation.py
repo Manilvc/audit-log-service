@@ -420,3 +420,59 @@ def test_bulk_target_ids_match_both_single_and_bulk_events() -> None:
         for field in clause[key]
     }
     assert fields == {"target.id", "target.ids"}
+
+
+# ---------------------------------------------------------------------------
+# The default search window
+# ---------------------------------------------------------------------------
+def test_a_search_with_no_dates_still_gets_a_window() -> None:
+    """Unbounded is never allowed - it is a full-retention scan."""
+    from app.search.query import build_query
+
+    query = build_query(UserScope(user_uuid="user-a"), AuditSearchFilter(), max_window_days=400)
+    ranges = [c for c in query["bool"]["filter"] if "range" in c]
+
+    assert len(ranges) == 1, "a time range is always applied"
+
+
+def test_the_default_window_is_configurable() -> None:
+    """A console listing recent activity should not have to compute dates."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.search.query import build_query
+
+    now = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+
+    def window(days: int) -> timedelta:
+        query = build_query(
+            UserScope(user_uuid="user-a"),
+            AuditSearchFilter(),
+            max_window_days=400,
+            default_window_days=days,
+            now=now,
+        )
+        clause = next(c for c in query["bool"]["filter"] if "range" in c)["range"]["@timestamp"]
+        return datetime.fromisoformat(clause["lte"]) - datetime.fromisoformat(clause["gte"])
+
+    assert window(1) == timedelta(days=1)
+    assert window(30) == timedelta(days=30)
+    assert window(365) == timedelta(days=365)
+
+
+def test_an_explicit_range_still_wins_over_the_default() -> None:
+    from datetime import UTC, datetime
+
+    from app.search.query import build_query
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 6, 1, tzinfo=UTC)
+    query = build_query(
+        UserScope(user_uuid="user-a"),
+        AuditSearchFilter(start=start, end=end),
+        max_window_days=400,
+        default_window_days=30,
+    )
+    clause = next(c for c in query["bool"]["filter"] if "range" in c)["range"]["@timestamp"]
+
+    assert datetime.fromisoformat(clause["gte"]) == start
+    assert datetime.fromisoformat(clause["lte"]) == end

@@ -124,6 +124,7 @@ def build_container(settings: Settings) -> ServiceContainer:
         search,
         router,
         max_window_days=settings.MAX_QUERY_WINDOW_DAYS,
+        default_window_days=settings.DEFAULT_QUERY_WINDOW_DAYS,
         search_timeout=settings.SEARCH_TIMEOUT,
     )
     keyring = SearchKeyRing(search, index=keyring_index_name(settings))

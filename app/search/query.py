@@ -113,6 +113,7 @@ def build_query(
     criteria: AuditSearchFilter,
     *,
     max_window_days: int,
+    default_window_days: int = 1,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Assemble the bool query, user constraint always included.
@@ -127,7 +128,7 @@ def build_query(
         QueryValidationError: the time window is missing, inverted or too wide.
     """
     reference = now or datetime.now(UTC)
-    start, end = _resolve_window(criteria, reference, max_window_days)
+    start, end = _resolve_window(criteria, reference, max_window_days, default_window_days)
 
     # ---- user constraint: first clause, never conditional on caller input --
     filters: list[dict[str, Any]] = []
@@ -234,6 +235,7 @@ def build_search_body(
     *,
     size: int,
     max_window_days: int,
+    default_window_days: int = 1,
     search_after: list[Any] | None = None,
     track_total_hits: bool | int = False,
     source_fields: list[str] | None = None,
@@ -253,7 +255,12 @@ def build_search_body(
     if sort_date_format is not None:
         timestamp_sort["format"] = sort_date_format
     body: dict[str, Any] = {
-        "query": build_query(scope, criteria, max_window_days=max_window_days),
+        "query": build_query(
+            scope,
+            criteria,
+            max_window_days=max_window_days,
+            default_window_days=default_window_days,
+        ),
         "size": size,
         "sort": [
             {"@timestamp": timestamp_sort},
@@ -277,6 +284,7 @@ def build_aggregation_body(
     *,
     group_by: str,
     max_window_days: int,
+    default_window_days: int = 1,
     interval: str | None = None,
     size: int = 50,
 ) -> dict[str, Any]:
@@ -286,7 +294,12 @@ def build_aggregation_body(
     mistake is to aggregate while also retrieving documents nobody reads.
     """
     body: dict[str, Any] = {
-        "query": build_query(scope, criteria, max_window_days=max_window_days),
+        "query": build_query(
+            scope,
+            criteria,
+            max_window_days=max_window_days,
+            default_window_days=default_window_days,
+        ),
         "size": 0,
         "track_total_hits": False,
     }
@@ -335,15 +348,19 @@ def _resolve_window(
     criteria: AuditSearchFilter,
     reference: datetime,
     max_window_days: int,
+    default_window_days: int = 1,
 ) -> tuple[datetime, datetime]:
     """Resolve and validate the time window.
 
-    Defaults to the last 24 hours when neither bound is given. An unbounded
-    audit query is a full-retention scan, which is both a performance incident
-    and a sign the caller does not know what they are looking for.
+    Falls back to `default_window_days` when neither bound is given. There is
+    always *some* window: an unbounded audit query is a full-retention scan,
+    which is both a performance incident and a sign the caller does not know
+    what they are looking for. How wide that fallback is belongs to the
+    deployment - a console listing recent activity without asking for dates
+    needs more than a day - so it comes from `DEFAULT_QUERY_WINDOW_DAYS`.
     """
     end = criteria.end or reference
-    start = criteria.start or (end - timedelta(days=1))
+    start = criteria.start or (end - timedelta(days=max(default_window_days, 1)))
 
     if start.tzinfo is None or end.tzinfo is None:
         raise QueryValidationError("start and end must be timezone-aware")
