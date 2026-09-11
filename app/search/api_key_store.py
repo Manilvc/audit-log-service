@@ -40,7 +40,13 @@ class ApiKeyRecord:
     """One issued key, as stored. Never carries the secret itself."""
 
     key_id: str
-    user_uuid: str
+    user_uuid: str | None
+    """The user this key may act for, or None when it is unbound.
+
+    An unbound key takes its user from `x-audit-user-uuid` on each request, so
+    one credential serves a backend that acts for every user. It is still
+    scope-limited and revocable, which is what separates it from the
+    env-configured admin key."""
     domain: str
     label: str
     secret_digest: str
@@ -57,6 +63,11 @@ class ApiKeyRecord:
     @property
     def is_revoked(self) -> bool:
         return self.status == API_KEY_STATUS_REVOKED
+
+    @property
+    def is_unbound(self) -> bool:
+        """True when the request header decides the user rather than the key."""
+        return self.user_uuid is None
 
     def is_expired(self, now: datetime) -> bool:
         """Whether the key's own expiry has passed."""
@@ -100,7 +111,7 @@ def _to_record(source: dict[str, Any]) -> ApiKeyRecord:
     created_at = _parse_timestamp(source.get("created_at"))
     return ApiKeyRecord(
         key_id=str(source["key_id"]),
-        user_uuid=str(source["user_uuid"]),
+        user_uuid=(str(raw_user) if (raw_user := source.get("user_uuid")) else None),
         domain=str(source.get("domain", "")),
         label=str(source.get("label", "")),
         secret_digest=str(source["secret_digest"]),
@@ -195,7 +206,10 @@ class ApiKeyStore:
         *,
         size: int = API_KEY_LIST_MAX_SIZE,
     ) -> list[ApiKeyRecord]:
-        """Every key issued to one user, newest first.
+        """Every key that can act for one user, newest first.
+
+        Includes unbound keys, which can act for any user and therefore for
+        this one.
 
         One query returns the whole page and the records are built from that
         response - there is no per-key lookup, because a list endpoint that
@@ -204,7 +218,24 @@ class ApiKeyStore:
         response = await self._store.search(
             index=self._index,
             body={
-                "query": {"bool": {"filter": [{"term": {"user_uuid": user_uuid}}]}},
+                # This user's own keys, plus every unbound key - an unbound one
+                # can write to this user's trail, so a management view that
+                # hid it would understate who can reach these records.
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {
+                                "bool": {
+                                    "should": [
+                                        {"term": {"user_uuid": user_uuid}},
+                                        {"bool": {"must_not": {"exists": {"field": "user_uuid"}}}},
+                                    ],
+                                    "minimum_should_match": 1,
+                                }
+                            }
+                        ]
+                    }
+                },
                 "size": min(size, API_KEY_LIST_MAX_SIZE),
                 "sort": [{"created_at": {"order": "desc"}}],
                 "track_total_hits": False,

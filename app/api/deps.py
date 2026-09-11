@@ -139,20 +139,39 @@ def _validated_user(user_uuid: str | None) -> str | None:
     return UserRouter.validate_user_uuid(user_uuid)
 
 
-def _assert_key_user_matches_header(record: ApiKeyRecord, requested: str | None) -> None:
-    """An issued key may only act for the user it was issued to.
+def _resolve_key_user(record: ApiKeyRecord, requested: str | None) -> str:
+    """Settle which user an issued key is acting for on this request.
 
-    The header stays legal - every emitter sends it - but it can only agree.
-    Naming a different user is an attempt to write into someone else's trail,
-    so it is refused rather than quietly resolved in the key's favour.
+    Two kinds of key, and the difference is the point of binding at all:
+
+    * **Bound** (`record.user_uuid` set). The key decides. The header stays
+      legal - every emitter sends it - but it can only agree. Naming a
+      different user is an attempt to write into someone else's trail, so it
+      is refused rather than quietly resolved in the key's favour.
+    * **Unbound** (`record.user_uuid` is None). The header decides, so a single
+      credential serves a backend that acts for every user. The header is then
+      mandatory: without it there is no user, and an event with no user cannot
+      be filed or filtered.
 
     Raises:
-        AuthorizationError: the header names a different user.
+        AuthorizationError: a bound key was used for a different user.
+        InvalidUserUuidError: an unbound key was used with no user header.
     """
+    # `record.user_uuid is None` rather than `record.is_unbound`: same
+    # condition, but this form narrows the type for the return below.
+    if record.user_uuid is None:
+        if requested is None:
+            raise InvalidUserUuidError(
+                f"this API key is not bound to a user, so {USER_UUID_HEADER} is "
+                "required to name the user whose trail this call acts on"
+            )
+        return requested
+
     if requested is not None and requested != record.user_uuid:
         raise AuthorizationError(
             f"this API key is bound to a different user than the {USER_UUID_HEADER} header names"
         )
+    return record.user_uuid
 
 
 async def _principal_from_issued_key(
@@ -172,6 +191,7 @@ async def _principal_from_issued_key(
     Raises:
         AuthenticationError: the key is not usable, for any reason.
         AuthorizationError: it is usable but bound to another user.
+        InvalidUserUuidError: it is unbound and no user header was sent.
     """
     if service is None:
         raise AuthenticationError("invalid service API key")
@@ -180,11 +200,10 @@ async def _principal_from_issued_key(
     if record is None:
         raise AuthenticationError("invalid service API key")
 
-    _assert_key_user_matches_header(record, requested_user)
     return authenticator.issued_key_principal(
         key_id=record.key_id,
         domain=record.domain,
-        user_uuid=record.user_uuid,
+        user_uuid=_resolve_key_user(record, requested_user),
         scopes=to_scopes(record),
         on_behalf_of=acting_for,
     )

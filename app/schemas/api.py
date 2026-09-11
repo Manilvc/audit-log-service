@@ -475,7 +475,9 @@ class ApiKeyIssueRequest(BaseModel):
     """Ask for an ingest credential for one emitting system.
 
     No `user_uuid` field: the user comes from `x-audit-user-uuid`, so a key
-    can only be bound to the user the request itself named.
+    can only be bound to the user the request itself named. Set `all_users`
+    to mint an unbound key instead, which takes its user from that same header
+    on every later request rather than from the record.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -503,6 +505,17 @@ class ApiKeyIssueRequest(BaseModel):
     expires_in_days: int | None = Field(default=None, ge=1, le=3650)
     """Shorter than the configured default, never longer."""
 
+    all_users: bool = False
+    """Mint a key that is not bound to any one user.
+
+    For a backend that acts for every user on the platform: one credential,
+    and `x-audit-user-uuid` names the user per request. The forbidden scopes
+    still cannot be granted, so an unbound key can write and read but never
+    erase, administer or reach across users.
+
+    When true, `x-audit-user-uuid` must be *absent* from the minting request -
+    sending one would suggest a binding that is not being created."""
+
 
 class ApiKeySummary(BaseModel):
     """A stored key, as a management view sees it. Carries no secret."""
@@ -510,7 +523,8 @@ class ApiKeySummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     key_id: str
-    user_uuid: str
+    user_uuid: str | None
+    """None for an unbound key, which acts for whichever user the header names."""
     domain: str
     label: str
     scopes: list[str]

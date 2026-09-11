@@ -65,7 +65,8 @@ class FakeApiKeyStore:
         return revoked
 
     async def list_for_user(self, user_uuid: str, *, size: int) -> list[ApiKeyRecord]:
-        matching = [r for r in self.records.values() if r.user_uuid == user_uuid]
+        # Mirrors the real query: this user's keys, plus every unbound one.
+        matching = [r for r in self.records.values() if r.user_uuid in (user_uuid, None)]
         return matching[:size]
 
 
@@ -284,3 +285,123 @@ async def test_a_key_from_another_user_reads_as_missing(service: ApiKeyService) 
 
     assert await service.get_for_user(minted.record.key_id, user_uuid=USER) is not None
     assert await service.get_for_user(minted.record.key_id, user_uuid="user-b") is None
+
+
+# ---------------------------------------------------------------------------
+# Unbound keys - one credential for a backend that acts for every user
+# ---------------------------------------------------------------------------
+async def test_an_unbound_key_is_issued_with_no_user(service: ApiKeyService) -> None:
+    """`user_uuid=None` is the whole contract: the header decides later."""
+    minted = await service.issue(user_uuid=None, domain=DOMAIN, label="backend", created_by="admin")
+
+    assert minted.record.user_uuid is None
+    assert minted.record.is_unbound is True
+
+
+async def test_an_unbound_key_still_verifies(service: ApiKeyService) -> None:
+    """Being unbound changes who it acts for, not whether it authenticates."""
+    minted = await service.issue(user_uuid=None, domain=DOMAIN, label="", created_by="admin")
+
+    verified = await service.verify(minted.plaintext)
+
+    assert verified is not None
+    assert verified.key_id == minted.record.key_id
+    assert verified.user_uuid is None
+
+
+async def test_an_unbound_key_can_never_hold_the_forbidden_scopes() -> None:
+    """The one guarantee that keeps it weaker than the env admin credential."""
+    for scope in ("audit:erase", "audit:admin", "audit:cross_user"):
+        with pytest.raises(ApiKeyError):
+            resolve_requested_scopes(("audit:write", scope))
+
+
+async def test_an_unbound_key_is_visible_to_every_user(service: ApiKeyService) -> None:
+    """It can write to anyone's trail, so every management view must show it."""
+    minted = await service.issue(user_uuid=None, domain=DOMAIN, label="", created_by="admin")
+
+    assert await service.get_for_user(minted.record.key_id, user_uuid=USER) is not None
+    assert await service.get_for_user(minted.record.key_id, user_uuid="user-b") is not None
+
+
+async def test_a_bound_key_is_still_confined_to_its_user(service: ApiKeyService) -> None:
+    """Adding unbound keys must not loosen the existing binding."""
+    minted = await service.issue(user_uuid=USER, domain=DOMAIN, label="", created_by="admin")
+
+    assert await service.get_for_user(minted.record.key_id, user_uuid=USER) is not None
+    assert await service.get_for_user(minted.record.key_id, user_uuid="user-b") is None
+
+
+async def test_a_record_written_before_binding_existed_reads_as_unbound() -> None:
+    """A legacy document must not raise - that is what 500d the whole request."""
+    from app.search.api_key_store import _to_record
+
+    record = _to_record(
+        {
+            "key_id": "k-legacy",
+            "domain": DOMAIN,
+            "secret_digest": "deadbeef",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+
+    assert record.user_uuid is None
+    assert record.is_unbound is True
+
+
+# ---------------------------------------------------------------------------
+# Which user a key acts for - the decision the isolation model rests on
+# ---------------------------------------------------------------------------
+def _key_record(user_uuid: str | None) -> ApiKeyRecord:
+    """A minimal stored key, bound or not."""
+    return ApiKeyRecord(
+        key_id="k-1",
+        user_uuid=user_uuid,
+        domain=DOMAIN,
+        label="",
+        secret_digest="deadbeef",
+        digest_scheme=DIGEST_SCHEME_SHA256,
+        scopes=("audit:write",),
+        status="active",
+        created_at=datetime.now(UTC),
+        created_by="admin",
+    )
+
+
+def test_a_bound_key_ignores_an_absent_header() -> None:
+    """The key is authoritative, so no header is needed to resolve the user."""
+    from app.api.deps import _resolve_key_user
+
+    assert _resolve_key_user(_key_record(USER), None) == USER
+
+
+def test_a_bound_key_accepts_a_header_that_agrees() -> None:
+    from app.api.deps import _resolve_key_user
+
+    assert _resolve_key_user(_key_record(USER), USER) == USER
+
+
+def test_a_bound_key_refuses_a_header_naming_someone_else() -> None:
+    """Writing into another user's trail is refused, not silently corrected."""
+    from app.api.deps import _resolve_key_user
+    from app.core.security.auth import AuthorizationError
+
+    with pytest.raises(AuthorizationError):
+        _resolve_key_user(_key_record(USER), "user-b")
+
+
+def test_an_unbound_key_takes_the_user_from_the_header() -> None:
+    """This is what lets one backend credential serve every user."""
+    from app.api.deps import _resolve_key_user
+
+    assert _resolve_key_user(_key_record(None), "user-b") == "user-b"
+    assert _resolve_key_user(_key_record(None), USER) == USER
+
+
+def test_an_unbound_key_without_a_header_is_refused() -> None:
+    """No key binding and no header means no user, and no user means no write."""
+    from app.api.deps import _resolve_key_user
+    from app.search.routing import InvalidUserUuidError
+
+    with pytest.raises(InvalidUserUuidError):
+        _resolve_key_user(_key_record(None), None)

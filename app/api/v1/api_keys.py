@@ -8,6 +8,12 @@ The user comes from ``x-audit-user-uuid``, not from the body. A key is bound
 to the user named on the request that created it, which means an admin cannot
 mint a key for a user they did not name in the header the gateway can see.
 
+A key minted with ``all_users: true`` is **unbound**: it carries no user, and
+the same header names the user on each later request. That is the shape a
+single backend serving every user needs. It stays weaker than the env
+credential - the forbidden scopes are still refused - and unlike an env key it
+has a record, so it can be listed, attributed and revoked.
+
 Routes
 ------
 ``POST /api-keys``
@@ -26,7 +32,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Path, Query, status
 
-from app.api.deps import ApiKeyServiceDep, PrincipalDep, UserUuidDep
+from app.api.deps import ApiKeyServiceDep, PrincipalDep, UserUuidDep, UserUuidHeaderDep
 from app.core.constants import API_KEY_LIST_MAX_SIZE
 from app.core.exceptions import IngestRejected, NotFound
 from app.core.logging import get_logger
@@ -68,24 +74,48 @@ async def issue_api_key(
     payload: Annotated[ApiKeyIssueRequest, Body()],
     principal: PrincipalDep,
     service: ApiKeyServiceDep,
-    user_uuid_header: UserUuidDep,
+    user_uuid_header: UserUuidHeaderDep = None,
 ) -> ORJSONResponse:
-    """Mint a key bound to this user and the named emitting domain.
+    """Mint a key for the named emitting domain, bound to a user or to none.
 
-    Write-only by default. An emitter needs to store events and nothing else,
-    and a key that can also read is a key that can exfiltrate the trail it was
-    issued to fill. `audit:erase`, `audit:admin` and `audit:cross_user` can
-    never be delegated to an issued key at all.
+    Two shapes, and the request decides which:
+
+    * **Bound** (default). `x-audit-user-uuid` is required and the key can only
+      ever act for that one user, whatever header a later request sends.
+    * **Unbound** (`all_users: true`). No user header, and the key takes its
+      user from `x-audit-user-uuid` on each request instead - one credential
+      for a backend that acts for every user on the platform.
+
+    Write-only by default either way. An emitter needs to store events and
+    nothing else, and a key that can also read is a key that can exfiltrate the
+    trail it was issued to fill. `audit:erase`, `audit:admin` and
+    `audit:cross_user` can never be delegated to an issued key at all, which is
+    what keeps an unbound key weaker than the admin credential it resembles.
 
     The plaintext appears in this response and nowhere else - not in the store,
     not in the logs. Losing it means issuing a new key and revoking this one,
     which is the right habit anyway.
+
+    Raises:
+        IngestRejected: the binding and the header disagree, or the requested
+            scopes are unknown or not delegable.
     """
     principal.require(Scope.ADMIN)
 
+    if payload.all_users and user_uuid_header is not None:
+        raise IngestRejected(
+            "an unbound key acts for every user, so do not send "
+            "x-audit-user-uuid when requesting all_users"
+        )
+    if not payload.all_users and user_uuid_header is None:
+        raise IngestRejected(
+            "x-audit-user-uuid is required to bind a key to one user; "
+            "send all_users: true to mint a key for every user instead"
+        )
+
     try:
         minted = await service.issue(
-            user_uuid=user_uuid_header,
+            user_uuid=None if payload.all_users else user_uuid_header,
             domain=payload.domain,
             label=payload.label,
             created_by=principal.audit_identity,

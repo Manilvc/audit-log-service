@@ -226,14 +226,21 @@ class ApiKeyService:
     async def issue(
         self,
         *,
-        user_uuid: str,
+        user_uuid: str | None,
         domain: str,
         label: str,
         created_by: str,
         requested_scopes: tuple[str, ...] | None = None,
         expires_in_days: int | None = None,
     ) -> MintedApiKey:
-        """Mint a key for one user and one emitting domain.
+        """Mint a key for one emitting domain, bound to a user or to none.
+
+        `user_uuid=None` mints an **unbound** key: the request header names the
+        user instead, so one credential serves a backend that acts for every
+        user. It is still capped by `resolve_requested_scopes`, so it can never
+        hold erase, admin or cross-user - that is the difference between it and
+        the env-configured admin credential, which an unbound key otherwise
+        resembles.
 
         The plaintext is returned once and never stored: the record holds only a
         peppered digest and a six-character hint. A caller who loses it issues a
@@ -328,15 +335,20 @@ class ApiKeyService:
         return await self._store.list_for_user(user_uuid, size=size)
 
     async def get_for_user(self, key_id: str, *, user_uuid: str) -> ApiKeyRecord | None:
-        """One key, but only if it belongs to this user.
+        """One key, but only if it can act for this user.
 
-        A key id from another user reads as "no such key". Without that, the
-        management endpoints would confirm which ids exist elsewhere.
+        A key id belonging to another user reads as "no such key". Without that,
+        the management endpoints would confirm which ids exist elsewhere. An
+        unbound key is visible to every user's management view, because it can
+        write to every user's trail - hiding it would make it unrevokable
+        through this route.
         """
         record = await self._store.get(key_id)
-        if record is None or record.user_uuid != user_uuid:
+        if record is None:
             return None
-        return record
+        if record.is_unbound or record.user_uuid == user_uuid:
+            return record
+        return None
 
 
 def to_scopes(record: ApiKeyRecord) -> frozenset[Scope]:
