@@ -4,17 +4,17 @@ Mounted under ``/v1/audit/admin/api-keys``. Every route needs ``audit:admin``,
 which only the env-configured `SERVICE_API_KEYS` carry - an issued key can never
 hold it, so a leaked emitter credential cannot mint more of itself.
 
-The tenant comes from ``x-audit-tenant-id``, not from the body. A key is bound
-to the tenant named on the request that created it, which means an admin cannot
-mint a key for a tenant they did not name in the header the gateway can see.
+The user comes from ``x-audit-user-uuid``, not from the body. A key is bound
+to the user named on the request that created it, which means an admin cannot
+mint a key for a user they did not name in the header the gateway can see.
 
 Routes
 ------
 ``POST /api-keys``
-    Mint a key for one tenant and one emitting domain. **The plaintext is in the
+    Mint a key for one user and one emitting domain. **The plaintext is in the
     response and nowhere else** - it is never stored and never logged.
 ``GET /api-keys``
-    List the tenant's keys. Never includes a secret.
+    List the user's keys. Never includes a secret.
 ``DELETE /api-keys/{key_id}``
     Revoke. The record stays: "revoked on the 3rd" is evidence, "no such key"
     is not.
@@ -26,7 +26,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Path, Query, status
 
-from app.api.deps import ApiKeyServiceDep, PrincipalDep, TenantIdDep
+from app.api.deps import ApiKeyServiceDep, PrincipalDep, UserUuidDep
 from app.core.constants import API_KEY_LIST_MAX_SIZE
 from app.core.exceptions import IngestRejected, NotFound
 from app.core.logging import get_logger
@@ -45,7 +45,7 @@ def _to_summary(record: ApiKeyRecord) -> ApiKeySummary:
     """Render a stored key for a management view. Carries no secret material."""
     return ApiKeySummary(
         key_id=record.key_id,
-        tenant_id=record.tenant_id,
+        user_uuid=record.user_uuid,
         domain=record.domain,
         label=record.label,
         scopes=list(record.scopes),
@@ -61,20 +61,20 @@ def _to_summary(record: ApiKeyRecord) -> ApiKeySummary:
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    summary="Issue an ingest API key for one tenant and domain",
+    summary="Issue an ingest API key for one user and domain",
     response_description="The key, returned once and never again",
 )
 async def issue_api_key(
     payload: Annotated[ApiKeyIssueRequest, Body()],
     principal: PrincipalDep,
     service: ApiKeyServiceDep,
-    tenant_header: TenantIdDep,
+    user_uuid_header: UserUuidDep,
 ) -> ORJSONResponse:
-    """Mint a key bound to this tenant and the named emitting domain.
+    """Mint a key bound to this user and the named emitting domain.
 
     Write-only by default. An emitter needs to store events and nothing else,
     and a key that can also read is a key that can exfiltrate the trail it was
-    issued to fill. `audit:erase`, `audit:admin` and `audit:cross_tenant` can
+    issued to fill. `audit:erase`, `audit:admin` and `audit:cross_user` can
     never be delegated to an issued key at all.
 
     The plaintext appears in this response and nowhere else - not in the store,
@@ -85,7 +85,7 @@ async def issue_api_key(
 
     try:
         minted = await service.issue(
-            tenant_id=tenant_header,
+            user_uuid=user_uuid_header,
             domain=payload.domain,
             label=payload.label,
             created_by=principal.audit_identity,
@@ -109,21 +109,21 @@ async def issue_api_key(
 
 @router.get(
     "",
-    summary="List the keys issued to this tenant",
+    summary="List the keys issued to this user",
 )
 async def list_api_keys(
     principal: PrincipalDep,
     service: ApiKeyServiceDep,
-    tenant_header: TenantIdDep,
+    user_uuid_header: UserUuidDep,
     size: Annotated[int, Query(ge=1, le=API_KEY_LIST_MAX_SIZE)] = 50,
 ) -> ORJSONResponse:
-    """Every key for this tenant, newest first, revoked ones included.
+    """Every key for this user, newest first, revoked ones included.
 
     One query serves the page; there is no per-key lookup behind it.
     """
     principal.require(Scope.ADMIN)
 
-    records = await service.list_for_tenant(tenant_header, size=size)
+    records = await service.list_for_user(user_uuid_header, size=size)
     listing = ApiKeyListResponse(keys=[_to_summary(record) for record in records])
     return success(
         listing.model_dump(mode="json"),
@@ -139,7 +139,7 @@ async def revoke_api_key(
     key_id: Annotated[str, Path(max_length=64)],
     principal: PrincipalDep,
     service: ApiKeyServiceDep,
-    tenant_header: TenantIdDep,
+    user_uuid_header: UserUuidDep,
 ) -> ORJSONResponse:
     """Stop a key working, keeping its record.
 
@@ -147,19 +147,19 @@ async def revoke_api_key(
     other. Revoking twice is a no-op, so an incident-response retry is safe.
 
     Raises:
-        NotFound: no such key, or it belongs to a different tenant - the two are
+        NotFound: no such key, or it belongs to a different user - the two are
             deliberately indistinguishable, so this endpoint cannot be used to
-            discover another tenant's key ids.
+            discover another user's key ids.
     """
     principal.require(Scope.ADMIN)
 
-    existing = await service.get_for_tenant(key_id, tenant_id=tenant_header)
+    existing = await service.get_for_user(key_id, user_uuid=user_uuid_header)
     if existing is None:
-        raise NotFound("No such API key for this tenant.")
+        raise NotFound("No such API key for this user.")
 
     revoked = await service.revoke(key_id, revoked_by=principal.audit_identity)
     if revoked is None:  # pragma: no cover - the read above already proved it exists
-        raise NotFound("No such API key for this tenant.")
+        raise NotFound("No such API key for this user.")
 
     return success(
         _to_summary(revoked).model_dump(mode="json"),

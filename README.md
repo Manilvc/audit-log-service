@@ -1,6 +1,6 @@
 # EveryCRED Audit Log Service
 
-Tamper-evident, multi-tenant audit logging for the EveryCRED DCS platform.
+Tamper-evident, multi-user audit logging for the EveryCRED DCS platform.
 
 Every security-relevant action across the platform — credential issuance,
 revocation, login, permission change, consent withdrawal, configuration edit —
@@ -22,7 +22,7 @@ own shape and its own idea of what an "audit log" is:
 
 That works until an auditor asks a cross-cutting question — *"show me everything
 this user did last March"* — which needs four joins across two schemas, per
-tenant, with no guarantee a row was never quietly `UPDATE`d. This service
+user, with no guarantee a row was never quietly `UPDATE`d. This service
 replaces them with one event model, one index, and an integrity guarantee.
 
 ## What it guarantees
@@ -31,10 +31,10 @@ replaces them with one event model, one index, and an integrity guarantee.
 |---|---|
 | **No lost events** | Redis Streams buffer with explicit ack; nothing is acknowledged until it is in both Elasticsearch and the WORM archive |
 | **No duplicate events** | `op_type: create` keyed on the event id — exactly-once on top of an at-least-once queue |
-| **Modification detected** | SHA-256 hash chain per (tenant, partition) |
+| **Modification detected** | SHA-256 hash chain per (user, partition) |
 | **Deletion / reordering detected** | Gap-free sequence numbers + `prev_hash` links |
 | **Wholesale rewrite detected** | Chain heads notarised into S3 Object Lock (COMPLIANCE mode) |
-| **Tenant isolation** | Mandatory filter injected in the query layer, plus `constant_keyword` enforcement on dedicated streams |
+| **User isolation** | Mandatory filter injected in the query layer, plus `constant_keyword` enforcement on dedicated streams |
 | **Right to erasure** | Crypto-shredding — destroy the subject's key, keep the record |
 
 ---
@@ -43,15 +43,15 @@ replaces them with one event model, one index, and an integrity guarantee.
 
 ```
 emitting services (everycred-backend, consent, contributor, verifier, signer)
-        │  POST /v1/audit/events        x-api-key + x-audit-tenant-id
+        │  POST /v1/audit/events        x-api-key + x-audit-user-uuid
         ▼
 ┌──────────────────┐
-│   Audit API      │  validate → resolve tenant → enqueue.  Returns 202 fast:
+│   Audit API      │  validate → resolve user → enqueue.  Returns 202 fast:
 │   (FastAPI)      │  no crypto, no ES, no S3 on the caller's request path.
 └────────┬─────────┘
          ▼
 ┌──────────────────┐
-│  Redis Streams   │  durable buffer, N partitions, tenant pinned to one
+│  Redis Streams   │  durable buffer, N partitions, user pinned to one
 │  (appendonly)    │  partition so its hash chain stays totally ordered
 └────────┬─────────┘
          ▼
@@ -69,19 +69,19 @@ emitting services (everycred-backend, consent, contributor, verifier, signer)
              └──────────────────┘
 ```
 
-### Tenant isolation — hybrid
+### User isolation — hybrid
 
-The platform is **database-per-tenant** (`core/tenant/` in the main backend), so
+The platform is **database-per-user** (`core/user/` in the main backend), so
 the index layer mirrors that shape without paying for one index per customer:
 
 - **Shared data stream** (`audit-shared`) by default. Every document is routed
-  by `tenant.id`, so a tenant's search hits **one shard** rather than fanning
+  by `user.uuid`, so a user's search hits **one shard** rather than fanning
   out across all of them.
-- **Dedicated data stream** (`audit-t-<tenant>`) for high-volume or
-  contractually-isolated tenants. Here `tenant.id` is mapped as
-  `constant_keyword`, so a backing index adopts the tenant id of its first
+- **Dedicated data stream** (`audit-u-<user>`) for high-volume or
+  contractually-isolated users. Here `user.uuid` is mapped as
+  `constant_keyword`, so a backing index adopts the user uuid of its first
   document and **Elasticsearch itself rejects** any document carrying a
-  different one. Cross-tenant contamination becomes impossible rather than
+  different one. Cross-user contamination becomes impossible rather than
   merely unlikely.
 - Promotion is non-destructive: reads cover the dedicated stream *and* the
   shared one, so history written before promotion stays visible.
@@ -89,8 +89,8 @@ the index layer mirrors that shape without paying for one index per customer:
 Because the cluster runs the **Basic licence**, there is no document-level
 security to fall back on. Isolation is therefore a code invariant:
 `app/search/query.py` is the only place a query is built, it takes a
-`TenantScope`, and there is no path that omits the tenant filter.
-`tests/unit/test_tenant_isolation.py` asserts this over every filter
+`UserScope`, and there is no path that omits the user filter.
+`tests/unit/test_user_isolation.py` asserts this over every filter
 permutation.
 
 ### Tamper evidence
@@ -190,7 +190,7 @@ uv run audit-service worker
 | `worker` | ingest worker — run at least one, scale independently |
 | `bootstrap` | apply ILM policy, index templates, keyring index, data streams |
 | `generate-kek` | mint a PII master key |
-| `verify --tenant <id>` | integrity check; **exits non-zero on a break**, so it works as a cron/CI gate |
+| `verify --user <id>` | integrity check; **exits non-zero on a break**, so it works as a cron/CI gate |
 | `backfill --file rows.ndjson` | replay a legacy Postgres export into ingest (idempotent on event id) |
 
 ---
@@ -205,12 +205,12 @@ Base path `/v1`. Responses use the platform envelope
 |---|---|---|---|
 | `POST` | `/v1/audit/events` | `audit:write` | Batch ingest, ≤500 events. **202**, partial success |
 | `POST` | `/v1/audit/events/search` | `audit:read` | Cursor pagination |
-| `GET` | `/v1/audit/events/{id}` | `audit:read` | Tenant-filtered |
+| `GET` | `/v1/audit/events/{id}` | `audit:read` | User-filtered |
 | `POST` | `/v1/audit/events/aggregate` | `audit:read` | `group_by` allow-list |
 | `POST` | `/v1/audit/events/export` | `audit:export` | Streaming NDJSON over a PIT |
 | `POST` | `/v1/audit/compliance/integrity/verify` | `audit:verify` | Chain verification report |
 | `POST` | `/v1/audit/compliance/erasure` | `audit:erase` | Crypto-shred a data subject |
-| `POST` | `/v1/audit/admin/tenants/{id}/dedicate` | `audit:admin` | Provision a dedicated stream |
+| `POST` | `/v1/audit/admin/users/{id}/dedicate` | `audit:admin` | Provision a dedicated stream |
 | `GET` | `/health`, `/health/live`, `/health/ready`, `/metrics` | — | Unversioned |
 
 ### Search store
@@ -225,7 +225,7 @@ What differs — retention (ILM vs ISM), three field types, and the
 point-in-time API — lives inside the adapters. See
 [`docs/OPENSEARCH_DEPLOYMENT.md`](docs/OPENSEARCH_DEPLOYMENT.md), and note one
 security consequence: Elastic's `constant_keyword` backstop has no OpenSearch
-equivalent, so the write path now refuses a wrong-tenant document itself, on
+equivalent, so the write path now refuses a wrong-user document itself, on
 both engines.
 
 ### Authentication
@@ -237,34 +237,34 @@ JWT and runs no login of its own.
 
 ```
 x-api-key:             <service key>
-x-audit-tenant-id:     <tenant uuid>          # REQUIRED - tenant this call acts for
-x-audit-issuer-id:     <issuer uuid>          # issuer (sub-tenant) default for the batch
+x-audit-user-uuid:     <user uuid>          # REQUIRED - user this call acts for
+x-audit-issuer-id:     <issuer uuid>          # issuer (sub-user) default for the batch
 x-audit-on-behalf-of:  <user uuid>            # the service user this call acts for
 x-service-name:        everycred-backend
 ```
 
 Two headers, two different jobs. `x-api-key` decides **whether you may call at
-all** — it is the security boundary. `x-audit-tenant-id` decides **whose trail
-you are touching** — it is the tenant boundary, and the key is not bound to a
-tenant, so nothing else can supply it.
+all** — it is the security boundary. `x-audit-user-uuid` decides **whose trail
+you are touching** — it is the user boundary, and the key is not bound to a
+user, so nothing else can supply it.
 
-The tenant header is required on every route that acts for one tenant: ingest,
+The user header is required on every route that acts for one user: ingest,
 `GET /events/{id}`, export, integrity verification and erasure all answer
 **400** without it, before the request body is even read. It may be omitted only
-on search and aggregate with `cross_tenant=true`, which name no tenant by
+on search and aggregate with `cross_user=true`, which name no user by
 definition.
 
 The value is checked for shape — `[A-Za-z0-9._-]`, 1–63 characters, alphanumeric
 first, which is what keeps it safe inside an index name — and otherwise trusted.
-**This service does not check that the tenant exists.** The caller resolved the
-tenant from its own request context and authorised the user against it before
-calling; repeating that here would need either a second credential or a tenant
+**This service does not check that the user exists.** The caller resolved the
+user from its own request context and authorised the user against it before
+calling; repeating that here would need either a second credential or a user
 registry, and it would put a network call in front of an audit write. The
-trade-off is that a well-formed id for a tenant that does not exist is accepted,
-and those events then belong to a tenant nobody can read — a caller bug, not a
-leak, since a read for tenant A still only ever returns tenant A's events.
+trade-off is that a well-formed id for a user that does not exist is accepted,
+and those events then belong to a user nobody can read — a caller bug, not a
+leak, since a read for user A still only ever returns user A's events.
 
-On ingest, an event whose body `tenant_id` disagrees with the header is rejected
+On ingest, an event whose body `user_uuid` disagrees with the header is rejected
 rather than silently resolved.
 
 One key is enough. `SERVICE_API_KEYS` is a list only so a rotation can keep the
@@ -276,18 +276,18 @@ outgoing key valid during the cutover.
 |---|---|---|
 | Where from | `SERVICE_API_KEYS` in the environment | `POST /v1/audit/admin/api-keys` |
 | Looks like | whatever you generated | `evcaud_<id>_<secret>` |
-| Bound to a tenant | No — names one per request via the header | **Yes**, at the moment it is minted |
-| Scopes | All of them | `audit:write` by default; `erase`, `admin` and `cross_tenant` can never be delegated |
+| Bound to a user | No — names one per request via the header | **Yes**, at the moment it is minted |
+| Scopes | All of them | `audit:write` by default; `erase`, `admin` and `cross_user` can never be delegated |
 | Rotation | Redeploy | Issue a new one, revoke the old one |
 
-An issued key takes its tenant from the key itself, so `x-audit-tenant-id` may
-only *agree* with it — naming a different tenant is a 403, not a silent
+An issued key takes its user from the key itself, so `x-audit-user-uuid` may
+only *agree* with it — naming a different user is a 403, not a silent
 resolution in the key's favour. Its `subject` is the verified domain it was
 issued to (`hrms.acme.example`), which is stronger than the `x-service-name`
 header it replaces: that one is an unchecked claim.
 
 That split is what makes per-emitter credentials safe to hand out. A leaked
-ingest key can write events for one tenant and nothing else — it cannot read
+ingest key can write events for one user and nothing else — it cannot read
 the trail it fills, cannot erase a data subject, and cannot mint more of itself.
 
 Minting needs `API_KEY_PEPPER` to be set. Unset, the service still runs and
@@ -303,11 +303,11 @@ attributable even when the emitter did not describe itself:
 |---|---|---|
 | `x-service-name` | `actor.service`, and `service.name` | `service.name` only while the event left it `unknown` |
 | `x-audit-on-behalf-of` | `actor.on_behalf_of` | The service user - the person the backend is acting for |
-| `x-audit-issuer-id` | `tenant.issuer_id` | Issuer (sub-tenant); filterable on search and aggregate |
+| `x-audit-issuer-id` | `user.issuer_id` | Issuer (sub-user); filterable on search and aggregate |
 
 All three **fill gaps and never overwrite**. An event that names its own issuer,
 service or acting user keeps what it sent - one batch can legitimately span
-issuers and users inside a tenant, and the emitter knows which event belongs to
+issuers and users inside a user, and the emitter knows which event belongs to
 whom. Both id headers are capped at 64 characters, the width of the fields they
 land in; a longer value is a 400 rather than a truncated identity on an
 immutable record.
@@ -316,9 +316,9 @@ The same identity is recorded on the audit-of-the-audit trail, so a read is
 attributed to the person behind it and not only to the service account.
 
 A valid key carries **every** scope, including `audit:erase` and
-`audit:cross_tenant` — with the user credential gone, nothing else can grant
+`audit:cross_user` — with the user credential gone, nothing else can grant
 them. Key custody is therefore the access-control boundary: a leaked key can
-crypto-shred a data subject's personal data or read every tenant's trail. Keep
+crypto-shred a data subject's personal data or read every user's trail. Keep
 keys distinct per environment, rotate them on a schedule, and keep the service
 unreachable from outside the cluster (see `deploy/`).
 
@@ -327,7 +327,7 @@ unreachable from outside the cluster (see `deploy/`).
 ```bash
 curl -X POST http://localhost:8020/v1/audit/events \
   -H 'x-api-key: <key>' \
-  -H 'x-audit-tenant-id: 7f3c…' \
+  -H 'x-audit-user-uuid: 7f3c…' \
   -H 'x-service-name: everycred-backend' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -352,7 +352,7 @@ retry idempotent.
 
 ### Historical backfill
 
-1. Export per-tenant rows to NDJSON (SQL sketch in `scripts/export_legacy_audit.sql`,
+1. Export per-user rows to NDJSON (SQL sketch in `scripts/export_legacy_audit.sql`,
    or `everycred-backend/scripts/export_audit_ndjson.py`).
 2. Replay into the running API:
 
@@ -362,7 +362,7 @@ uv run audit-service backfill --file user_audit.ndjson             # POST ingest
 ```
 
 Re-runs are safe: event ids are the legacy row uuids, and Elasticsearch rejects
-duplicates. After a large backfill, run `audit-service verify --tenant <id>`.
+duplicates. After a large backfill, run `audit-service verify --user <id>`.
 
 ### Legacy action strings
 
@@ -388,13 +388,13 @@ Six years of retention makes naive queries expensive. The measures that matter:
 
 | Measure | Effect |
 |---|---|
-| Custom routing by `tenant.id` | tenant search hits **1 shard**, not all |
+| Custom routing by `user.uuid` | user search hits **1 shard**, not all |
 | `index.sort` `@timestamp` desc | Lucene terminates early on newest-first |
 | Filter context only | no scoring; results land in the node query cache |
 | `track_total_hits: false` | skips counting every match across the retention window |
 | `search_after` + PIT | page 500 costs the same as page 1; `from: 10000` would sort and discard 10 000 docs per shard |
 | `pre_filter_shard_size: 1` | skips backing indices whose date range cannot match |
-| `constant_keyword` on dedicated streams | tenant filter resolved at rewrite time |
+| `constant_keyword` on dedicated streams | user filter resolved at rewrite time |
 | `flattened` for `labels` / `change` | fixed mapping cost instead of unbounded field explosion |
 | `_source` field allow-list | less decompression on wide `change` diffs |
 | `best_compression` + `forcemerge` in warm | ~20–30% less disk on write-once data |
@@ -403,7 +403,7 @@ Guardrails, because an unbounded audit query is a full-retention scan:
 unbounded time ranges are refused (`MAX_QUERY_WINDOW_DAYS`), page size is
 capped, `group_by` is a closed allow-list, and **raw Elasticsearch DSL is never
 accepted** from a client — it would be a search-injection and DoS surface on a
-cluster holding every tenant's data.
+cluster holding every user's data.
 
 ## Compliance mapping
 
@@ -504,8 +504,8 @@ app/
 │   └── events.py          canonical event + PII field registry
 ├── search/
 │   ├── mappings.py        ILM policy, index templates, keyring mapping
-│   ├── routing.py         hybrid tenant → data stream resolution
-│   ├── query.py           DSL builder — the tenant isolation boundary
+│   ├── routing.py         hybrid user → data stream resolution
+│   ├── query.py           DSL builder — the user isolation boundary
 │   ├── repository.py      bulk write, search, PIT, aggregations
 │   ├── keyring.py         wrapped-DEK store
 │   ├── bootstrap.py       idempotent cluster provisioning

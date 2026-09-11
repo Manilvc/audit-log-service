@@ -129,15 +129,15 @@ sequencing guarantee unverified.
 
 ### Elasticsearch 9.x — the system of record for search
 
-Data streams with ILM. Hybrid tenant isolation: a shared stream by default, a
-dedicated stream per high-volume tenant. Full detail in
+Data streams with ILM. Hybrid user isolation: a shared stream by default, a
+dedicated stream per high-volume user. Full detail in
 [ELASTICSEARCH_DEPLOYMENT.md](./ELASTICSEARCH_DEPLOYMENT.md).
 
 Two indices matter:
 
 | Index | Kind | Mutable? | Purpose |
 |---|---|---|---|
-| `audit-shared`, `audit-t-<tenant>` | Data stream | **Append-only** | Audit events |
+| `audit-shared`, `audit-u-<user>` | Data stream | **Append-only** | Audit events |
 | `audit-keyring-v1` | Normal index | **Mutable** | Wrapped per-subject DEKs |
 
 The keyring is the one mutable store in the service, and deliberately so:
@@ -152,7 +152,7 @@ event is removed only once it is durably in Elasticsearch.
 
 Redis also holds two pieces of coordination state:
 
-- `audit:chain:<tenant>:<partition>` — the hot pointer to each chain head.
+- `audit:chain:<user>:<partition>` — the hot pointer to each chain head.
   Elasticsearch remains authoritative; this is a cache and is reconciled against
   the ledger, never trusted blindly.
 - `audit:stream:lease:<partition>` — the partition lease that makes a partition
@@ -201,11 +201,11 @@ request that wrote it.
 | Choice | Benefit | Accepted cost |
 |---|---|---|
 | Queue in front of ES | No lost events during an ES outage | Events are searchable ~1s after `202`, not immediately |
-| Hash chain per (tenant, partition) | Modification, deletion and reordering are all detectable | A partition must be single-writer, enforced by a Redis lease |
+| Hash chain per (user, partition) | Modification, deletion and reordering are all detectable | A partition must be single-writer, enforced by a Redis lease |
 | Crypto-shredding for erasure | GDPR/DPDP erasure on an immutable log | Losing `PII_MASTER_KEK` makes all PII permanently unreadable |
 | PII never indexed | No oracle over personal data | Cannot search by email; search is by stable ids |
 | `dynamic: strict` mapping | An undeclared field fails loudly | Adding a field needs a template update before deploy |
-| Shared stream + routing | Tenant search hits one shard | A very large tenant needs promoting to a dedicated stream |
+| Shared stream + routing | User search hits one shard | A very large user needs promoting to a dedicated stream |
 | ES Basic licence | No licence cost | No document-level security; isolation is a code invariant |
 
 ---
@@ -225,7 +225,7 @@ main backend, so existing clients parse audit responses unchanged.
 | `POST` | `/v1/audit/events/export` | `audit:export` |
 | `POST` | `/v1/audit/compliance/integrity/verify` | `audit:verify` |
 | `POST` | `/v1/audit/compliance/erasure` | `audit:erase` |
-| `POST` | `/v1/audit/admin/tenants/{id}/dedicate` | `audit:admin` |
+| `POST` | `/v1/audit/admin/users/{id}/dedicate` | `audit:admin` |
 | `GET` | `/health`, `/health/live`, `/health/ready`, `/metrics` | — |
 
 Health and metrics sit outside the version prefix so probe configuration does not
@@ -267,7 +267,7 @@ Plus an HMAC key-length check (RFC 7518 §3.2): HS256 requires ≥32 bytes.
 | Unit tests | `uv run pytest -m "not integration"` | 261 passing |
 | Integration | `uv run pytest -m integration` | 24 passing |
 
-`mypy` runs in `strict` mode deliberately: a mistyped tenant filter is a
+`mypy` runs in `strict` mode deliberately: a mistyped user filter is a
 data-leak bug, not a style problem.
 
 ---
@@ -277,9 +277,9 @@ data-leak bug, not a style problem.
 | Contract | Value |
 |---|---|
 | Credential | Service API key in `x-api-key`, matched in constant time |
-| Tenant scoping | `x-audit-tenant-id` header, required on every request |
+| User scoping | `x-audit-user-uuid` header, required on every request |
 | Service auth | `x-api-key`, constant-time compare against a rotatable list |
-| Tenant header | `x-audit-tenant-id` |
+| User header | `x-audit-user-uuid` |
 | Attribution header | `x-audit-on-behalf-of` |
 | Response envelope | `{status, data, message}` |
 

@@ -27,10 +27,10 @@ silent mismatch would otherwise surface as confusing query-time errors.
 
 ### What Basic does not include
 
-**No document-level or field-level security.** Tenant isolation is therefore a
+**No document-level or field-level security.** User isolation is therefore a
 code invariant enforced in `app/search/query.py`, backed by 86 tests, plus
 `constant_keyword` enforcement at the storage layer for dedicated streams. See
-[SECURITY.md §3](./SECURITY.md#3-tenant-isolation).
+[SECURITY.md §3](./SECURITY.md#3-user-isolation).
 
 If the organisation later buys Platinum, DLS-backed roles become available as
 defence in depth. The code does not depend on that happening.
@@ -61,14 +61,14 @@ it in any hand-written Helm values or systemd unit.
         ▼                                                       ▼
 ┌───────────────────────────┐                 ┌───────────────────────────────┐
 │ template: audit-shared    │ priority 200    │ template: audit-dedicated     │ priority 300
-│ pattern:  audit-shared    │                 │ pattern:  audit-t-*           │
-│ tenant.id: keyword        │                 │ tenant.id: constant_keyword   │
+│ pattern:  audit-shared    │                 │ pattern:  audit-u-*           │
+│ user.uuid: keyword        │                 │ user.uuid: constant_keyword   │
 │ shards: 3                 │                 │ shards: 1                     │
 │ allow_custom_routing: true│                 │ allow_custom_routing: FALSE   │
 └───────────┬───────────────┘                 └───────────┬───────────────────┘
             ▼                                             ▼
-   data stream: audit-shared                  data stream: audit-t-<tenant>
-   .ds-audit-shared-YYYY.MM.DD-NNNNNN         .ds-audit-t-<tenant>-...
+   data stream: audit-shared                  data stream: audit-u-<user>
+   .ds-audit-shared-YYYY.MM.DD-NNNNNN         .ds-audit-u-<user>-...
 
 ┌────────────────────────────────────────────────────────────────┐
 │ audit-keyring-v1   normal index, 1 shard, MUTABLE              │
@@ -81,40 +81,40 @@ colliding. **Template names too** — a hardcoded name meant an integration run
 clobbered the staging template and ES rejected it with *"would cause data streams
 to no longer match a data stream template"*.
 
-### Hybrid tenant isolation
+### Hybrid user isolation
 
 | | Shared stream | Dedicated stream |
 |---|---|---|
-| Name | `audit-shared` | `audit-t-<tenant>` |
-| Used by | Every tenant by default | Tenants in `DEDICATED_TENANTS` |
-| `tenant.id` mapping | `keyword` | `constant_keyword` |
+| Name | `audit-shared` | `audit-u-<user>` |
+| Used by | Every user by default | Users in `DEDICATED_USERS` |
+| `user.uuid` mapping | `keyword` | `constant_keyword` |
 | Shards | 3 | 1 |
-| Custom routing | Yes — routed by `tenant.id` | **No** |
-| Isolation | Mandatory query filter | Filter **+ ES rejects wrong-tenant docs** |
+| Custom routing | Yes — routed by `user.uuid` | **No** |
+| Isolation | Mandatory query filter | Filter **+ ES rejects wrong-user docs** |
 
-`constant_keyword` is the strong guarantee: a backing index adopts the tenant id
+`constant_keyword` is the strong guarantee: a backing index adopts the user uuid
 of its first document, and any later document with a different value is rejected
-by Elasticsearch with `document_parsing_exception`. Cross-tenant contamination
+by Elasticsearch with `document_parsing_exception`. Cross-user contamination
 becomes impossible rather than merely unlikely.
 
-Custom routing pins a shared-stream tenant to **one shard**, so its searches fan
+Custom routing pins a shared-stream user to **one shard**, so its searches fan
 out to one shard instead of three.
 
 > **Do not enable `allow_custom_routing` on the dedicated template.** Enabling it
 > makes ES set `_routing: {required: true}` on every backing index, and the router
-> supplies no routing key for a dedicated tenant — every write then fails with
+> supplies no routing key for a dedicated user — every write then fails with
 > `routing_missing_exception`. This was a real bug: it would have rejected 100% of
-> writes for exactly the highest-volume tenants.
+> writes for exactly the highest-volume users.
 > `test_dedicated_stream_does_not_require_routing` locks the behaviour in.
 
-### Promoting a tenant
+### Promoting a user
 
 ```bash
 # 1. Provision the stream (off the write path)
-curl -X POST "$AUDIT_URL/v1/audit/admin/tenants/$TENANT/dedicate" \
+curl -X POST "$AUDIT_URL/v1/audit/admin/users/$USER/dedicate" \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 
-# 2. Add to DEDICATED_TENANTS and restart the service + workers
+# 2. Add to DEDICATED_USERS and restart the service + workers
 ```
 
 Promotion is **non-destructive**: reads cover the dedicated stream *and* the
@@ -132,7 +132,7 @@ Root `dynamic: strict`. 13 top-level fields, `total_fields.limit: 200`.
 |---|---|---|
 | `@timestamp` | `date` | Index-sorted descending |
 | `event.*` | `keyword` ×6, `date` | `id` is **sortable** (see below) |
-| `tenant.*` | `keyword` ×3 | `id` is `constant_keyword` on dedicated |
+| `user.*` | `keyword` ×3 | `id` is `constant_keyword` on dedicated |
 | `actor.*` | `keyword`, `long` | **No email/name/phone** — PII by design |
 | `target.*` | `keyword`, `long` | `ids` for bulk events |
 | `source.*` | `keyword` | **`ip_prefix` only** — no full IP |
@@ -293,7 +293,7 @@ the tail. Measure against your own event mix before committing budget — a
 
 Rollover at 50 GB primary shard size keeps shards in the recommended 20–50 GB
 band. At 10 M events/day, consider raising `SHARED_SHARD_COUNT` and promoting
-heavy tenants to dedicated streams.
+heavy users to dedicated streams.
 
 ---
 
@@ -383,13 +383,13 @@ Measures that matter at six-year scale (all in `app/search/query.py` and
 
 | Measure | Effect |
 |---|---|
-| Custom routing by `tenant.id` | Tenant search hits **1 shard**, not all |
+| Custom routing by `user.uuid` | User search hits **1 shard**, not all |
 | `index.sort` `@timestamp` desc | Lucene terminates early on newest-first |
 | Filter context only | No scoring; results cacheable in the node query cache |
 | `track_total_hits: false` | Skips counting every match across the retention window |
 | `search_after` + PIT | Page 500 costs the same as page 1; `from: 10000` would sort and discard 10,000 docs *per shard* |
 | `pre_filter_shard_size: 1` | Skips backing indices whose date range cannot match — the biggest win for a narrow window over years of indices |
-| `constant_keyword` on dedicated | Tenant filter resolved at query-rewrite time |
+| `constant_keyword` on dedicated | User filter resolved at query-rewrite time |
 | `_source` allow-list | Less decompression on wide `change` diffs |
 | `execution_hint: global_ordinals` | Right hint for low-cardinality keyword terms aggs |
 | `allow_partial_search_results: false` | A partial result set in a compliance report is worse than an explicit failure |
@@ -426,7 +426,7 @@ curl -s "$ES/_data_stream/audit-*?pretty" | grep -E '"name"|index_name'
 curl -s "$ES/_cat/indices/.ds-audit-*?v&h=index,docs.count,store.size,pri,rep"
 
 # Integrity gate (exits non-zero on a break)
-uv run audit-service verify --tenant <tenant-id>
+uv run audit-service verify --user <user-id>
 ```
 
 ### Snapshots
@@ -469,7 +469,7 @@ deletable, and the archive bucket denies deletion.
 | `Can't load fielddata on [event.id]` | A sort field lost `doc_values` | Restore doc values on sort fields |
 | `routing_missing_exception` on a dedicated stream | `allow_custom_routing` enabled there | Remove it from the dedicated template |
 | `strict_dynamic_mapping_exception` | Emitter sent an undeclared field | Add it to `mappings.py` **and** the event model, or move it under `labels` |
-| `document_parsing_exception ... constant_keyword` | Wrong-tenant document to a dedicated stream | A routing bug — isolation working as intended |
+| `document_parsing_exception ... constant_keyword` | Wrong-user document to a dedicated stream | A routing bug — isolation working as intended |
 | `would cause data streams to no longer match a template` | Template name reused with a different pattern | Template names derive from `INDEX_PREFIX`; use a distinct prefix |
 | `illegal_state_exception ... conflicts with index` | Concrete index occupying a stream name | Delete it and re-run bootstrap |
 | Searches slow on a narrow window | `pre_filter_shard_size` not applied, or no routing | Verify the repository path is used, not a hand-rolled query |

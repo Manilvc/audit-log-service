@@ -44,9 +44,9 @@ from app.search.bootstrap import (
     shared_template_name,
 )
 from app.search.mappings import dedicated_index_template, shared_index_template
-from app.search.query import AuditSearchFilter, TenantScope
+from app.search.query import AuditSearchFilter, UserScope
 from app.search.repository import AuditRepository
-from app.search.routing import TenantRouter
+from app.search.routing import UserRouter
 
 pytestmark = pytest.mark.integration
 
@@ -59,9 +59,9 @@ SearchStore = ElasticsearchBackend | OpenSearchBackend
 # A unique prefix per run, so a test run never collides with real data or with a
 # previous run's leftovers.
 RUN_ID = uuid.uuid4().hex[:8]
-TENANT_A = f"itest-{RUN_ID}-a"
-TENANT_B = f"itest-{RUN_ID}-b"
-DEDICATED_TENANT = f"itest-{RUN_ID}-ded"
+USER_A = f"itest-{RUN_ID}-a"
+USER_B = f"itest-{RUN_ID}-b"
+DEDICATED_USER = f"itest-{RUN_ID}-ded"
 
 
 @pytest.fixture(scope="module")
@@ -77,7 +77,7 @@ def itest_settings() -> Iterator[Settings]:
     overrides = {
         "INDEX_PREFIX": f"itest-{RUN_ID}",
         "SHARED_DATA_STREAM": f"itest-{RUN_ID}-shared",
-        "DEDICATED_TENANTS": DEDICATED_TENANT,
+        "DEDICATED_USERS": DEDICATED_USER,
         "ILM_POLICY_NAME": f"itest-{RUN_ID}-retention",
         # A single-node development cluster cannot allocate replicas.
         "INDEX_REPLICAS": "0",
@@ -113,7 +113,7 @@ async def store(itest_settings: Settings) -> AsyncIterator[SearchStore]:
 
 
 @pytest.fixture(scope="module")
-def router(itest_settings: Settings, store: SearchStore) -> TenantRouter:
+def router(itest_settings: Settings, store: SearchStore) -> UserRouter:
     """Built from the store, exactly as `build_container` does.
 
     The routing capability is the reason for the dependency: an OpenSearch data
@@ -121,17 +121,17 @@ def router(itest_settings: Settings, store: SearchStore) -> TenantRouter:
     there. A router built without asking the engine would fail every write to
     the shared stream on that engine.
     """
-    return TenantRouter(
+    return UserRouter(
         shared_stream=itest_settings.SHARED_DATA_STREAM,
         index_prefix=itest_settings.INDEX_PREFIX,
-        dedicated_tenants=itest_settings.dedicated_tenant_set,
+        dedicated_users=itest_settings.dedicated_user_set,
         custom_routing=store.supports_custom_routing,
     )
 
 
 @pytest.fixture(scope="module", autouse=True)
 async def _topology(
-    store: SearchStore, itest_settings: Settings, router: TenantRouter
+    store: SearchStore, itest_settings: Settings, router: UserRouter
 ) -> AsyncIterator[None]:
     """Apply the topology once per module, and remove it afterwards."""
     await bootstrap_cluster(store, itest_settings, router)
@@ -146,7 +146,7 @@ async def _topology(
     # to delete, and a cleanup failure must not mask the test result.
     for name in (
         router.shared_pattern(),
-        router.dedicated_stream_name(DEDICATED_TENANT),
+        router.dedicated_stream_name(DEDICATED_USER),
     ):
         with contextlib.suppress(Exception):
             await client.indices.delete_data_stream(name=name)
@@ -172,9 +172,7 @@ async def _topology(
 
 
 @pytest.fixture
-def repository(
-    store: SearchStore, router: TenantRouter, itest_settings: Settings
-) -> AuditRepository:
+def repository(store: SearchStore, router: UserRouter, itest_settings: Settings) -> AuditRepository:
     # The configured backend, so these tests exercise the same path the service
     # uses. `store.client` stays available to the few tests that assert on what
     # the *engine* enforces.
@@ -187,7 +185,7 @@ def repository(
 
 
 def _document(
-    tenant_id: str,
+    user_uuid: str,
     *,
     seq: int = 0,
     chain_id: str | None = None,
@@ -197,7 +195,7 @@ def _document(
     prev_hash: str = GENESIS_HASH,
 ) -> dict[str, Any]:
     """A complete, correctly chained document, as the worker would produce."""
-    chain = chain_id or f"{tenant_id}:0"
+    chain = chain_id or f"{user_uuid}:0"
     document: dict[str, Any] = {
         "@timestamp": datetime.now(UTC).isoformat(),
         "event": {
@@ -208,7 +206,7 @@ def _document(
             "outcome": "success",
             "severity": "info",
         },
-        "tenant": {"id": tenant_id},
+        "user": {"uuid": user_uuid},
         "actor": {"id": actor_id, "type": "user"},
         "target": {"type": "credential", "id": f"vc-{seq}"},
         "source": {"country_code": "IN", "ip_prefix": "203.0.113.0/24"},
@@ -226,7 +224,7 @@ def _document(
     return document
 
 
-async def _refresh(store: SearchStore, router: TenantRouter) -> None:
+async def _refresh(store: SearchStore, router: UserRouter) -> None:
     """Make writes visible. Only needed in tests: production reads tolerate 1s."""
     await store.client.indices.refresh(
         index=f"{router.shared_pattern()},{router.dedicated_pattern()}",
@@ -238,7 +236,7 @@ async def _refresh(store: SearchStore, router: TenantRouter) -> None:
 # Bootstrap
 # ---------------------------------------------------------------------------
 async def test_bootstrap_creates_the_expected_topology(
-    store: SearchStore, itest_settings: Settings, router: TenantRouter
+    store: SearchStore, itest_settings: Settings, router: UserRouter
 ) -> None:
     """The topology is applied from code, so a fresh cluster cannot drift.
 
@@ -273,7 +271,7 @@ async def test_bootstrap_creates_the_expected_topology(
 
 
 async def test_bootstrap_is_idempotent(
-    store: SearchStore, itest_settings: Settings, router: TenantRouter
+    store: SearchStore, itest_settings: Settings, router: UserRouter
 ) -> None:
     """It runs on every startup, so a second pass must be a no-op."""
     await bootstrap_cluster(store, itest_settings, router)
@@ -284,22 +282,22 @@ async def test_bootstrap_is_idempotent(
 # Write path
 # ---------------------------------------------------------------------------
 async def test_write_and_read_round_trip(
-    repository: AuditRepository, store: SearchStore, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: UserRouter
 ) -> None:
-    route = router.resolve(TENANT_A)
+    route = router.resolve(USER_A)
     outcome = await repository.bulk_index(
-        [(route, _document(TENANT_A, seq=index)) for index in range(5)]
+        [(route, _document(USER_A, seq=index)) for index in range(5)]
     )
     assert outcome.all_succeeded, outcome.failed
     assert outcome.succeeded == 5
 
     await _refresh(store, router)
-    page = await repository.search(TenantScope(tenant_id=TENANT_A), AuditSearchFilter(), size=10)
+    page = await repository.search(UserScope(user_uuid=USER_A), AuditSearchFilter(), size=10)
     assert len(page.events) == 5
 
 
 async def test_duplicate_event_id_is_rejected_giving_exactly_once(
-    repository: AuditRepository, store: SearchStore, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: UserRouter
 ) -> None:
     """The property that makes the at-least-once queue safe.
 
@@ -307,9 +305,9 @@ async def test_duplicate_event_id_is_rejected_giving_exactly_once(
     the event id and `op_type: create` refuses to overwrite, so the retry is a
     409 that the repository counts as success.
     """
-    route = router.resolve(TENANT_A)
+    route = router.resolve(USER_A)
     event_id = f"fixed-{uuid.uuid4().hex}"
-    document = _document(TENANT_A, seq=100, event_id=event_id)
+    document = _document(USER_A, seq=100, event_id=event_id)
 
     first = await repository.bulk_index([(route, document)])
     assert first.succeeded == 1
@@ -321,7 +319,7 @@ async def test_duplicate_event_id_is_rejected_giving_exactly_once(
 
     await _refresh(store, router)
     page = await repository.search(
-        TenantScope(tenant_id=TENANT_A),
+        UserScope(user_uuid=USER_A),
         AuditSearchFilter(event_ids=(event_id,)),
         size=10,
         with_total=100,
@@ -330,7 +328,7 @@ async def test_duplicate_event_id_is_rejected_giving_exactly_once(
 
 
 async def test_unmapped_field_is_rejected_by_strict_mapping(
-    repository: AuditRepository, router: TenantRouter
+    repository: AuditRepository, router: UserRouter
 ) -> None:
     """`dynamic: strict` makes an undeclared field a loud error.
 
@@ -338,8 +336,8 @@ async def test_unmapped_field_is_rejected_by_strict_mapping(
     data is needed and unsearchable. The rejection routes the event to the
     dead-letter queue instead, which is alerted on.
     """
-    route = router.resolve(TENANT_A)
-    document = _document(TENANT_A, seq=200)
+    route = router.resolve(USER_A)
+    document = _document(USER_A, seq=200)
     document["totally_undeclared_field"] = "surprise"
 
     outcome = await repository.bulk_index([(route, document)])
@@ -352,74 +350,74 @@ async def test_unmapped_field_is_rejected_by_strict_mapping(
 
 
 # ---------------------------------------------------------------------------
-# Tenant isolation, enforced by the cluster
+# User isolation, enforced by the cluster
 # ---------------------------------------------------------------------------
-async def test_tenant_cannot_read_another_tenants_events(
-    repository: AuditRepository, store: SearchStore, router: TenantRouter
+async def test_user_cannot_read_another_users_events(
+    repository: AuditRepository, store: SearchStore, router: UserRouter
 ) -> None:
     """The isolation guarantee, verified against a real index."""
     await repository.bulk_index(
-        [(router.resolve(TENANT_A), _document(TENANT_A, seq=300, actor_id="alice"))]
+        [(router.resolve(USER_A), _document(USER_A, seq=300, actor_id="alice"))]
     )
     await repository.bulk_index(
-        [(router.resolve(TENANT_B), _document(TENANT_B, seq=300, actor_id="bob"))]
+        [(router.resolve(USER_B), _document(USER_B, seq=300, actor_id="bob"))]
     )
     await _refresh(store, router)
 
-    a_page = await repository.search(TenantScope(tenant_id=TENANT_A), AuditSearchFilter(), size=100)
-    a_tenants = {event["tenant"]["id"] for event in a_page.events}
-    assert a_tenants == {TENANT_A}
+    a_page = await repository.search(UserScope(user_uuid=USER_A), AuditSearchFilter(), size=100)
+    a_users = {event["user"]["uuid"] for event in a_page.events}
+    assert a_users == {USER_A}
 
-    # Even explicitly asking for the other tenant's actor returns nothing.
+    # Even explicitly asking for the other user's actor returns nothing.
     leaked = await repository.search(
-        TenantScope(tenant_id=TENANT_A),
+        UserScope(user_uuid=USER_A),
         AuditSearchFilter(actor_ids=("bob",)),
         size=100,
     )
     assert leaked.events == []
 
 
-async def test_get_event_by_id_is_tenant_filtered(
-    repository: AuditRepository, store: SearchStore, router: TenantRouter
+async def test_get_event_by_id_is_user_filtered(
+    repository: AuditRepository, store: SearchStore, router: UserRouter
 ) -> None:
-    """Guessing an event id must not cross a tenant boundary.
+    """Guessing an event id must not cross a user boundary.
 
     This is why `get_event` is a filtered search rather than a document GET - a
-    GET would return the document regardless of tenant.
+    GET would return the document regardless of user.
     """
     event_id = f"cross-{uuid.uuid4().hex}"
     await repository.bulk_index(
-        [(router.resolve(TENANT_B), _document(TENANT_B, seq=400, event_id=event_id))]
+        [(router.resolve(USER_B), _document(USER_B, seq=400, event_id=event_id))]
     )
     await _refresh(store, router)
 
-    assert await repository.get_event(TenantScope(tenant_id=TENANT_B), event_id)
-    assert await repository.get_event(TenantScope(tenant_id=TENANT_A), event_id) is None
+    assert await repository.get_event(UserScope(user_uuid=USER_B), event_id)
+    assert await repository.get_event(UserScope(user_uuid=USER_A), event_id) is None
 
 
-async def test_a_wrong_tenant_document_never_reaches_the_store(
-    repository: AuditRepository, router: TenantRouter
+async def test_a_wrong_user_document_never_reaches_the_store(
+    repository: AuditRepository, router: UserRouter
 ) -> None:
     """The write-path guarantee, on whichever engine is configured.
 
-    A document must land in the stream belonging to the tenant it names. The
+    A document must land in the stream belonging to the user it names. The
     repository refuses the write itself, so the invariant does not depend on a
     field type only one engine has - and it covers the shared stream too, which
     neither engine guards.
     """
-    route = router.resolve(DEDICATED_TENANT)
-    outcome = await repository.bulk_index([(route, _document("some-other-tenant", seq=99))])
+    route = router.resolve(DEDICATED_USER)
+    outcome = await repository.bulk_index([(route, _document("some-other-user", seq=99))])
 
     assert outcome.succeeded == 0
-    assert "tenant_mismatch" in outcome.failed[0][1]
+    assert "user_uuid_mismatch" in outcome.failed[0][1]
 
 
 async def test_elasticsearch_also_rejects_it_at_the_storage_layer(
-    store: SearchStore, router: TenantRouter
+    store: SearchStore, router: UserRouter
 ) -> None:
     """The second layer, where the engine provides one.
 
-    A dedicated stream's backing index adopts the tenant id of its first
+    A dedicated stream's backing index adopts the user uuid of its first
     document, and `constant_keyword` then refuses any document carrying a
     different one - a guarantee that holds even if the routing code is wrong.
     OpenSearch has no dependable equivalent, which is why the repository guard
@@ -429,12 +427,12 @@ async def test_elasticsearch_also_rejects_it_at_the_storage_layer(
     if not isinstance(store, ElasticsearchBackend):
         pytest.skip("constant_keyword is Elasticsearch-only; the guard above covers both")
 
-    stream = router.dedicated_stream_name(DEDICATED_TENANT)
+    stream = router.dedicated_stream_name(DEDICATED_USER)
 
     # First document establishes the constant value.
     await store.client.index(
         index=stream,
-        document=_document(DEDICATED_TENANT, seq=0),
+        document=_document(DEDICATED_USER, seq=0),
         op_type="create",
         refresh="wait_for",
     )
@@ -442,7 +440,7 @@ async def test_elasticsearch_also_rejects_it_at_the_storage_layer(
     with pytest.raises(BadRequestError) as caught:
         await store.client.index(
             index=stream,
-            document=_document("some-other-tenant", seq=1),
+            document=_document("some-other-user", seq=1),
             op_type="create",
             refresh="wait_for",
         )
@@ -450,36 +448,36 @@ async def test_elasticsearch_also_rejects_it_at_the_storage_layer(
     assert "constant_keyword" in message, message
 
 
-async def test_dedicated_tenant_reads_both_streams(
+async def test_dedicated_user_reads_both_streams(
     repository: AuditRepository,
     store: SearchStore,
-    router: TenantRouter,
+    router: UserRouter,
     itest_settings: Settings,
 ) -> None:
     """History written before promotion must stay visible.
 
     The setup has to be honest about how that history got there. Before the
-    promotion the router knew of no dedicated tenants, so `resolve` returned a
-    *shared* route that still carried this tenant's own id - which is what is
-    reconstructed here. Borrowing another tenant's route to reach the shared
-    stream would be a routing bug, and the repository's tenant guard refuses it.
+    promotion the router knew of no dedicated users, so `resolve` returned a
+    *shared* route that still carried this user's own id - which is what is
+    reconstructed here. Borrowing another user's route to reach the shared
+    stream would be a routing bug, and the repository's user guard refuses it.
     """
-    before_promotion = TenantRouter(
+    before_promotion = UserRouter(
         shared_stream=itest_settings.SHARED_DATA_STREAM,
         index_prefix=itest_settings.INDEX_PREFIX,
-        dedicated_tenants=frozenset(),
+        dedicated_users=frozenset(),
         custom_routing=store.supports_custom_routing,
     )
-    shared_route = before_promotion.resolve(DEDICATED_TENANT)
+    shared_route = before_promotion.resolve(DEDICATED_USER)
     assert shared_route.write_target == router.shared_pattern()
 
-    pre_promotion = _document(DEDICATED_TENANT, seq=500)
+    pre_promotion = _document(DEDICATED_USER, seq=500)
     outcome = await repository.bulk_index([(shared_route, pre_promotion)])
     assert outcome.succeeded == 1, outcome.failed
     await _refresh(store, router)
 
     page = await repository.search(
-        TenantScope(tenant_id=DEDICATED_TENANT), AuditSearchFilter(), size=100
+        UserScope(user_uuid=DEDICATED_USER), AuditSearchFilter(), size=100
     )
     ids = {event["event"]["id"] for event in page.events}
     assert pre_promotion["event"]["id"] in ids, "pre-promotion history is not visible"
@@ -489,23 +487,23 @@ async def test_dedicated_tenant_reads_both_streams(
 # Privacy, enforced by the mapping
 # ---------------------------------------------------------------------------
 async def test_ciphertext_is_not_searchable(
-    store: SearchStore, router: TenantRouter, repository: AuditRepository
+    store: SearchStore, router: UserRouter, repository: AuditRepository
 ) -> None:
     """`pii_ct` is mapped `enabled: false`, so encrypted blobs cannot be queried.
 
     Without this, a wildcard or match_all query over the ciphertext field could
     confirm the presence of a known value.
     """
-    document = _document(TENANT_A, seq=600)
+    document = _document(USER_A, seq=600)
     document["pii_ct"] = {"actor.email": "v1:nonce:ciphertextblob"}
     document["pii"] = {"encrypted": True, "key_id": "k-1", "fields": ["actor.email"]}
 
-    outcome = await repository.bulk_index([(router.resolve(TENANT_A), document)])
+    outcome = await repository.bulk_index([(router.resolve(USER_A), document)])
     assert outcome.all_succeeded, outcome.failed
     await _refresh(store, router)
 
     # The value is retrievable from _source...
-    stored = await repository.get_event(TenantScope(tenant_id=TENANT_A), document["event"]["id"])
+    stored = await repository.get_event(UserScope(user_uuid=USER_A), document["event"]["id"])
     assert stored is not None
     assert stored["pii_ct"]["actor.email"].startswith("v1:")
 
@@ -551,7 +549,7 @@ async def test_pii_fields_are_absent_from_the_mapping(
 def test_shared_and_dedicated_templates_differ_only_where_intended(
     store: SearchStore,
 ) -> None:
-    """Higher priority on the dedicated template, and a pinned tenant id.
+    """Higher priority on the dedicated template, and a pinned user id.
 
     The pinned type is whatever the configured engine offers - Elastic's
     `constant_keyword`, or `keyword` where there is nothing to pin with - so
@@ -565,12 +563,12 @@ def test_shared_and_dedicated_templates_differ_only_where_intended(
     )
     assert dedicated["priority"] > shared["priority"]
     assert (
-        shared["template"]["mappings"]["properties"]["tenant"]["properties"]["id"]["type"]
+        shared["template"]["mappings"]["properties"]["user"]["properties"]["uuid"]["type"]
         == "keyword"
     )
     assert (
-        dedicated["template"]["mappings"]["properties"]["tenant"]["properties"]["id"]
-        == store.field_types.pinned_tenant
+        dedicated["template"]["mappings"]["properties"]["user"]["properties"]["uuid"]
+        == store.field_types.pinned_user_uuid
     )
 
 
@@ -578,18 +576,18 @@ def test_shared_and_dedicated_templates_differ_only_where_intended(
 # Pagination, export and integrity over real data
 # ---------------------------------------------------------------------------
 async def test_cursor_pagination_covers_every_event_exactly_once(
-    repository: AuditRepository, store: SearchStore, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: UserRouter
 ) -> None:
     """`search_after` must neither skip nor repeat a row.
 
     Timestamps collide constantly under bulk ingest, which is why the sort
     carries a unique tiebreaker. Without it, pages would overlap.
     """
-    tenant = f"{TENANT_A}-page"
-    route = router.resolve(tenant)
+    user = f"{USER_A}-page"
+    route = router.resolve(user)
     expected = {
         document["event"]["id"]: document
-        for document in (_document(tenant, seq=index) for index in range(25))
+        for document in (_document(user, seq=index) for index in range(25))
     }
     await repository.bulk_index([(route, doc) for doc in expected.values()])
     await _refresh(store, router)
@@ -598,7 +596,7 @@ async def test_cursor_pagination_covers_every_event_exactly_once(
     cursor: list[Any] | None = None
     for _ in range(10):  # bounded, so a paging bug fails rather than loops
         page = await repository.search(
-            TenantScope(tenant_id=tenant),
+            UserScope(user_uuid=user),
             AuditSearchFilter(),
             size=7,
             search_after=cursor,
@@ -615,19 +613,19 @@ async def test_cursor_pagination_covers_every_event_exactly_once(
 
 
 async def test_point_in_time_export_is_a_consistent_snapshot(
-    repository: AuditRepository, store: SearchStore, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: UserRouter
 ) -> None:
     """A PIT freezes the view, so an export is a snapshot rather than a smear."""
-    tenant = f"{TENANT_A}-pit"
-    route = router.resolve(tenant)
-    await repository.bulk_index([(route, _document(tenant, seq=index)) for index in range(10)])
+    user = f"{USER_A}-pit"
+    route = router.resolve(user)
+    await repository.bulk_index([(route, _document(user, seq=index)) for index in range(10)])
     await _refresh(store, router)
 
-    pit_id = await repository.open_pit(TenantScope(tenant_id=tenant))
+    pit_id = await repository.open_pit(UserScope(user_uuid=user))
     try:
         # Documents arriving after the PIT opened must not appear in it.
         await repository.bulk_index(
-            [(route, _document(tenant, seq=index)) for index in range(10, 20)]
+            [(route, _document(user, seq=index)) for index in range(10, 20)]
         )
         await _refresh(store, router)
 
@@ -635,7 +633,7 @@ async def test_point_in_time_export_is_a_consistent_snapshot(
         cursor: list[Any] | None = None
         while True:
             page = await repository.search_pit(
-                TenantScope(tenant_id=tenant),
+                UserScope(user_uuid=user),
                 AuditSearchFilter(),
                 pit_id=pit_id,
                 size=5,
@@ -654,7 +652,7 @@ async def test_point_in_time_export_is_a_consistent_snapshot(
 
 
 async def test_chain_written_to_the_cluster_verifies_after_round_trip(
-    repository: AuditRepository, store: SearchStore, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: UserRouter
 ) -> None:
     """The hash must survive storage and retrieval.
 
@@ -662,14 +660,14 @@ async def test_chain_written_to_the_cluster_verifies_after_round_trip(
     canonical re-serialisation makes verification work on retrieved documents
     rather than only on in-memory ones.
     """
-    tenant = f"{TENANT_A}-chain"
-    chain_id = f"{tenant}:0"
-    route = router.resolve(tenant)
+    user = f"{USER_A}-chain"
+    chain_id = f"{user}:0"
+    route = router.resolve(user)
 
     documents: list[dict[str, Any]] = []
     prev = GENESIS_HASH
     for seq in range(15):
-        document = _document(tenant, seq=seq, chain_id=chain_id, prev_hash=prev)
+        document = _document(user, seq=seq, chain_id=chain_id, prev_hash=prev)
         prev = document["integrity"]["hash"]
         documents.append(document)
 
@@ -678,7 +676,7 @@ async def test_chain_written_to_the_cluster_verifies_after_round_trip(
     await _refresh(store, router)
 
     retrieved = await repository.fetch_chain_slice(
-        chain_id=chain_id, tenant_id=tenant, start_seq=0, limit=100
+        chain_id=chain_id, user_uuid=user, start_seq=0, limit=100
     )
     assert len(retrieved) == 15
 
@@ -688,21 +686,21 @@ async def test_chain_written_to_the_cluster_verifies_after_round_trip(
 
 
 async def test_aggregation_returns_buckets(
-    repository: AuditRepository, store: SearchStore, router: TenantRouter
+    repository: AuditRepository, store: SearchStore, router: UserRouter
 ) -> None:
-    tenant = f"{TENANT_A}-agg"
-    route = router.resolve(tenant)
+    user = f"{USER_A}-agg"
+    route = router.resolve(user)
     await repository.bulk_index(
         [
-            (route, _document(tenant, seq=0, action="credential.issue")),
-            (route, _document(tenant, seq=1, action="credential.issue")),
-            (route, _document(tenant, seq=2, action="credential.revoke")),
+            (route, _document(user, seq=0, action="credential.issue")),
+            (route, _document(user, seq=1, action="credential.issue")),
+            (route, _document(user, seq=2, action="credential.revoke")),
         ]
     )
     await _refresh(store, router)
 
     aggregations = await repository.aggregate(
-        TenantScope(tenant_id=tenant), AuditSearchFilter(), group_by="event.action"
+        UserScope(user_uuid=user), AuditSearchFilter(), group_by="event.action"
     )
     buckets = {bucket["key"]: bucket["doc_count"] for bucket in aggregations["by_group"]["buckets"]}
     assert buckets["credential.issue"] == 2
@@ -710,23 +708,23 @@ async def test_aggregation_returns_buckets(
 
 
 async def test_dedicated_stream_does_not_require_routing(
-    store: SearchStore, router: TenantRouter
+    store: SearchStore, router: UserRouter
 ) -> None:
     """Regression guard for the `allow_custom_routing` / `_routing` coupling.
 
     Enabling `allow_custom_routing` on a data stream template makes
     Elasticsearch set `_routing: {required: true}` on every backing index. The
     dedicated template therefore leaves the flag off, because the router supplies
-    no routing key for a dedicated tenant. With the flag on, every write to a
+    no routing key for a dedicated user. With the flag on, every write to a
     dedicated stream fails with `routing_missing_exception` - a total ingest
-    outage for exactly the highest-volume tenants.
+    outage for exactly the highest-volume users.
 
     This asserts the cluster-side facts, so re-adding the flag fails here.
     """
     if not store.supports_custom_routing:
         pytest.skip("this engine has no custom routing to couple `_routing` to")
 
-    stream = router.dedicated_stream_name(DEDICATED_TENANT)
+    stream = router.dedicated_stream_name(DEDICATED_USER)
     streams = await store.client.indices.get_data_stream(name=stream)
     assert streams["data_streams"][0].get("allow_custom_routing") is False
 

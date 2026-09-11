@@ -1,14 +1,14 @@
-"""Ingest: validate, resolve the tenant, enqueue.
+"""Ingest: validate, resolve the user, enqueue.
 
 Deliberately thin and fast. Everything expensive - encryption, hash chaining,
 Elasticsearch, the WORM archive - happens in the worker, so an emitting service
 never waits on it. An audit write that adds latency to credential issuance is an
 audit write that someone will eventually be tempted to make optional.
 
-Tenant resolution is the security-critical part. The tenant is taken from the
-authenticated principal, and a body-supplied `tenant_id` is only honoured when it
+User resolution is the security-critical part. The user is taken from the
+authenticated principal, and a body-supplied `user_uuid` is only honoured when it
 matches. Without that reconciliation, any service key could write events into
-any tenant's trail - forged evidence, which is worse than missing evidence.
+any user's trail - forged evidence, which is worse than missing evidence.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from app.core.security.auth import Principal
 from app.domain.enums import Scope
 from app.queue.stream import IngestQueue
 from app.schemas.api import AuditEventIn, IngestAccepted
-from app.search.routing import InvalidTenantError, TenantRouter
+from app.search.routing import InvalidUserUuidError, UserRouter
 
 logger = get_logger(__name__)
 
@@ -46,7 +46,7 @@ class IngestService:
         *,
         settings: Settings,
         queue: IngestQueue,
-        router: TenantRouter,
+        router: UserRouter,
     ) -> None:
         self._settings = settings
         self._queue = queue
@@ -57,7 +57,7 @@ class IngestService:
         events: list[AuditEventIn],
         *,
         principal: Principal,
-        header_tenant_id: str | None,
+        header_user_uuid: str | None,
         header_issuer_id: str | None = None,
     ) -> IngestAccepted:
         """Validate and enqueue a batch.
@@ -68,7 +68,7 @@ class IngestService:
 
         Raises:
             IngestRejected: the caller lacks the write scope, the batch is over
-                the size limit, or no tenant can be resolved for the whole batch.
+                the size limit, or no user can be resolved for the whole batch.
         """
         principal.require(Scope.WRITE)
 
@@ -84,18 +84,18 @@ class IngestService:
 
         for index, incoming in enumerate(events):
             try:
-                tenant_id = self._resolve_tenant(
+                user_uuid = self._resolve_user(
                     principal=principal,
-                    header_tenant_id=header_tenant_id,
-                    body_tenant_id=incoming.tenant_id,
+                    header_user_uuid=header_user_uuid,
+                    body_user_uuid=incoming.user_uuid,
                 )
-            except (IngestRejected, InvalidTenantError) as exc:
+            except (IngestRejected, InvalidUserUuidError) as exc:
                 rejections.append(_Rejection(index=index, reason=str(exc)))
                 continue
 
             try:
                 event = incoming.to_domain(
-                    tenant_id=tenant_id,
+                    user_uuid=user_uuid,
                     issuer_id=header_issuer_id,
                     # Who actually submitted this, taken from the request rather
                     # than from the event body. An emitter that forgets to fill
@@ -111,7 +111,7 @@ class IngestService:
                     # service_name is the only handle on that.
                     logger.warning(
                         "event_clock_skew",
-                        tenant_id=tenant_id,
+                        user_uuid=user_uuid,
                         service_name=event.service_name,
                         action=event.action,
                         skew_seconds=event.labels.get("clock_skew_seconds"),
@@ -121,7 +121,7 @@ class IngestService:
                 rejections.append(_Rejection(index=index, reason=f"invalid event: {exc}"))
                 continue
 
-            partition = self._router.partition_for(tenant_id, self._settings.STREAM_PARTITIONS)
+            partition = self._router.partition_for(user_uuid, self._settings.STREAM_PARTITIONS)
             # The queue carries the *domain* shape, so the worker re-validates
             # against the same model rather than trusting a wire payload that
             # may have been queued by an older build.
@@ -150,22 +150,22 @@ class IngestService:
             errors=[rejection.as_dict() for rejection in rejections],
         )
 
-    def _resolve_tenant(
+    def _resolve_user(
         self,
         *,
         principal: Principal,
-        header_tenant_id: str | None,
-        body_tenant_id: str | None,
+        header_user_uuid: str | None,
+        body_user_uuid: str | None,
     ) -> str:
-        """Determine which tenant an event belongs to.
+        """Determine which user an event belongs to.
 
         Precedence:
-          1. The `x-audit-tenant-id` header, which is how a service names the
-             tenant it is acting for. A service legitimately writes for many
-             tenants, so the tenant is per-request rather than bound to the key.
-          2. A body-supplied `tenant_id`, used only when no header was sent, so
+          1. The `x-audit-user-uuid` header, which is how a service names the
+             user it is acting for. A service legitimately writes for many
+             users, so the user is per-request rather than bound to the key.
+          2. A body-supplied `user_uuid`, used only when no header was sent, so
              a batch can be self-describing. Unreachable over HTTP - the ingest
-             route takes `TenantIdDep` and refuses a call with no header - and
+             route takes `UserUuidDep` and refuses a call with no header - and
              kept for callers that are not the route: the CLI, a backfill, a
              replay.
           3. When both are present they must agree: a body value can never
@@ -173,28 +173,28 @@ class IngestService:
              live in production, and the one worth reading first.
 
         Raises:
-            IngestRejected: no tenant could be resolved, or the body contradicts
+            IngestRejected: no user could be resolved, or the body contradicts
                 the header.
         """
-        authoritative = header_tenant_id or principal.tenant_id or body_tenant_id
+        authoritative = header_user_uuid or principal.user_uuid or body_user_uuid
 
         if not authoritative:
             raise IngestRejected(
-                "cannot determine the tenant for this event: no x-audit-tenant-id "
-                "header was supplied and the event body carries no tenant_id"
+                "cannot determine the user for this event: no x-audit-user-uuid "
+                "header was supplied and the event body carries no user_uuid"
             )
 
-        if body_tenant_id and body_tenant_id != authoritative:
-            # A mismatch is treated as an attempted cross-tenant write and is
+        if body_user_uuid and body_user_uuid != authoritative:
+            # A mismatch is treated as an attempted cross-user write and is
             # logged at error level, because a correct emitter never does this.
             logger.error(
-                "tenant_mismatch_rejected",
-                header_tenant=authoritative,
-                body_tenant=body_tenant_id,
+                "user_uuid_mismatch_rejected",
+                header_user=authoritative,
+                body_user=body_user_uuid,
                 principal=principal.audit_identity,
             )
             raise IngestRejected(
-                "tenant_id in the event body does not match the x-audit-tenant-id header"
+                "user_uuid in the event body does not match the x-audit-user-uuid header"
             )
 
-        return self._router.validate_tenant_id(authoritative)
+        return self._router.validate_user_uuid(authoritative)

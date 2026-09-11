@@ -17,14 +17,14 @@ from typing import Final
 # Request headers
 # ---------------------------------------------------------------------------
 #: The credential. Either an env-configured service key (the admin plane) or an
-#: issued key bound to one tenant (the ingest plane).
+#: issued key bound to one user (the ingest plane).
 API_KEY_HEADER: Final[str] = "x-api-key"
 
-#: Tenant the call acts for. Authoritative only for an env-configured key; an
-#: issued key carries its own tenant and this header may only agree with it.
-TENANT_HEADER: Final[str] = "x-audit-tenant-id"
+#: User the call acts for. Authoritative only for an env-configured key; an
+#: issued key carries its own user and this header may only agree with it.
+USER_UUID_HEADER: Final[str] = "x-audit-user-uuid"
 
-#: Issuer (sub-tenant) the call acts within. Batch default for `issuer_id`.
+#: Issuer (sub-user) the call acts within. Batch default for `issuer_id`.
 ISSUER_HEADER: Final[str] = "x-audit-issuer-id"
 
 #: The person a service is acting for, recorded as `actor.on_behalf_of`.
@@ -75,10 +75,10 @@ API_KEY_HINT_LENGTH: Final[int] = 6
 DEFAULT_ISSUED_KEY_SCOPES: Final[tuple[str, ...]] = ("audit:write",)
 
 #: Scopes an issued key may never hold, whatever the request asks for. These
-#: reach across tenants or destroy data, so they stay with the env-configured
+#: reach across users or destroy data, so they stay with the env-configured
 #: admin credential that is rotated by deploy rather than by API.
 FORBIDDEN_ISSUED_KEY_SCOPES: Final[frozenset[str]] = frozenset(
-    {"audit:erase", "audit:admin", "audit:cross_tenant"}
+    {"audit:erase", "audit:admin", "audit:cross_user"}
 )
 
 #: Lifecycle states a key record can be in. Revoked keys are kept rather than
@@ -104,7 +104,7 @@ DEFAULT_API_KEY_EXPIRY_DAYS: Final[int] = 365
 #: process heap without bound.
 API_KEY_CACHE_MAX_ENTRIES: Final[int] = 4096
 
-#: Page size ceiling when listing keys for a tenant.
+#: Page size ceiling when listing keys for a user.
 API_KEY_LIST_MAX_SIZE: Final[int] = 200
 
 # ---------------------------------------------------------------------------

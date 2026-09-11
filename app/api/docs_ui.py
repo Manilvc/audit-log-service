@@ -143,7 +143,7 @@ def redoc_html(
     Redoc.init(
       "{openapi_url}",
       {{
-        // Auth and the tenant header are the two things a reader needs before
+        // Auth and the user header are the two things a reader needs before
         // anything else works, so the security block is never collapsed away.
         expandSingleSchemaField: true,
         expandResponses: "200,202",

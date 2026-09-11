@@ -12,7 +12,7 @@ Two invariants make the rest of the service work:
    what lets a crypto-shred destroy personal data years later without
    invalidating the hash chain - the ciphertext bytes stay in place, only the
    key needed to read them is destroyed.
-2. **`tenant.id` is never optional.** A document with no tenant cannot be
+2. **`user.uuid` is never optional.** A document with no user cannot be
    filtered safely, so it is rejected at ingest rather than written to a
    quarantine nobody reads.
 """
@@ -194,7 +194,7 @@ class Integrity(BaseModel):
     """Tamper-evidence metadata, assigned by the writer, never by the emitter.
 
     `seq` and `prev_hash` are allocated inside a single Redis Lua transaction
-    per (tenant, partition) chain, so the ordering is total and gap-free. A
+    per (user, partition) chain, so the ordering is total and gap-free. A
     verifier can therefore detect deletion (missing seq), reordering (broken
     prev link) and mutation (hash mismatch).
     """
@@ -206,7 +206,7 @@ class Integrity(BaseModel):
     hash: str
     algo: str = "sha256"
     chain_id: str
-    """`<tenant_id>:<partition>` - the chain this sequence belongs to."""
+    """`<user_uuid>:<partition>` - the chain this sequence belongs to."""
 
 
 class PiiEnvelope(BaseModel):
@@ -248,11 +248,11 @@ class AuditEvent(BaseModel):
     """Server receipt time. A large gap from `timestamp` is itself a signal."""
 
     # --------------------------------------------------------------- tenancy
-    tenant_id: Uuid36
+    user_uuid: Uuid36
     """Never optional - the entire isolation model rests on this field."""
-    tenant_name: ShortText | None = None
+    user_name: ShortText | None = None
     issuer_id: Uuid36 | None = None
-    """Sub-tenant scope inside a tenant, mirroring `user_audit_log.issuer_uuid`."""
+    """Sub-user scope inside a user, mirroring `user_audit_log.issuer_uuid`."""
 
     # ------------------------------------------------------------ what/where
     action: Keyword
@@ -314,9 +314,9 @@ class AuditEvent(BaseModel):
                 "ingested": (self.ingested_at.isoformat() if self.ingested_at else None),
                 "reason": self.reason,
             },
-            "tenant": {
-                "id": self.tenant_id,
-                "name": self.tenant_name,
+            "user": {
+                "uuid": self.user_uuid,
+                "name": self.user_name,
                 "issuer_id": self.issuer_id,
             },
             "service": {"name": self.service_name, "version": self.service_version},

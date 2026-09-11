@@ -25,7 +25,7 @@ from app.schemas.api import (
     IntegrityVerifyRequest,
 )
 from app.search.repository import AuditRepository
-from app.search.routing import TenantRouter
+from app.search.routing import UserRouter
 
 logger = get_logger(__name__)
 
@@ -38,7 +38,7 @@ class IntegrityService:
         *,
         settings: Settings,
         repository: AuditRepository,
-        router: TenantRouter,
+        router: UserRouter,
         archive: Any,
     ) -> None:
         self._settings = settings
@@ -51,9 +51,9 @@ class IntegrityService:
         request: IntegrityVerifyRequest,
         *,
         principal: Principal,
-        tenant_id: str,
+        user_uuid: str,
     ) -> IntegrityReport:
-        """Verify one chain, or every chain for a tenant.
+        """Verify one chain, or every chain for a user.
 
         A chain slice is only meaningful evidence when the verifier knows where
         it should start. Verifying from `start_seq=0` asserts contiguity from the
@@ -67,7 +67,7 @@ class IntegrityService:
             [request.chain_id]
             if request.chain_id
             else [
-                self._router.chain_id(tenant_id, partition)
+                self._router.chain_id(user_uuid, partition)
                 for partition in range(self._settings.STREAM_PARTITIONS)
             ]
         )
@@ -79,7 +79,7 @@ class IntegrityService:
         for chain_id in chain_ids:
             documents = await self._repository.fetch_chain_slice(
                 chain_id=chain_id,
-                tenant_id=tenant_id,
+                user_uuid=user_uuid,
                 start_seq=request.start_seq,
                 limit=request.max_events,
             )
@@ -107,10 +107,10 @@ class IntegrityService:
                 for break_ in result.breaks
             )
 
-        checkpoint = await self._latest_checkpoint(tenant_id, chain_ids)
+        checkpoint = await self._latest_checkpoint(user_uuid, chain_ids)
 
         report = IntegrityReport(
-            tenant_id=tenant_id,
+            user_uuid=user_uuid,
             chains_checked=chains_with_data,
             events_verified=verified_total,
             intact=not all_breaks,
@@ -125,21 +125,21 @@ class IntegrityService:
             # incident responder needs immediately.
             logger.error(
                 "integrity_verification_failed",
-                tenant_id=tenant_id,
+                user_uuid=user_uuid,
                 break_count=len(all_breaks),
                 kinds=sorted({break_["kind"] for break_ in all_breaks}),
             )
         else:
             logger.info(
                 "integrity_verified",
-                tenant_id=tenant_id,
+                user_uuid=user_uuid,
                 chains=chains_with_data,
                 events=verified_total,
             )
         return report
 
     async def _latest_checkpoint(
-        self, tenant_id: str, chain_ids: list[str]
+        self, user_uuid: str, chain_ids: list[str]
     ) -> dict[str, Any] | None:
         """Most recent WORM-notarised checkpoint across the chains checked.
 
@@ -153,7 +153,7 @@ class IntegrityService:
         for chain_id in chain_ids:
             try:
                 candidate = await self._archive.latest_checkpoint(
-                    tenant_id=tenant_id, chain_id=chain_id
+                    user_uuid=user_uuid, chain_id=chain_id
                 )
             except Exception as exc:
                 logger.warning("checkpoint_lookup_failed", chain_id=chain_id, error=str(exc))
@@ -173,7 +173,7 @@ class ErasureService:
         *,
         settings: Settings,
         repository: AuditRepository,
-        router: TenantRouter,
+        router: UserRouter,
         cipher: PiiCipher,
         keyring: Any,
         queue: IngestQueue,
@@ -190,7 +190,7 @@ class ErasureService:
         request: ErasureRequest,
         *,
         principal: Principal,
-        tenant_id: str,
+        user_uuid: str,
     ) -> ErasureReceipt:
         """Destroy the key protecting one data subject's PII.
 
@@ -208,13 +208,13 @@ class ErasureService:
         """
         principal.require(Scope.ERASE)
 
-        key_id = self._cipher.subject_key_id(tenant_id, request.subject_id)
+        key_id = self._cipher.subject_key_id(user_uuid, request.subject_id)
 
         # Count first: once the key is gone the documents are still countable by
         # key_id, but reporting the figure is a GDPR Art. 19 obligation and
         # doing it beforehand keeps the receipt accurate even if the count query
         # later fails.
-        affected = await self._repository.count_by_key_id(tenant_id=tenant_id, key_id=key_id)
+        affected = await self._repository.count_by_key_id(user_uuid=user_uuid, key_id=key_id)
 
         destroyed = await self._keyring.delete(
             key_id,
@@ -228,7 +228,7 @@ class ErasureService:
         # personal data being erased.
         audit_event_id = await self._record_erasure(
             principal=principal,
-            tenant_id=tenant_id,
+            user_uuid=user_uuid,
             subject_id=request.subject_id,
             key_id=key_id,
             affected=affected,
@@ -238,7 +238,7 @@ class ErasureService:
 
         logger.warning(
             "data_subject_erasure_executed",
-            tenant_id=tenant_id,
+            user_uuid=user_uuid,
             key_id=key_id,
             affected_events=affected,
             destroyed=destroyed,
@@ -259,7 +259,7 @@ class ErasureService:
         self,
         *,
         principal: Principal,
-        tenant_id: str,
+        user_uuid: str,
         subject_id: str,
         key_id: str,
         affected: int,
@@ -275,13 +275,13 @@ class ErasureService:
         import uuid
 
         event_id = str(uuid.uuid4())
-        partition = self._router.partition_for(tenant_id, self._settings.STREAM_PARTITIONS)
+        partition = self._router.partition_for(user_uuid, self._settings.STREAM_PARTITIONS)
         await self._queue.publish(
             partition,
             {
                 "event_id": event_id,
                 "timestamp": datetime.now(UTC).isoformat(),
-                "tenant_id": tenant_id,
+                "user_uuid": user_uuid,
                 "action": Action.AUDIT_ERASURE_REQUEST.value,
                 "category": EventCategory.AUDIT.value,
                 "type": EventType.DELETION.value,

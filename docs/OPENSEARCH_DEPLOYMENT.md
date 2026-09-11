@@ -33,7 +33,7 @@ except three. Four things differ, and all four live inside the adapter.
 | Retention | ILM (`_ilm/policy`), attached per index by `index.lifecycle.name` | ISM (`_plugins/_ism/policies`), attached by `ism_template` index patterns |
 | `labels`, `change.before/after` | `flattened` | `flat_object` |
 | `message` | `match_only_text` | `text` |
-| `tenant.id` on a dedicated stream | `constant_keyword` | `keyword` — see [Tenant isolation](#tenant-isolation) |
+| `user.uuid` on a dedicated stream | `constant_keyword` | `keyword` — see [User isolation](#user-isolation) |
 | Point-in-time | `open_point_in_time` → `id`, `ignore_unavailable` supported | `create_pit` → `pit_id`; no `ignore_unavailable`, so a missing target is a clean `index_not_found_exception` rather than an empty PIT |
 | Custom routing on a data stream | Supported via `allow_custom_routing` | **Rejected outright** — see below |
 | `@timestamp` sort | Takes a `format`, so the cursor carries a formatted date | `field_sort` rejects `format`; the cursor carries epoch millis |
@@ -42,7 +42,7 @@ except three. Four things differ, and all four live inside the adapter.
 ### Custom routing
 
 This one has an operational consequence rather than just a code one. On
-Elasticsearch the shared stream routes by tenant id, so a tenant-scoped search
+Elasticsearch the shared stream routes by user uuid, so a user-scoped search
 hits **one shard**. OpenSearch data streams refuse a routed write:
 
 ```
@@ -55,9 +55,9 @@ There is no flag to enable it, so on OpenSearch the router issues no routing key
 and the template omits `allow_custom_routing`. Searches on the shared stream
 then fan out across its shards.
 
-Isolation is unaffected — that comes from the mandatory tenant filter, not from
+Isolation is unaffected — that comes from the mandatory user filter, not from
 routing. What changes is search cost on the shared stream, which scales with
-`SHARED_SHARD_COUNT`. A tenant whose volume makes that expensive is exactly the
+`SHARED_SHARD_COUNT`. A user whose volume makes that expensive is exactly the
 case dedicated streams exist for, and those never used routing on either
 engine.
 
@@ -71,18 +71,18 @@ Two consequences worth knowing:
   positions. Over six years of retention that is a real difference; budget for
   it when sizing EBS.
 
-## Tenant isolation
+## User isolation
 
 On Elasticsearch, a dedicated stream's `constant_keyword` makes the **engine
-itself** refuse a document carrying another tenant's id. `SECURITY.md` counts
+itself** refuse a document carrying another user's id. `SECURITY.md` counts
 that as a layer of the isolation model, and OpenSearch has no dependable
 equivalent — availability of `constant_keyword` varies across 2.x minors, and a
 security control must not depend on a patch version.
 
 So the guarantee moved into the code: **`AuditRepository.bulk_index` refuses to
-write a document whose `tenant.id` disagrees with its route**, on both engines
+write a document whose `user.uuid` disagrees with its route**, on both engines
 and on the shared stream too — which neither engine ever guarded. A mismatch is
-logged as `bulk_index_tenant_mismatch`, reported as a permanent failure, and
+logged as `bulk_index_user_uuid_mismatch`, reported as a permanent failure, and
 dead-lettered for a human rather than retried.
 
 The engine check remains a second layer where the engine offers it. Net effect
@@ -92,7 +92,7 @@ by engine:
 |---|---|---|
 | Mandatory query filter on reads | Yes | Yes |
 | Repository write guard | Yes | Yes |
-| Engine refuses a foreign tenant id | Yes, dedicated streams | No |
+| Engine refuses a foreign user uuid | Yes, dedicated streams | No |
 
 `tests/unit/test_opensearch_backend.py` covers the guard;
 `tests/integration/test_end_to_end.py` asserts the extra Elastic layer is still
@@ -103,7 +103,7 @@ present rather than silently lost.
 Two decisions first.
 
 **VPC or public endpoint.** Production should be a VPC domain: this store holds
-every tenant's audit trail and has no business having a public endpoint. A
+every user's audit trail and has no business having a public endpoint. A
 public endpoint with an IP-restricted access policy is fine for a spike.
 
 **Basic auth or SigV4.** Fine-grained access control with an internal master
@@ -210,7 +210,7 @@ Current status of that matrix, run against Elasticsearch 9.2.0 and OpenSearch
 | `opensearch` | 23 passed, 2 skipped |
 
 The two skips are the Elastic-only guarantees: `constant_keyword` refusing a
-foreign tenant id, and the `allow_custom_routing` / `_routing` coupling. Both
+foreign user uuid, and the `allow_custom_routing` / `_routing` coupling. Both
 skip explicitly rather than silently asserting nothing.
 
 ## Before production

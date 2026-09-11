@@ -1,16 +1,22 @@
 """Historical backfill: legacy Postgres audit rows → ingest API.
 
 The audit service has no SQL dependency by design. Operators export rows from
-tenant DBs as NDJSON, then this module maps and posts them.
+the main backend's databases as NDJSON, then this module maps and posts them.
 
 Each NDJSON line::
 
     {
       "source": "user_audit_log" | "holder_audit_log" | "session_audit_log",
-      "tenant_id": "<uuid>",
+      "user_uuid": "<uuid>",
       "uuid": "<row uuid or synthetic id>",
       ...source-specific columns...
     }
+
+``user_uuid`` is the scope the event is filed under. For ``user_audit_log`` it
+is the acting user's own uuid, so it doubles as ``actor.id``. For holder and
+session rows the actor is somebody else, so the exporter must supply the
+``user_uuid`` whose trail the row belongs to (``--default-user-uuid`` covers a
+whole file).
 
 Idempotency: ``event_id`` is derived from the legacy row id/uuid so a re-run
 is safe (ES ``op_type: create`` rejects duplicates).
@@ -61,18 +67,18 @@ def _strip_nones(value: Any) -> Any:
 def map_legacy_row(row: dict[str, Any]) -> dict[str, Any]:
     """Convert one exported legacy row into an ``AuditEventIn``-shaped dict."""
     source = str(row.get("source") or "user_audit_log").strip().lower()
-    tenant_id = row.get("tenant_id")
-    if not tenant_id:
-        raise ValueError("tenant_id is required on every backfill row")
+    user_uuid = row.get("user_uuid")
+    if not user_uuid:
+        raise ValueError("user_uuid is required on every backfill row")
 
     if source == "holder_audit_log":
-        return _map_holder(row, tenant_id=str(tenant_id))
+        return _map_holder(row, user_uuid=str(user_uuid))
     if source == "session_audit_log":
-        return _map_session(row, tenant_id=str(tenant_id))
-    return _map_user(row, tenant_id=str(tenant_id))
+        return _map_session(row, user_uuid=str(user_uuid))
+    return _map_user(row, user_uuid=str(user_uuid))
 
 
-def _map_user(row: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
+def _map_user(row: dict[str, Any], *, user_uuid: str) -> dict[str, Any]:
     event_id = str(row.get("uuid") or row.get("event_id") or "")
     if not event_id:
         raise ValueError("user_audit_log row needs uuid")
@@ -89,13 +95,16 @@ def _map_user(row: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
     event: dict[str, Any] = {
         "event_id": event_id,
         "action": str(action),
-        "tenant_id": tenant_id,
+        "user_uuid": user_uuid,
         "outcome": str(outcome),
         "message": row.get("details"),
         "service_name": _SERVICE_NAME,
         "actor": {
             "type": "user",
-            "id": str(row["user_uuid"]) if row.get("user_uuid") else None,
+            # Same column as the scope: `user_uuid` is both who acted and which
+            # trail the event belongs to. Holder and session rows differ - there
+            # the actor is not the scope, so they read their own actor columns.
+            "id": user_uuid,
             "numeric_id": row.get("user_id"),
         },
         "target": {
@@ -123,7 +132,7 @@ def _map_user(row: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
     return cast(dict[str, Any], _strip_nones(event))
 
 
-def _map_holder(row: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
+def _map_holder(row: dict[str, Any], *, user_uuid: str) -> dict[str, Any]:
     event_id = str(row.get("uuid") or row.get("event_id") or "")
     if not event_id:
         raise ValueError("holder_audit_log row needs uuid")
@@ -131,7 +140,7 @@ def _map_holder(row: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
     event: dict[str, Any] = {
         "event_id": event_id,
         "action": str(map_action(str(row.get("action") or "Unknown"))),
-        "tenant_id": tenant_id,
+        "user_uuid": user_uuid,
         "outcome": str(map_status(str(row.get("status") or "Unknown"))),
         "message": row.get("details"),
         "service_name": _SERVICE_NAME,
@@ -151,7 +160,7 @@ def _map_holder(row: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
     return cast(dict[str, Any], _strip_nones(event))
 
 
-def _map_session(row: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
+def _map_session(row: dict[str, Any], *, user_uuid: str) -> dict[str, Any]:
     session_uuid = str(row.get("session_uuid") or "")
     event_type = str(row.get("event_type") or row.get("action") or "")
     row_id = row.get("id") or row.get("uuid") or row.get("event_id")
@@ -168,7 +177,7 @@ def _map_session(row: dict[str, Any], *, tenant_id: str) -> dict[str, Any]:
     event: dict[str, Any] = {
         "event_id": event_id,
         "action": str(map_action(event_type)),
-        "tenant_id": tenant_id,
+        "user_uuid": user_uuid,
         "outcome": "success",
         "service_name": _SERVICE_NAME,
         "actor": {
@@ -230,7 +239,7 @@ def run_backfill(
     api_key: str,
     batch_size: int = 100,
     dry_run: bool = False,
-    default_tenant: str | None = None,
+    default_user_uuid: str | None = None,
     timeout: float = 30.0,
 ) -> BackfillStats:
     """Map NDJSON rows and POST batches to ``/v1/audit/events``."""
@@ -244,27 +253,26 @@ def run_backfill(
         if dry_run:
             stats.accepted += len(batch)
             return
-        # Group by tenant so the header matches every event in the batch.
-        by_tenant: dict[str, list[dict[str, Any]]] = {}
+        # Group by user so the header matches every event in the batch.
+        by_user: dict[str, list[dict[str, Any]]] = {}
         for event in batch:
-            by_tenant.setdefault(str(event["tenant_id"]), []).append(event)
+            by_user.setdefault(str(event["user_uuid"]), []).append(event)
 
         with httpx.Client(timeout=timeout) as client:
-            for tenant_id, events in by_tenant.items():
+            for user_uuid, events in by_user.items():
                 response = client.post(
                     f"{base}/v1/audit/events",
                     headers={
                         "Content-Type": "application/json",
                         "x-api-key": api_key,
-                        "x-audit-tenant-id": tenant_id,
+                        "x-audit-user-uuid": user_uuid,
                         "x-service-name": _SERVICE_NAME,
                     },
                     json={"events": events},
                 )
                 if response.status_code >= 300:
                     stats.errors.append(
-                        f"tenant={tenant_id} status={response.status_code} "
-                        f"body={response.text[:300]}"
+                        f"user={user_uuid} status={response.status_code} body={response.text[:300]}"
                     )
                     stats.rejected += len(events)
                     continue
@@ -276,8 +284,8 @@ def run_backfill(
 
     for row in iter_ndjson(path):
         stats.read += 1
-        if default_tenant and not row.get("tenant_id"):
-            row = {**row, "tenant_id": default_tenant}
+        if default_user_uuid and not row.get("user_uuid"):
+            row = {**row, "user_uuid": default_user_uuid}
         try:
             pending.append(map_legacy_row(row))
             stats.mapped += 1

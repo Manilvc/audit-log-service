@@ -19,22 +19,22 @@ Why the mapping looks like this
     ``flattened`` indexes the whole subtree as one field: still queryable by
     exact key/value, with a fixed mapping cost.
 
-``FieldTypes.pinned_tenant`` for ``tenant.id`` on dedicated streams
+``FieldTypes.pinned_user_uuid`` for ``user.uuid`` on dedicated streams
     Doubles as a storage-layer isolation guarantee. A backing index adopts the
-    tenant id of its first document, and any later document with a different
-    tenant id is *rejected by Elasticsearch*. Cross-tenant contamination in a
+    user uuid of its first document, and any later document with a different
+    user uuid is *rejected by Elasticsearch*. Cross-user contamination in a
     dedicated stream becomes impossible rather than merely unlikely. It also
-    makes the tenant filter free to evaluate.
+    makes the user filter free to evaluate.
 
 ``index.sort`` on ``@timestamp`` descending
     The overwhelmingly common query is "most recent events first". A
     descending index sort lets Lucene terminate early instead of scoring a
     whole segment.
 
-Custom routing by tenant (shared stream only)
-    ``allow_custom_routing`` lets a tenant's documents be pinned to one shard,
-    so a tenant-scoped search fans out to one shard instead of all of them. The
-    hot-shard risk this introduces is exactly what promoting a heavy tenant to
+Custom routing by user (shared stream only)
+    ``allow_custom_routing`` lets a user's documents be pinned to one shard,
+    so a user-scoped search fans out to one shard instead of all of them. The
+    hot-shard risk this introduces is exactly what promoting a heavy user to
     a dedicated stream solves.
 
     The flag has a side effect worth knowing: Elasticsearch marks ``_routing``
@@ -80,11 +80,11 @@ _KEYWORD_SORTABLE_ID: dict[str, Any] = {
 }
 
 
-def _event_mapping(types: FieldTypes, tenant_id_field: dict[str, Any]) -> dict[str, Any]:
+def _event_mapping(types: FieldTypes, user_uuid_field: dict[str, Any]) -> dict[str, Any]:
     """Build the audit document mapping.
 
     Args:
-        tenant_id_field: `keyword` for the shared stream, `constant_keyword`
+        user_uuid_field: `keyword` for the shared stream, `constant_keyword`
             for a dedicated one.
     """
     return {
@@ -106,10 +106,10 @@ def _event_mapping(types: FieldTypes, tenant_id_field: dict[str, Any]) -> dict[s
                     "reason": _KEYWORD_1024,
                 },
             },
-            "tenant": {
+            "user": {
                 "dynamic": "strict",
                 "properties": {
-                    "id": tenant_id_field,
+                    "uuid": user_uuid_field,
                     "name": _KEYWORD_1024,
                     "issuer_id": _KEYWORD,
                 },
@@ -254,19 +254,19 @@ def shared_index_template(
     policy_name: str,
     priority: int = 200,
 ) -> dict[str, Any]:
-    """Template for the multi-tenant shared data stream.
+    """Template for the multi-user shared data stream.
 
-    `tenant.id` is a plain `keyword`: the isolation guarantee here is the
+    `user.uuid` is a plain `keyword`: the isolation guarantee here is the
     mandatory filter injected by `search.query`, backed by the tests in
-    `tests/unit/test_tenant_isolation.py`.
+    `tests/unit/test_user_isolation.py`.
     """
     return {
         "index_patterns": [name_pattern],
         # Enabling custom routing also makes `_routing` REQUIRED on every
         # backing index - Elasticsearch sets `_routing: {required: true}`
         # automatically. Every write to the shared stream must therefore supply
-        # a routing value, which `TenantRouter.resolve` guarantees by returning
-        # the tenant id as `routing_key` for shared tenants.
+        # a routing value, which `UserRouter.resolve` guarantees by returning
+        # the user uuid as `routing_key` for shared users.
         #
         # Omitted on an engine whose data streams refuse routed writes, where
         # the router issues no key either - the two have to agree, or every
@@ -294,11 +294,11 @@ def dedicated_index_template(
     policy_name: str,
     priority: int = 300,
 ) -> dict[str, Any]:
-    """Template for per-tenant dedicated data streams.
+    """Template for per-user dedicated data streams.
 
-    Higher priority than the shared template so `audit-t-<uuid>-*` wins over
-    any broader pattern. `tenant.id` becomes `constant_keyword`, which makes
-    the *engine* reject a document carrying the wrong tenant id - on an engine
+    Higher priority than the shared template so `audit-u-<uuid>-*` wins over
+    any broader pattern. `user.uuid` becomes `constant_keyword`, which makes
+    the *engine* reject a document carrying the wrong user uuid - on an engine
     without that type it degrades to `keyword`, and the check has to move into
     the worker.
     """
@@ -307,7 +307,7 @@ def dedicated_index_template(
         # Custom routing is deliberately NOT enabled here. Enabling it would
         # make `_routing` required on the backing indices, and a dedicated
         # stream has no routing key to supply - the stream is already scoped to
-        # one tenant, so pinning to a single shard would only remove headroom.
+        # one user, so pinning to a single shard would only remove headroom.
         # Setting the flag anyway would reject every write with
         # `routing_missing_exception`.
         "data_stream": {},
@@ -318,7 +318,7 @@ def dedicated_index_template(
                 replicas=replicas,
                 lifecycle=backend.lifecycle_index_settings(policy_name),
             ),
-            "mappings": _event_mapping(backend.field_types, backend.field_types.pinned_tenant),
+            "mappings": _event_mapping(backend.field_types, backend.field_types.pinned_user_uuid),
         },
         "_meta": {"managed_by": "everycred-audit-service", "isolation": "dedicated"},
     }
@@ -352,7 +352,7 @@ def api_key_index_settings(*, replicas: int) -> dict[str, Any]:
             "dynamic": "strict",
             "properties": {
                 "key_id": _KEYWORD,
-                "tenant_id": _KEYWORD,
+                "user_uuid": _KEYWORD,
                 # The emitting system the key was issued to.
                 "domain": _KEYWORD_1024,
                 "label": _KEYWORD_1024,

@@ -65,7 +65,7 @@ than fall back to a guessable value.
 
 | Variable | Notes |
 |---|---|
-| `SERVICE_API_KEYS` | **The only credential**, and it carries every scope including `audit:erase` and `audit:cross_tenant`. Comma-separated for rotation with overlap. `openssl rand -hex 32`. Distinct per environment |
+| `SERVICE_API_KEYS` | **The only credential**, and it carries every scope including `audit:erase` and `audit:cross_user`. Comma-separated for rotation with overlap. `openssl rand -hex 32`. Distinct per environment |
 | `PII_MASTER_KEK` | `audit-service generate-kek`. **Losing it makes all encrypted PII permanently unreadable** |
 | `ES_API_KEY` | Scoped key; preferred over `ES_USERNAME`/`ES_PASSWORD` |
 | `AWS_*` | Prefer an instance role / IRSA over static keys |
@@ -98,7 +98,7 @@ read the startup log, the message names the problem.
 
 | Setting | Guidance |
 |---|---|
-| `STREAM_PARTITIONS` | 8 default. **Changing it after go-live re-partitions tenants and starts new chains** — plan it as a migration, not a tweak |
+| `STREAM_PARTITIONS` | 8 default. **Changing it after go-live re-partitions users and starts new chains** — plan it as a migration, not a tweak |
 | `WORKER_BATCH_SIZE` | 500. Lower for latency, higher for throughput |
 | `INGEST_RATE_LIMIT_PER_MINUTE` | Set above peak platform activity — throttling ingest means dropping evidence |
 | `READ_RATE_LIMIT_PER_MINUTE` | 120 is deliberately low; reads are the sensitive surface |
@@ -252,7 +252,7 @@ curl -s https://audit.yourdomain.com/health   # ES version, queue depth, archive
 
 # Ingest and read back
 curl -s -X POST https://audit.yourdomain.com/v1/audit/events \
-  -H "x-api-key: $KEY" -H "x-audit-tenant-id: $TENANT" \
+  -H "x-api-key: $KEY" -H "x-audit-user-uuid: $USER" \
   -H 'Content-Type: application/json' \
   -d '{"events":[{"action":"credential.issue","event_id":"deploy-check-1",
        "outcome":"success","actor":{"type":"service","id":"deploy-check"},
@@ -260,10 +260,10 @@ curl -s -X POST https://audit.yourdomain.com/v1/audit/events \
 
 sleep 3
 curl -s https://audit.yourdomain.com/v1/audit/events/deploy-check-1 \
-  -H "x-api-key: $KEY" -H "x-audit-tenant-id: $TENANT"
+  -H "x-api-key: $KEY" -H "x-audit-user-uuid: $USER"
 
 # Integrity gate — exits non-zero on a break
-audit-service verify --tenant "$TENANT"
+audit-service verify --user "$USER"
 ```
 
 Expected: `202` on ingest, the event retrievable within ~1s, and
@@ -301,12 +301,12 @@ Log lines worth alerting on:
 | `batch_was_redelivery_chain_resynced` | Explains a documented gap; frequent means an upstream failure |
 | `partition_lease_lost` | Redis connectivity |
 | `archive_seal_failed` | Un-notarised evidence; batch retried |
-| `keyring_unavailable` | Ingest halted for affected tenants |
+| `keyring_unavailable` | Ingest halted for affected users |
 | `integrity_verification_failed` | **Security incident** |
-| `tenant_mismatch_rejected` | An emitter tried to write into another tenant |
+| `user_uuid_mismatch_rejected` | An emitter tried to write into another user |
 | `worm_archive_misconfigured` | Immutability not actually in place |
 
-Schedule `audit-service verify --tenant <id>` as a job. Continuous verification
+Schedule `audit-service verify --user <id>` as a job. Continuous verification
 is what turns tamper *evidence* into tamper *detection* — a chain checked only
 when someone suspects a problem is not much of a control. It exits non-zero on a
 break, so it works directly as a cron or CI gate.
@@ -323,7 +323,7 @@ The service is stateless; the data is not.
 | Config | Revert env and restart |
 | Index template | Re-apply the previous template. Existing backing indices keep their mapping; only new ones pick it up |
 | ILM policy | Re-apply the previous policy — takes effect on the next phase evaluation |
-| `STREAM_PARTITIONS` | **Not a rollback.** Reverting re-partitions tenants again and starts further chains. Treat any change as one-way |
+| `STREAM_PARTITIONS` | **Not a rollback.** Reverting re-partitions users again and starts further chains. Treat any change as one-way |
 
 Never delete audit indices to "clean up" a bad deploy. Documents are immutable
 and a partial chain is still evidence; a deleted index is a compliance gap.
@@ -342,7 +342,7 @@ and a partial chain is still evidence; a deleted index is a compliance gap.
 The integration job is not optional coverage. It verifies guarantees enforced by
 Elasticsearch itself and by the worker/Redis/ES interaction — and has already
 caught a mapping that broke all pagination and a routing setting that would have
-rejected 100% of writes for dedicated tenants.
+rejected 100% of writes for dedicated users.
 
 A release pipeline should add: build and push the image, run `bootstrap` against
 the target cluster, deploy the API (rolling), deploy the worker (recreate), then

@@ -1,7 +1,7 @@
 """Event ingest, search and export endpoints.
 
 Mounted under ``/v1/audit``. Every route requires a valid ``x-api-key`` and a
-tenant named in ``x-audit-tenant-id`` — the query layer injects the tenant
+user named in ``x-audit-user-uuid`` — the query layer injects the user
 filter from that header; callers cannot omit it.
 
 Routes
@@ -10,7 +10,7 @@ Routes
     Batch ingest (≤500). Returns **202** after durable enqueue; crypto/ES/S3
     happen in the worker, so credential flows never wait on audit I/O.
 ``POST /events/search`` / ``GET /events/{id}`` / ``POST /events/aggregate``
-    Tenant-scoped reads. Each successful read emits an ``audit_log.*`` event
+    User-scoped reads. Each successful read emits an ``audit_log.*`` event
     (HIPAA 164.312(b) audit-of-the-audit).
 ``POST /events/export``
     Streaming NDJSON over a Point-in-Time; requires ``audit:export``.
@@ -30,8 +30,8 @@ from app.api.deps import (
     IssuerHeaderDep,
     PrincipalDep,
     QueryServiceDep,
-    TenantHeaderDep,
-    TenantIdDep,
+    UserUuidDep,
+    UserUuidHeaderDep,
 )
 from app.core.exceptions import NotFound
 from app.core.logging import get_logger
@@ -59,7 +59,7 @@ async def ingest_events(
     payload: Annotated[IngestBatchIn, Body()],
     principal: PrincipalDep,
     service: IngestServiceDep,
-    tenant_header: TenantIdDep,
+    user_uuid_header: UserUuidDep,
     issuer_header: IssuerHeaderDep,
 ) -> ORJSONResponse:
     """Record audit events.
@@ -75,7 +75,7 @@ async def ingest_events(
     result = await service.ingest(
         payload.events,
         principal=principal,
-        header_tenant_id=tenant_header,
+        header_user_uuid=user_uuid_header,
         header_issuer_id=issuer_header,
     )
     message = (
@@ -98,10 +98,10 @@ async def search_events(
     payload: Annotated[SearchRequest, Body()],
     principal: PrincipalDep,
     service: QueryServiceDep,
-    tenant_header: TenantHeaderDep,
-    cross_tenant: Annotated[
+    user_uuid_header: UserUuidHeaderDep,
+    cross_user: Annotated[
         bool,
-        Query(description="Query across all tenants. Requires audit:cross_tenant."),
+        Query(description="Query across all users. Requires audit:cross_user."),
     ] = False,
 ) -> ORJSONResponse:
     """Search the audit trail.
@@ -119,8 +119,8 @@ async def search_events(
     result = await service.search(
         payload,
         principal=principal,
-        requested_tenant_id=tenant_header,
-        cross_tenant=cross_tenant,
+        requested_user_uuid=user_uuid_header,
+        cross_user=cross_user,
     )
     return success(result.model_dump(), message=f"{len(result.events)} event(s) returned.")
 
@@ -133,15 +133,15 @@ async def get_event(
     event_id: Annotated[str, Path(max_length=64)],
     principal: PrincipalDep,
     service: QueryServiceDep,
-    tenant_header: TenantIdDep,
+    user_uuid_header: UserUuidDep,
 ) -> ORJSONResponse:
     """Fetch a single event by id.
 
-    Still tenant-filtered: this is a filtered search, not a document GET, so
-    guessing an event id from another tenant returns 404 rather than the record.
+    Still user-filtered: this is a filtered search, not a document GET, so
+    guessing an event id from another user returns 404 rather than the record.
     """
     document = await service.get_event(
-        event_id, principal=principal, requested_tenant_id=tenant_header
+        event_id, principal=principal, requested_user_uuid=user_uuid_header
     )
     if document is None:
         raise NotFound("No audit event with that id is visible to you.")
@@ -156,8 +156,8 @@ async def aggregate_events(
     payload: Annotated[AggregationRequest, Body()],
     principal: PrincipalDep,
     service: QueryServiceDep,
-    tenant_header: TenantHeaderDep,
-    cross_tenant: Annotated[bool, Query()] = False,
+    user_uuid_header: UserUuidHeaderDep,
+    cross_user: Annotated[bool, Query()] = False,
 ) -> ORJSONResponse:
     """Bucket events by a field, optionally over time.
 
@@ -168,8 +168,8 @@ async def aggregate_events(
     aggregations = await service.aggregate(
         payload,
         principal=principal,
-        requested_tenant_id=tenant_header,
-        cross_tenant=cross_tenant,
+        requested_user_uuid=user_uuid_header,
+        cross_user=cross_user,
     )
     return success(aggregations, message="Aggregation complete.")
 
@@ -182,7 +182,7 @@ async def export_events(
     payload: Annotated[ExportRequest, Body()],
     principal: PrincipalDep,
     service: QueryServiceDep,
-    tenant_header: TenantIdDep,
+    user_uuid_header: UserUuidDep,
 ) -> StreamingResponse:
     """Export matching events as newline-delimited JSON.
 
@@ -199,7 +199,7 @@ async def export_events(
 
     async def stream() -> AsyncIterator[bytes]:
         async for document in service.export(
-            payload, principal=principal, requested_tenant_id=tenant_header
+            payload, principal=principal, requested_user_uuid=user_uuid_header
         ):
             yield orjson.dumps(document) + b"\n"
 

@@ -18,8 +18,8 @@ entirely, the audit trail can be rebuilt from these segments.
 
 Object layout
 -------------
-    <prefix>/events/<tenant>/<yyyy>/<mm>/<dd>/<chain>/<start_seq>-<end_seq>.ndjson.gz
-    <prefix>/checkpoints/<tenant>/<chain>/<seq>.json
+    <prefix>/events/<user>/<yyyy>/<mm>/<dd>/<chain>/<start_seq>-<end_seq>.ndjson.gz
+    <prefix>/checkpoints/<user>/<chain>/<seq>.json
 
 NDJSON so a segment streams line by line without loading it whole, gzipped
 because audit JSON is highly repetitive and compresses to roughly a fifth.
@@ -174,7 +174,7 @@ class WormArchive:
     async def seal_segment(
         self,
         *,
-        tenant_id: str,
+        user_uuid: str,
         chain_id: str,
         documents: list[dict[str, Any]],
     ) -> SealedSegment:
@@ -198,7 +198,7 @@ class WormArchive:
             compresslevel=6,
         )
         digest = _sha256_hex(body)
-        key = self._segment_key(tenant_id, chain_id, start_seq, end_seq)
+        key = self._segment_key(user_uuid, chain_id, start_seq, end_seq)
         retain_until = datetime.now(UTC) + timedelta(days=self._settings.OBJECT_LOCK_RETAIN_DAYS)
 
         await self._put_locked_object(
@@ -207,7 +207,7 @@ class WormArchive:
             content_type="application/gzip",
             retain_until=retain_until,
             metadata={
-                "tenant-id": tenant_id,
+                "user-id": user_uuid,
                 "chain-id": chain_id,
                 "start-seq": str(start_seq),
                 "end-seq": str(end_seq),
@@ -234,7 +234,7 @@ class WormArchive:
     async def seal_checkpoint(
         self,
         *,
-        tenant_id: str,
+        user_uuid: str,
         chain_id: str,
         seq: int,
         head_hash: str,
@@ -254,7 +254,7 @@ class WormArchive:
             sealed_at=datetime.now(UTC).isoformat(),
             event_count=event_count,
         )
-        key = f"{self._settings.ARCHIVE_PREFIX}/checkpoints/{tenant_id}/{chain_id}/{seq}.json"
+        key = f"{self._settings.ARCHIVE_PREFIX}/checkpoints/{user_uuid}/{chain_id}/{seq}.json"
         await self._put_locked_object(
             key=key,
             body=orjson.dumps(payload, option=orjson.OPT_INDENT_2),
@@ -316,13 +316,13 @@ class WormArchive:
         lines = gzip.decompress(raw).split(b"\n")
         return [orjson.loads(line) for line in lines if line]
 
-    async def latest_checkpoint(self, *, tenant_id: str, chain_id: str) -> dict[str, Any] | None:
+    async def latest_checkpoint(self, *, user_uuid: str, chain_id: str) -> dict[str, Any] | None:
         """Most recent notarised checkpoint for a chain.
 
         Keys end in the zero-padded sequence number, so lexicographic order
         equals numeric order and the last key S3 lists is the newest.
         """
-        prefix = f"{self._settings.ARCHIVE_PREFIX}/checkpoints/{tenant_id}/{chain_id}/"
+        prefix = f"{self._settings.ARCHIVE_PREFIX}/checkpoints/{user_uuid}/{chain_id}/"
         async with self._client() as s3:
             paginator = s3.get_paginator("list_objects_v2")
             newest: str | None = None
@@ -339,13 +339,13 @@ class WormArchive:
             return dict(orjson.loads(await response["Body"].read()))
 
     # ----------------------------------------------------------------- helpers
-    def _segment_key(self, tenant_id: str, chain_id: str, start: int, end: int) -> str:
+    def _segment_key(self, user_uuid: str, chain_id: str, start: int, end: int) -> str:
         now = datetime.now(UTC)
         safe_chain = chain_id.replace(":", "_")
         # Sequence numbers are zero-padded so lexicographic listing matches
         # numeric order - S3 has no numeric sort.
         return (
-            f"{self._settings.ARCHIVE_PREFIX}/events/{tenant_id}/"
+            f"{self._settings.ARCHIVE_PREFIX}/events/{user_uuid}/"
             f"{now:%Y/%m/%d}/{safe_chain}/{start:018d}-{end:018d}.ndjson.gz"
         )
 

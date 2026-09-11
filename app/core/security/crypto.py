@@ -18,7 +18,7 @@ Key hierarchy
 -------------
     PII_MASTER_KEK (env, 32 bytes)
       |- HKDF "keyid"  -> key-id derivation key   (deterministic, non-secret output)
-      |- HKDF "bidx"   -> blind-index key         (per tenant, optional)
+      |- HKDF "bidx"   -> blind-index key         (per user, optional)
       |- AES-GCM wrap  -> per-subject DEK         (random, stored in the keyring)
                             |- AES-GCM           -> PII field ciphertext
 
@@ -189,7 +189,7 @@ class PiiCipher:
             info=b"everycred-audit|" + info,
         ).derive(self._kek)
 
-    def subject_key_id(self, tenant_id: str, subject_id: str) -> str:
+    def subject_key_id(self, user_uuid: str, subject_id: str) -> str:
         """Deterministic, non-reversible key identifier for a data subject.
 
         Deterministic so every event about the same subject shares one DEK -
@@ -199,7 +199,7 @@ class PiiCipher:
         """
         digest = hmac.new(
             self._keyid_key,
-            f"{tenant_id}|{subject_id}".encode(),
+            f"{user_uuid}|{subject_id}".encode(),
             hashlib.sha256,
         ).digest()
         return _b64e(digest[:24])
@@ -245,7 +245,7 @@ class PiiCipher:
         self,
         document: dict[str, Any],
         *,
-        tenant_id: str,
+        user_uuid: str,
         event_id: str,
         subject_id: str | None,
     ) -> EncryptionResult:
@@ -253,8 +253,8 @@ class PiiCipher:
 
         Args:
             document: the ECS document, mutated in place and also returned.
-            tenant_id: scopes the key id, so identical subject ids in two
-                tenants never share a key.
+            user_uuid: scopes the key id, so identical subject ids in two
+                users never share a key.
             event_id: bound into the AAD.
             subject_id: the data subject this event's PII belongs to. When None
                 (a system event with no identifiable person) nothing is
@@ -275,7 +275,7 @@ class PiiCipher:
         if not present:
             return EncryptionResult(document=document, key_id=None, encrypted_paths=())
 
-        key_id = self.subject_key_id(tenant_id, subject_id)
+        key_id = self.subject_key_id(user_uuid, subject_id)
         dek = await self._resolve_dek(key_id, create=True)
         aesgcm = AESGCM(dek)
 
@@ -288,7 +288,7 @@ class PiiCipher:
             ciphertexts[path] = f"{CIPHER_VERSION}:{_b64e(nonce)}:{_b64e(blob)}"
 
         if self._blind_index_enabled:
-            self._attach_blind_indexes(document, tenant_id, present, ciphertexts)
+            self._attach_blind_indexes(document, user_uuid, present, ciphertexts)
 
         document[CIPHERTEXT_FIELD] = ciphertexts
         return EncryptionResult(
@@ -300,7 +300,7 @@ class PiiCipher:
     def _attach_blind_indexes(
         self,
         document: dict[str, Any],
-        tenant_id: str,
+        user_uuid: str,
         present: list[str],
         ciphertexts: dict[str, str],
     ) -> None:
@@ -319,14 +319,14 @@ class PiiCipher:
         # config flag has a single, findable home when it is enabled.
         return
 
-    def blind_index(self, tenant_id: str, kind: str, value: str) -> str:
+    def blind_index(self, user_uuid: str, kind: str, value: str) -> str:
         """Deterministic lookup hash for an exact-match PII search.
 
         Normalises before hashing so "  Foo@Example.COM " and "foo@example.com"
         collide as they should.
         """
         normalised = value.strip().casefold()
-        key = self._derive(f"bidx|{tenant_id}".encode())
+        key = self._derive(f"bidx|{user_uuid}".encode())
         return _b64e(hmac.new(key, f"{kind}|{normalised}".encode(), hashlib.sha256).digest()[:16])
 
     # ------------------------------------------------------------- decrypting
@@ -382,7 +382,7 @@ class PiiCipher:
         return document
 
     # --------------------------------------------------------------- shredding
-    async def shred_subject(self, tenant_id: str, subject_id: str) -> tuple[str, bool]:
+    async def shred_subject(self, user_uuid: str, subject_id: str) -> tuple[str, bool]:
         """Destroy the key protecting one data subject's PII.
 
         This is the entire erasure operation: no audit document is touched, so
@@ -394,7 +394,7 @@ class PiiCipher:
             already gone, which makes a repeated DSR idempotent rather than an
             error.
         """
-        key_id = self.subject_key_id(tenant_id, subject_id)
+        key_id = self.subject_key_id(user_uuid, subject_id)
         destroyed = await self._keyring.delete(key_id)
         return key_id, destroyed
 

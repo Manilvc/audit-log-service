@@ -124,7 +124,7 @@ class ChainLedger(Protocol):
     """The durable side of the chain - implemented by `AuditRepository`."""
 
     async def fetch_chain_slice(
-        self, *, chain_id: str, tenant_id: str, start_seq: int, limit: int
+        self, *, chain_id: str, user_uuid: str, start_seq: int, limit: int
     ) -> list[dict[str, Any]]: ...
 
 
@@ -210,7 +210,7 @@ class ChainAllocator:
         self,
         chain_id: str,
         *,
-        tenant_id: str,
+        user_uuid: str,
         ledger: ChainLedger,
         force: bool = False,
     ) -> tuple[int, str] | None:
@@ -230,7 +230,7 @@ class ChainAllocator:
         if not force and chain_id in self._reconciled:
             return await self.peek(chain_id)
 
-        tail = await self._find_ledger_tail(chain_id, tenant_id, ledger)
+        tail = await self._find_ledger_tail(chain_id, user_uuid, ledger)
         self._reconciled.add(chain_id)
 
         if tail is None:
@@ -251,7 +251,7 @@ class ChainAllocator:
     async def _find_ledger_tail(
         self,
         chain_id: str,
-        tenant_id: str,
+        user_uuid: str,
         ledger: ChainLedger,
     ) -> tuple[int, str] | None:
         """Find the highest persisted (seq, hash) for a chain.
@@ -267,7 +267,7 @@ class ChainAllocator:
         while True:
             docs = await ledger.fetch_chain_slice(
                 chain_id=chain_id,
-                tenant_id=tenant_id,
+                user_uuid=user_uuid,
                 start_seq=cursor,
                 limit=page_size,
             )

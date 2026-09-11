@@ -1,6 +1,6 @@
 """EveryCRED Audit Log Service.
 
-Tamper-evident, multi-tenant audit logging for the EveryCRED DCS platform.
+Tamper-evident, multi-user audit logging for the EveryCRED DCS platform.
 This package is the Python application root; the supported entrypoint is the
 ``audit-service`` CLI (see ``app.cli``).
 

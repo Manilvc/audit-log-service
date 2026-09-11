@@ -32,7 +32,7 @@ class SearchRejected(SearchError):
     """The store refused the request: bad mapping, illegal argument, 4xx.
 
     The message is never returned to an API caller - an engine error body
-    carries index names, mappings and sometimes another tenant's document
+    carries index names, mappings and sometimes another user's document
     content. `app.core.exceptions` logs it and answers with a generic 502.
     """
 

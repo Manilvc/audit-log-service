@@ -1,11 +1,11 @@
 """Compliance endpoints: integrity verification and data-subject erasure.
 
 Mounted under ``/v1/audit/compliance``. Both operations require a *single*
-named tenant — cross-tenant scope is refused, because verifying or shredding
-"every tenant at once" is not a meaningful compliance action.
+named user — cross-user scope is refused, because verifying or shredding
+"every user at once" is not a meaningful compliance action.
 
 ``POST .../integrity/verify`` (``audit:verify``)
-    Walks each hash chain for the tenant and reports breaks
+    Walks each hash chain for the user and reports breaks
     (``hash_mismatch``, ``gap``, ``duplicate_seq``, ``prev_mismatch``).
 ``POST .../erasure`` (``audit:erase``)
     Crypto-shreds a data subject's DEK. Structural evidence stays; PII becomes
@@ -23,33 +23,33 @@ from app.api.deps import (
     IntegrityServiceDep,
     PrincipalDep,
     QueryServiceDep,
-    TenantIdDep,
+    UserUuidDep,
 )
 from app.core.logging import get_logger
 from app.core.responses import ORJSONResponse, success
 from app.core.security.auth import AuthorizationError
 from app.schemas.api import ErasureRequest, IntegrityVerifyRequest
-from app.search.query import TenantScope
+from app.search.query import UserScope
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/audit/compliance", tags=["Compliance"])
 
 
-def _require_tenant(scope: TenantScope) -> str:
-    """Narrow a scope to a concrete tenant id.
+def _require_user(scope: UserScope) -> str:
+    """Narrow a scope to a concrete user uuid.
 
     A real check rather than an ``assert``: asserts are stripped under
     ``python -O``, and both callers here perform an irreversible or
-    evidence-bearing operation that must never run without a tenant.
-    Cross-tenant scopes are refused outright - verifying or erasing across
-    every tenant at once is not a meaningful operation.
+    evidence-bearing operation that must never run without a user.
+    Cross-user scopes are refused outright - verifying or erasing across
+    every user at once is not a meaningful operation.
     """
-    if scope.cross_tenant or not scope.tenant_id:
+    if scope.cross_user or not scope.user_uuid:
         raise AuthorizationError(
-            "this operation requires a single named tenant; cross-tenant scope is not accepted here"
+            "this operation requires a single named user; cross-user scope is not accepted here"
         )
-    return scope.tenant_id
+    return scope.user_uuid
 
 
 @router.post(
@@ -61,7 +61,7 @@ async def verify_integrity(
     principal: PrincipalDep,
     integrity: IntegrityServiceDep,
     query: QueryServiceDep,
-    tenant_header: TenantIdDep,
+    user_uuid_header: UserUuidDep,
 ) -> ORJSONResponse:
     """Recompute the hash chain and report any discontinuity.
 
@@ -79,8 +79,8 @@ async def verify_integrity(
     security incident, not a validation error, so the call still returns 200 -
     the verification itself succeeded.
     """
-    tenant_id = _require_tenant(query.resolve_scope(principal, requested_tenant_id=tenant_header))
-    report = await integrity.verify(payload, principal=principal, tenant_id=tenant_id)
+    user_uuid = _require_user(query.resolve_scope(principal, requested_user_uuid=user_uuid_header))
+    report = await integrity.verify(payload, principal=principal, user_uuid=user_uuid)
     return success(
         report.model_dump(mode="json"),
         message=(
@@ -100,7 +100,7 @@ async def erase_subject(
     principal: PrincipalDep,
     erasure: ErasureServiceDep,
     query: QueryServiceDep,
-    tenant_header: TenantIdDep,
+    user_uuid_header: UserUuidDep,
 ) -> ORJSONResponse:
     """Crypto-shred one data subject's personal data.
 
@@ -117,8 +117,8 @@ async def erase_subject(
     Requires the `audit:erase` scope and explicit `confirm: true`. The erasure is
     itself audited at CRITICAL severity.
     """
-    tenant_id = _require_tenant(query.resolve_scope(principal, requested_tenant_id=tenant_header))
-    receipt = await erasure.erase(payload, principal=principal, tenant_id=tenant_id)
+    user_uuid = _require_user(query.resolve_scope(principal, requested_user_uuid=user_uuid_header))
+    receipt = await erasure.erase(payload, principal=principal, user_uuid=user_uuid)
     return success(
         receipt.model_dump(mode="json"),
         message=(

@@ -3,41 +3,42 @@
 One kind of caller
 ------------------
 **Service principal** (`x-api-key`). The main backend and its siblings. They
-have already enforced RBAC on the user's behalf, so a service may write events
-and read within the tenant it names explicitly via the `x-audit-tenant-id`
-header. The key is compared in constant time and matched against a list, so keys
-can be rotated with an overlap window.
+have already enforced RBAC on the end user's behalf, so a service may write
+events and read within the user trail it names explicitly via the
+`x-audit-user-uuid` header. The key is compared in constant time and matched
+against a list, so keys can be rotated with an overlap window.
 
-There is no user credential. This service does not validate platform JWTs and
-has no login of its own: it is reachable only by callers holding a service key,
-and the tenant boundary for every call comes from the tenant header rather than
-from a token claim.
+There is no end-user credential. This service does not validate platform JWTs
+and has no login of its own: it is reachable only by callers holding a service
+key, and the isolation boundary for every call comes from the user-uuid header
+rather than from a token claim.
 
-Tenant scoping
---------------
-A service key is not bound to a tenant, so `x-audit-tenant-id` is what decides
-which tenant's records a call may touch. Whoever holds a key can therefore name
-any tenant - the key is the trust boundary, and the caller in front of it (the
-main backend) is responsible for having checked `require_permission` first.
+User scoping
+------------
+A service key is not bound to a user, so `x-audit-user-uuid` is what decides
+whose records a call may touch. Whoever holds a key can therefore name any
+user - the key is the trust boundary, and the caller in front of it (the main
+backend) is responsible for having checked `require_permission` first.
 
-The header is validated for *shape* only (`TenantRouter.validate_tenant_id`),
-and it is required on every route that touches one tenant's records. Existence
-is not checked, by design: the main backend resolves the tenant from its own
-request context and authorises the user against it before calling, so a lookup
-here would re-answer a question that has already been answered - and would put
-a network call to the caller in front of an audit write. The cost of that choice
-is that a wrong-but-well-formed tenant id is accepted and its events become
-unreachable by the tenant that should own them, which is a caller bug rather
-than a leak: a read for tenant A can still only ever return tenant A's events.
+The header is validated for *shape* only (`UserRouter.validate_user_uuid`),
+and it is required on every route that touches one user's records. Existence
+is not checked, by design: the main backend resolves the subject user from its
+own request context and authorises the caller against it before calling, so a
+lookup here would re-answer a question that has already been answered - and
+would put a network call to the caller in front of an audit write. The cost of
+that choice is that a wrong-but-well-formed user uuid is accepted and its
+events become unreachable by whoever should own them, which is a caller bug
+rather than a leak: a read for user A can still only ever return user A's
+events.
 
 Scope grant
 -----------
-A valid key receives every scope, including ERASE, ADMIN and CROSS_TENANT. That
-is a deliberate choice made when the user credential was removed: those
+A valid key receives every scope, including ERASE, ADMIN and CROSS_USER. That
+is a deliberate choice made when the end-user credential was removed: those
 operations - crypto-shredding personal data, provisioning streams, reading
-across tenant boundaries - would otherwise be unreachable, because nothing else
+across user boundaries - would otherwise be unreachable, because nothing else
 can mint a scoped principal. The consequence is that a leaked key is enough to
-erase a data subject's personal data or read every tenant's trail, so the key
+erase a data subject's personal data or read every user's trail, so the key
 must be treated as a high-value secret: distinct per environment, rotated on a
 schedule, and never shared with a component that only needs to write events.
 """
@@ -55,7 +56,7 @@ from app.domain.enums import ActorType, Scope
 logger = get_logger(__name__)
 
 #: Scopes a trusted internal service receives. Every scope this service defines:
-#: see the module docstring for why ERASE, ADMIN and CROSS_TENANT are included
+#: see the module docstring for why ERASE, ADMIN and CROSS_USER are included
 #: and what that means for how the key must be handled.
 _SERVICE_SCOPES: Final[frozenset[Scope]] = frozenset(Scope)
 
@@ -75,11 +76,11 @@ class Principal:
     subject: str
     """The service name, as the caller declared it for attribution."""
     actor_type: ActorType
-    tenant_id: str | None
-    """Tenant named in the `x-audit-tenant-id` header, when one was sent.
+    user_uuid: str | None
+    """User named in the `x-audit-user-uuid` header, when one was sent.
 
     Validated for shape, never for existence. `None` only on the routes that
-    need no tenant: the health probes, and a cross-tenant read.
+    need no user: the health probes, and a cross-user read.
     """
     scopes: frozenset[Scope]
     on_behalf_of: str | None = None
@@ -152,18 +153,18 @@ class Authenticator:
         self,
         *,
         service_name: str,
-        tenant_id: str | None,
+        user_uuid: str | None,
         on_behalf_of: str | None,
     ) -> Principal:
         """Build the principal for a caller holding an env-configured key.
 
-        The admin plane: every scope, and the tenant comes from the header
+        The admin plane: every scope, and the user comes from the header
         because the credential is not bound to one.
         """
         return Principal(
             subject=service_name,
             actor_type=ActorType.SERVICE,
-            tenant_id=tenant_id,
+            user_uuid=user_uuid,
             scopes=_SERVICE_SCOPES,
             on_behalf_of=on_behalf_of,
         )
@@ -173,7 +174,7 @@ class Authenticator:
         *,
         key_id: str,
         domain: str,
-        tenant_id: str,
+        user_uuid: str,
         scopes: frozenset[Scope],
         on_behalf_of: str | None,
     ) -> Principal:
@@ -182,7 +183,7 @@ class Authenticator:
         Three differences from the admin plane, and each one is the point of
         issuing keys at all:
 
-        * the tenant comes from the **key**, not from a header, so the caller
+        * the user comes from the **key**, not from a header, so the caller
           cannot name someone else's;
         * the scopes are whatever that key was granted, normally write only;
         * `subject` is the domain the key was issued to - a verified identity,
@@ -194,7 +195,7 @@ class Authenticator:
         return Principal(
             subject=domain,
             actor_type=ActorType.SERVICE,
-            tenant_id=tenant_id,
+            user_uuid=user_uuid,
             scopes=scopes,
             on_behalf_of=on_behalf_of,
             api_key_id=key_id,

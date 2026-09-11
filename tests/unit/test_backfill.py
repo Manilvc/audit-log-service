@@ -11,7 +11,6 @@ def test_map_user_audit_row() -> None:
     event = map_legacy_row(
         {
             "source": "user_audit_log",
-            "tenant_id": "t-1",
             "uuid": "evt-1",
             "user_id": 9,
             "user_uuid": "u-9",
@@ -28,6 +27,8 @@ def test_map_user_audit_row() -> None:
     assert event["action"] == Action.CREDENTIAL_ISSUE_BULK
     assert event["outcome"] == Outcome.SUCCESS
     assert event["actor"]["id"] == "u-9"
+    # The scope and the actor are the same column for user_audit_log rows.
+    assert event["user_uuid"] == "u-9"
     assert event["target"]["type"] == EntityType.CREDENTIAL
     assert event["timestamp"].endswith("+00:00")
     assert event["labels"]["backfill"] is True
@@ -37,7 +38,7 @@ def test_map_session_row() -> None:
     event = map_legacy_row(
         {
             "source": "session_audit_log",
-            "tenant_id": "t-1",
+            "user_uuid": "t-1",
             "id": 42,
             "session_uuid": "s-1",
             "user_id": 7,
@@ -55,7 +56,7 @@ def test_map_holder_row() -> None:
     event = map_legacy_row(
         {
             "source": "holder_audit_log",
-            "tenant_id": "t-1",
+            "user_uuid": "t-1",
             "uuid": "h-evt-1",
             "holder_id": 3,
             "holder_uuid": "holder-3",

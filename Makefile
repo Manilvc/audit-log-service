@@ -50,8 +50,8 @@ security:  ## SAST + dependency CVE scan
 # in a service holding six years of audit evidence is a release blocker.
 check: lint typecheck test security  ## Full compliance gate
 
-verify:  ## Verify a tenant's hash chains (TENANT=<id>)
-	uv run audit-service verify --tenant $(TENANT)
+verify:  ## Verify a user's hash chains (USER=<id>)
+	uv run audit-service verify --user $(USER)
 
 clean:
 	rm -rf .venv .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage

@@ -2,9 +2,9 @@
 
 Three responsibilities, all of them security-relevant:
 
-1. **Turn a principal into a `TenantScope`.** This is where "who may see what"
+1. **Turn a principal into a `UserScope`.** This is where "who may see what"
    is decided. A user token with no explicit grant is pinned to its own events;
-   cross-tenant access requires a dedicated scope.
+   cross-user access requires a dedicated scope.
 2. **Decrypt PII for display**, and only for a caller that is allowed to see it.
 3. **Audit every read.** HIPAA 164.312(b) and SOC 2 CC7.2 both require that
    access to the audit trail is itself logged. A reader who can search without
@@ -29,9 +29,9 @@ from app.schemas.api import (
     SearchRequest,
     SearchResponse,
 )
-from app.search.query import AuditSearchFilter, TenantScope
+from app.search.query import AuditSearchFilter, UserScope
 from app.search.repository import AuditRepository
-from app.search.routing import InvalidTenantError, TenantRouter
+from app.search.routing import InvalidUserUuidError, UserRouter
 
 logger = get_logger(__name__)
 
@@ -48,9 +48,9 @@ _ALLOWED_SOURCE_FIELDS = frozenset(
         "event.outcome",
         "event.severity",
         "event.reason",
-        "tenant",
-        "tenant.id",
-        "tenant.issuer_id",
+        "user",
+        "user.uuid",
+        "user.issuer_id",
         "actor",
         "actor.id",
         "actor.type",
@@ -79,7 +79,7 @@ class QueryService:
         *,
         settings: Settings,
         repository: AuditRepository,
-        router: TenantRouter,
+        router: UserRouter,
         cipher: PiiCipher,
         queue: IngestQueue,
     ) -> None:
@@ -94,42 +94,42 @@ class QueryService:
         self,
         principal: Principal,
         *,
-        requested_tenant_id: str | None = None,
-        cross_tenant: bool = False,
-    ) -> TenantScope:
+        requested_user_uuid: str | None = None,
+        cross_user: bool = False,
+    ) -> UserScope:
         """Derive the authorised query boundary for a principal.
 
-        The tenant comes from the `x-audit-tenant-id` header, which the caller
-        must send: a service key is not bound to a tenant, so there is nothing
-        else to scope the query by. `principal.tenant_id` holds that same header
+        The user comes from the `x-audit-user-uuid` header, which the caller
+        must send: a service key is not bound to a user, so there is nothing
+        else to scope the query by. `principal.user_uuid` holds that same header
         value, captured at authentication time, and serves as the fallback for
         call sites that do not thread the header through separately.
 
         Raises:
-            AuthorizationError: cross-tenant access was requested without the
+            AuthorizationError: cross-user access was requested without the
                 scope.
-            InvalidTenantError: no tenant was named on a tenant-scoped query.
+            InvalidUserUuidError: no user was named on a user-scoped query.
         """
-        if cross_tenant:
-            if not principal.has(Scope.CROSS_TENANT):
+        if cross_user:
+            if not principal.has(Scope.CROSS_USER):
                 raise AuthorizationError(
-                    "cross-tenant audit access requires the audit:cross_tenant scope"
+                    "cross-user audit access requires the audit:cross_user scope"
                 )
-            return TenantScope(tenant_id=None, cross_tenant=True)
+            return UserScope(user_uuid=None, cross_user=True)
 
-        tenant_id = requested_tenant_id or principal.tenant_id
-        if not tenant_id:
+        user_uuid = requested_user_uuid or principal.user_uuid
+        if not user_uuid:
             # 400, not 403: the caller is authenticated and entitled to read -
-            # they simply did not say whose trail. Every tenant-scoped route
-            # takes `TenantIdDep` and fails before reaching this, so this is
-            # the guard for search and aggregate with `cross_tenant=false`.
-            raise InvalidTenantError(
-                "name the tenant you are querying via the x-audit-tenant-id header"
+            # they simply did not say whose trail. Every user-scoped route
+            # takes `UserUuidDep` and fails before reaching this, so this is
+            # the guard for search and aggregate with `cross_user=false`.
+            raise InvalidUserUuidError(
+                "name the user you are querying via the x-audit-user-uuid header"
             )
 
-        return TenantScope(
-            tenant_id=self._router.validate_tenant_id(tenant_id),
-            cross_tenant=False,
+        return UserScope(
+            user_uuid=self._router.validate_user_uuid(user_uuid),
+            cross_user=False,
         )
 
     # ----------------------------------------------------------------- search
@@ -138,15 +138,15 @@ class QueryService:
         request: SearchRequest,
         *,
         principal: Principal,
-        requested_tenant_id: str | None = None,
-        cross_tenant: bool = False,
+        requested_user_uuid: str | None = None,
+        cross_user: bool = False,
     ) -> SearchResponse:
         """Run a paginated search and record that it happened."""
         principal.require(Scope.READ)
         scope = self.resolve_scope(
             principal,
-            requested_tenant_id=requested_tenant_id,
-            cross_tenant=cross_tenant,
+            requested_user_uuid=requested_user_uuid,
+            cross_user=cross_user,
         )
 
         page = await self._repository.search(
@@ -163,7 +163,7 @@ class QueryService:
         await self.record_access(
             principal=principal,
             scope=scope,
-            action=(Action.AUDIT_CROSS_TENANT_ACCESS if cross_tenant else Action.AUDIT_SEARCH),
+            action=(Action.AUDIT_CROSS_USER_ACCESS if cross_user else Action.AUDIT_SEARCH),
             result_count=len(events),
             detail={
                 "size": request.size,
@@ -187,11 +187,11 @@ class QueryService:
         event_id: str,
         *,
         principal: Principal,
-        requested_tenant_id: str | None = None,
+        requested_user_uuid: str | None = None,
     ) -> dict[str, Any] | None:
-        """Fetch a single event, tenant-filtered."""
+        """Fetch a single event, user-filtered."""
         principal.require(Scope.READ)
-        scope = self.resolve_scope(principal, requested_tenant_id=requested_tenant_id)
+        scope = self.resolve_scope(principal, requested_user_uuid=requested_user_uuid)
         document = await self._repository.get_event(scope, event_id)
         if document is None:
             return None
@@ -203,8 +203,8 @@ class QueryService:
         request: AggregationRequest,
         *,
         principal: Principal,
-        requested_tenant_id: str | None = None,
-        cross_tenant: bool = False,
+        requested_user_uuid: str | None = None,
+        cross_user: bool = False,
     ) -> dict[str, Any]:
         """Run a dashboard aggregation.
 
@@ -214,8 +214,8 @@ class QueryService:
         principal.require(Scope.READ)
         scope = self.resolve_scope(
             principal,
-            requested_tenant_id=requested_tenant_id,
-            cross_tenant=cross_tenant,
+            requested_user_uuid=requested_user_uuid,
+            cross_user=cross_user,
         )
         aggregations = await self._repository.aggregate(
             scope,
@@ -232,7 +232,7 @@ class QueryService:
         request: ExportRequest,
         *,
         principal: Principal,
-        requested_tenant_id: str | None = None,
+        requested_user_uuid: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream every matching event over a point-in-time snapshot.
 
@@ -245,7 +245,7 @@ class QueryService:
         aborted download still leaves a record that the extract was requested.
         """
         principal.require(Scope.EXPORT)
-        scope = self.resolve_scope(principal, requested_tenant_id=requested_tenant_id)
+        scope = self.resolve_scope(principal, requested_user_uuid=requested_user_uuid)
         criteria = _to_filter(request)
 
         await self.record_access(
@@ -287,7 +287,7 @@ class QueryService:
                 "export_completed",
                 events=emitted,
                 principal=principal.audit_identity,
-                tenant_id=scope.tenant_id,
+                user_uuid=scope.user_uuid,
             )
 
     # ------------------------------------------------------------- decryption
@@ -318,7 +318,7 @@ class QueryService:
         self,
         *,
         principal: Principal,
-        scope: TenantScope,
+        scope: UserScope,
         action: Action,
         result_count: int,
         detail: dict[str, Any],
@@ -331,15 +331,15 @@ class QueryService:
         is Redis being unreachable, which is already alerted on.
         """
         try:
-            tenant_id = scope.tenant_id or "cross-tenant"
+            user_uuid = scope.user_uuid or "cross-user"
             partition = self._router.partition_for(
-                tenant_id if scope.tenant_id else "cross-tenant",
+                user_uuid if scope.user_uuid else "cross-user",
                 self._settings.STREAM_PARTITIONS,
             )
             payload = {
                 "event_id": None,
                 "timestamp": datetime.now(UTC).isoformat(),
-                "tenant_id": tenant_id,
+                "user_uuid": user_uuid,
                 "issuer_id": scope.issuer_id,
                 "action": action.value,
                 "category": EventCategory.AUDIT.value,
@@ -347,7 +347,7 @@ class QueryService:
                 "outcome": Outcome.SUCCESS.value,
                 "severity": (
                     Severity.CRITICAL.value
-                    if action is Action.AUDIT_CROSS_TENANT_ACCESS
+                    if action is Action.AUDIT_CROSS_USER_ACCESS
                     else Severity.INFO.value
                 ),
                 "actor": {
@@ -360,7 +360,7 @@ class QueryService:
                 "service_name": self._settings.SERVICE_NAME,
                 "labels": {
                     "result_count": result_count,
-                    "cross_tenant": scope.cross_tenant,
+                    "cross_user": scope.cross_user,
                     "self_restricted": scope.actor_id is not None,
                     **detail,
                 },

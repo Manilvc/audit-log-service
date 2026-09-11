@@ -1,7 +1,7 @@
 """Shared test fixtures.
 
 Populates the minimum environment variables before any settings object is
-constructed, then provides reusable fakes (tenant router, cipher settings) used
+constructed, then provides reusable fakes (user router, cipher settings) used
 by both unit and integration suites.
 """
 
@@ -28,7 +28,7 @@ os.environ.setdefault("PII_MASTER_KEK", "A" * 43)
 
 from app.core.config import Settings, get_settings
 from app.core.security.crypto import KeyRing, PiiCipher
-from app.search.routing import TenantRouter
+from app.search.routing import UserRouter
 
 
 @pytest.fixture
@@ -37,11 +37,11 @@ def settings() -> Settings:
 
 
 @pytest.fixture
-def router(settings: Settings) -> TenantRouter:
-    return TenantRouter(
+def router(settings: Settings) -> UserRouter:
+    return UserRouter(
         shared_stream=settings.SHARED_DATA_STREAM,
         index_prefix=settings.INDEX_PREFIX,
-        dedicated_tenants=frozenset({"big-tenant"}),
+        dedicated_users=frozenset({"big-user"}),
     )
 
 

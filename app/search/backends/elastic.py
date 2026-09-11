@@ -47,7 +47,7 @@ logger = get_logger(__name__)
 ELASTIC_FIELD_TYPES: Final[FieldTypes] = FieldTypes(
     subtree={"type": "flattened"},
     log_text={"type": "match_only_text"},
-    pinned_tenant={"type": "constant_keyword"},
+    pinned_user_uuid={"type": "constant_keyword"},
 )
 
 #: Marks a create that lost a race. Elasticsearch reports it as a 400 rather
@@ -126,7 +126,7 @@ class ElasticsearchBackend:
 
         For Elastic-specific tooling and the integration suite, which asserts on
         guarantees the *engine* enforces - a strict mapping rejecting an unknown
-        field, `constant_keyword` rejecting a foreign tenant id. Nothing in the
+        field, `constant_keyword` rejecting a foreign user uuid. Nothing in the
         request path should reach for this.
         """
         return self._client
@@ -328,7 +328,7 @@ class ElasticsearchBackend:
         Elasticsearch 9.x answers `GET /_data_stream/<name>` for a stream that
         does not exist with 200 and an empty `data_streams` list. Trusting the
         status alone reports every missing stream as present, so nothing is ever
-        created - which defeats pre-provisioning a tenant's stream off the write
+        created - which defeats pre-provisioning a user's stream off the write
         path. The `SearchNotFound` branch stays because older versions do 404.
         """
         try:

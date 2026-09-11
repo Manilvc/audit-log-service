@@ -5,7 +5,7 @@ it lives in the code. Every claim below corresponds to code in the repository an
 to a test.
 
 This service is a high-value target: it holds a queryable record of every action
-on the platform, across every tenant, for six years, including personal data. It
+on the platform, across every user, for six years, including personal data. It
 is also the thing an attacker would want to edit after a breach. The controls are
 organised around those two facts.
 
@@ -19,10 +19,10 @@ organised around those two facts.
 
 | # | Threat | Primary control |
 |---|---|---|
-| T1 | Tenant A reads tenant B's audit trail | Mandatory tenant filter + `constant_keyword` |
+| T1 | User A reads user B's audit trail | Mandatory user filter + `constant_keyword` |
 | T2 | Attacker edits or deletes records to hide activity | Hash chain + WORM checkpoints + no `delete` privilege |
 | T3 | Audit log becomes a PII exfiltration channel | PII encrypted per subject, never indexed |
-| T4 | Forged events inserted to mislead an investigation | Tenant reconciliation on ingest; server-assigned integrity |
+| T4 | Forged events inserted to mislead an investigation | User reconciliation on ingest; server-assigned integrity |
 | T5 | Service key theft | Constant-time compare, rotatable key list, per-environment keys |
 | T6 | Reads of the audit trail go unnoticed | Audit-of-the-audit on every search and export |
 | T7 | Denial of service via expensive queries | Typed filters only, bounded windows, rate limits |
@@ -66,14 +66,14 @@ client to retry with a token this service cannot accept.
 ### What the key is worth
 
 A valid key carries **every** scope, including `audit:erase` and
-`audit:cross_tenant`. Those operations were previously reachable only through a
+`audit:cross_user`. Those operations were previously reachable only through a
 scoped user token; with that path removed, nothing else can mint a principal
 that holds them.
 
 The consequence is that key custody *is* the access-control boundary:
 
 - A leaked key is enough to crypto-shred a data subject's personal data or read
-  every tenant's trail.
+  every user's trail.
 - Keys must be distinct per environment, rotated on a schedule, and never shared
   with a component that only needs to write events.
 - The service must not be reachable from outside the cluster; the nginx config
@@ -92,8 +92,8 @@ The consequence is that key custody *is* the access-control boundary:
 | `audit:export` | Bulk export; also permits PII decryption |
 | `audit:verify` | Run chain verification |
 | `audit:erase` | Crypto-shred a data subject — irreversible |
-| `audit:admin` | Tenant administration; implies read/verify/export |
-| `audit:cross_tenant` | Query across tenant boundaries — break-glass |
+| `audit:admin` | User administration; implies read/verify/export |
+| `audit:cross_user` | Query across user boundaries — break-glass |
 
 Checks live in services, not routes, so the CLI and worker get the same
 enforcement without going through HTTP.
@@ -108,30 +108,30 @@ credential they no longer separate one caller from another.
 Read `principal.require(...)` as a statement of what an operation costs, not as
 a boundary between callers. The boundary is the key itself.
 
-### Tenant scoping
+### User scoping
 
-A key is not bound to a tenant, so `x-audit-tenant-id` is the sole source of the
-tenant boundary on every request. A caller holding a key may therefore name any
-tenant; the caller in front of it (the main backend) is responsible for having
+A key is not bound to a user, so `x-audit-user-uuid` is the sole source of the
+user boundary on every request. A caller holding a key may therefore name any
+user; the caller in front of it (the main backend) is responsible for having
 checked `require_permission` first.
 
-**Required, shape-checked, not verified.** Every route that touches one tenant's
-records takes `require_tenant_id` (`app/api/deps.py`), so a call that names no
-tenant is refused with a 400 at the boundary rather than failing differently on
+**Required, shape-checked, not verified.** Every route that touches one user's
+records takes `require_user_uuid` (`app/api/deps.py`), so a call that names no
+user is refused with a 400 at the boundary rather than failing differently on
 each route. What is validated is the *shape* — the same regex that keeps the
 value safe inside an index name. Existence is not checked, and that is a
 decision rather than an omission:
 
 | | |
 |---|---|
-| Why not | The caller has already resolved the tenant from its own request context and authorised the user against it. Re-deriving it here needs a second credential or a tenant registry; looking it up needs a synchronous call **to the caller** in front of every audit write, which couples audit availability to backend availability and can drop evidence during a blip. |
-| Residual risk | A well-formed id for a tenant that does not exist is accepted. Its events land in the shared stream under a tenant nobody reads. |
-| Why that is tolerable | It is a caller bug, not a disclosure. The tenant filter is still applied on every read, so a wrong id makes events *unreachable*, never visible to the wrong tenant. |
-| If it stops being tolerable | The place to add it is `_validated_tenant`, behind a Redis-cached lookup: fail **open** on ingest (never drop evidence) and **closed** on read, export and erasure. |
+| Why not | The caller has already resolved the user from its own request context and authorised the user against it. Re-deriving it here needs a second credential or a user registry; looking it up needs a synchronous call **to the caller** in front of every audit write, which couples audit availability to backend availability and can drop evidence during a blip. |
+| Residual risk | A well-formed id for a user that does not exist is accepted. Its events land in the shared stream under a user nobody reads. |
+| Why that is tolerable | It is a caller bug, not a disclosure. The user filter is still applied on every read, so a wrong id makes events *unreachable*, never visible to the wrong user. |
+| If it stops being tolerable | The place to add it is `_validated_user`, behind a Redis-cached lookup: fail **open** on ingest (never drop evidence) and **closed** on read, export and erasure. |
 
 ---
 
-## 3. Tenant isolation
+## 3. User isolation
 
 `app/search/query.py` — the isolation boundary.
 
@@ -140,11 +140,11 @@ fall back on. Isolation is therefore a code invariant, enforced structurally:
 
 1. **Clients never send query DSL.** They send a typed `AuditSearchFilter`; the
    DSL is assembled server-side. Accepting raw DSL would hand callers `script`
-   queries, unbounded wildcards and deep aggregations over every tenant's data.
-2. **The tenant filter is applied by the builder, not the caller.** `build_query`
-   takes a `TenantScope`, and there is no code path that omits it. A scope with
-   neither a tenant nor cross-tenant authority cannot even be constructed —
-   `TenantScope.__post_init__` raises.
+   queries, unbounded wildcards and deep aggregations over every user's data.
+2. **The user filter is applied by the builder, not the caller.** `build_query`
+   takes a `UserScope`, and there is no code path that omits it. A scope with
+   neither a user nor cross-user authority cannot even be constructed —
+   `UserScope.__post_init__` raises.
 3. **The clause is in `filter` context**, never `should`. A `should` clause is
    optional once another matches, which would make the constraint bypassable.
 
@@ -152,23 +152,23 @@ Additional layers:
 
 | Layer | Control |
 |---|---|
-| Write path | `AuditRepository.bulk_index` refuses a document whose `tenant.id` disagrees with its route, on **every engine and both streams** — logged as `bulk_index_tenant_mismatch` and dead-lettered, never retried |
-| Storage | On Elasticsearch, dedicated streams map `tenant.id` as `constant_keyword`, so **the engine itself rejects** a wrong-tenant document. OpenSearch has no dependable equivalent (availability varies by 2.x minor), which is why the write-path guard above exists rather than relying on it |
-| Index naming | Tenant ids are regex-validated before reaching an index name — rejects `*`, `,`, `..`, spaces and other index-name metacharacters |
-| API boundary | `require_tenant_id` refuses a tenant-scoped call that names no tenant (400), and normalises the one it accepts, so `" t1"` and `"t1"` cannot become two partitions |
-| Single-event fetch | `GET /events/{id}` is a filtered **search**, not a document GET, so id-guessing cannot cross a tenant |
-| Ingest | A body `tenant_id` may only *confirm* the `x-audit-tenant-id` header, never redirect the write; a mismatch is logged at error level |
-| Cross-tenant | Requires `audit:cross_tenant` and is itself audited as `audit_log.cross_tenant_access` at CRITICAL |
+| Write path | `AuditRepository.bulk_index` refuses a document whose `user.uuid` disagrees with its route, on **every engine and both streams** — logged as `bulk_index_user_uuid_mismatch` and dead-lettered, never retried |
+| Storage | On Elasticsearch, dedicated streams map `user.uuid` as `constant_keyword`, so **the engine itself rejects** a wrong-user document. OpenSearch has no dependable equivalent (availability varies by 2.x minor), which is why the write-path guard above exists rather than relying on it |
+| Index naming | User uuids are regex-validated before reaching an index name — rejects `*`, `,`, `..`, spaces and other index-name metacharacters |
+| API boundary | `require_user_uuid` refuses a user-scoped call that names no user (400), and normalises the one it accepts, so `" t1"` and `"t1"` cannot become two partitions |
+| Single-event fetch | `GET /events/{id}` is a filtered **search**, not a document GET, so id-guessing cannot cross a user |
+| Ingest | A body `user_uuid` may only *confirm* the `x-audit-user-uuid` header, never redirect the write; a mismatch is logged at error level |
+| Cross-user | Requires `audit:cross_user` and is itself audited as `audit_log.cross_user_access` at CRITICAL |
 
-`tests/unit/test_tenant_isolation.py` — 86 tests — asserts the tenant clause is
+`tests/unit/test_user_isolation.py` — 86 tests — asserts the user clause is
 present, singular and top-level across every filter permutation and pairwise
-combination, and that hostile tenant ids are rejected.
+combination, and that hostile user uuids are rejected.
 `tests/unit/test_opensearch_backend.py` covers the write-path guard, and
 `tests/integration/test_end_to_end.py` asserts the Elastic storage layer is
 still present rather than silently lost when the guard was added.
 
 `tests/unit/test_identity_headers.py` covers the boundary itself: a call naming
-no tenant is refused on every tenant-scoped route, malformed ids never reach an
+no user is refused on every user-scoped route, malformed ids never reach an
 index name, the issuer and acting-user headers are length-bounded, and the
 OpenAPI document cannot drift from what the routes enforce.
 
@@ -186,7 +186,7 @@ Each component is **length-prefixed**, so no boundary-shifting forgery is
 possible: with plain concatenation, chain `a` at seq 12 and chain `a1` at seq 2
 would share a preimage.
 
-The hash binds the `chain_id`, so a document cannot be lifted from one tenant's
+The hash binds the `chain_id`, so a document cannot be lifted from one user's
 chain into another's and still verify.
 
 | Attack | Detected as |
@@ -245,7 +245,7 @@ PII_MASTER_KEK (env, 32 bytes)
 | **AAD = `<event_id>|<field_path>`** | A ciphertext lifted into another event or field fails authentication instead of silently decrypting to someone else's data |
 | HKDF purpose separation | A weakness in one use (blind index) cannot be pivoted into another (field encryption) |
 | Key ids are keyed HMAC | Reading the keyring index does not enumerate users |
-| Key ids are tenant-scoped | Identical subject ids in two tenants never share a key |
+| Key ids are user-scoped | Identical subject ids in two users never share a key |
 | PII stored in `pii_ct`, mapped `enabled: false` | Not indexed at all: no inverted index, no doc values, unsearchable and unaggregatable. Verified live — a term query returns 0 hits |
 | PII fields absent from the mapping | A future emitter writing plaintext to `actor.email` is rejected by `dynamic: strict` rather than quietly indexing it |
 | `source.ip` → `source.ip_prefix` (/24, /48) | Network analytics without retaining an address that identifies a person |
@@ -383,7 +383,7 @@ logged. A reader who can search without leaving a trace defeats the purpose.
 | `audit_log.export` | HIGH — recorded **before** streaming starts, so an aborted download still leaves evidence |
 | `audit_log.integrity_verify` | INFO |
 | `audit_log.erasure_request` | CRITICAL |
-| `audit_log.cross_tenant_access` | CRITICAL |
+| `audit_log.cross_user_access` | CRITICAL |
 
 Each records the principal, whether a service acted on behalf of a human, the
 result count and whether the read was self-restricted.
@@ -401,7 +401,7 @@ swallowed: an unrecorded erasure is an undocumented destruction of evidence.
 
 A client learns *what to fix*, never *how the service is built*. Stack traces,
 Elasticsearch error bodies, index names and query DSL all stay server-side: on a
-service holding every tenant's audit trail, an error message is a reconnaissance
+service holding every user's audit trail, an error message is a reconnaissance
 channel.
 
 | Situation | Client sees | Server logs |
@@ -425,7 +425,7 @@ knowing which grant they lack is what lets them request it.
 | `uv.lock` committed; CI uses `--frozen` | A build fails rather than resolving untested versions |
 | `pip-audit` in CI | Dependency CVE scan; currently no known vulnerabilities |
 | `bandit` in CI | SAST; currently no findings. Two suppressions, both justified in-line |
-| `mypy --strict` | A mistyped tenant filter is a data-leak bug |
+| `mypy --strict` | A mistyped user filter is a data-leak bug |
 | ES client major pinned | `>=9,<10` — must match the cluster |
 | Container runs as **UID 10001**, non-root | No filesystem writes needed; state lives in ES/Redis/S3 |
 | Multi-stage build | No compiler, no uv, no build cache in the runtime image |
@@ -467,7 +467,7 @@ permanently undeletable object.
 | SOC 2 CC6.1 — no default credentials | Boot-time validation, no secret defaults |
 | SOC 2 CC7.2 / HIPAA 164.312(b) — audit the audit | Every read and export emits `audit_log.*` |
 | ISO 27001 A.12.4 — protected, immutable logs | Data streams + hash chain + Object Lock |
-| HIPAA 164.312(a) — access control | Scope model, tenant isolation, least-privilege ES role |
+| HIPAA 164.312(a) — access control | Scope model, user isolation, least-privilege ES role |
 | HIPAA 164.312(e) — transmission security | TLS to ES and S3, HSTS, nginx TLS 1.2+ |
 | HIPAA 164.316(b)(2)(i) — 6-year retention | `RETENTION_DAYS=2190`, ILM delete phase |
 | GDPR Art. 17 / DPDP s.12 — erasure | Crypto-shredding |
@@ -490,7 +490,7 @@ Stated explicitly rather than left implicit.
 | **`PII_MASTER_KEK` loss** makes all encrypted PII permanently unreadable | By design — there is no recovery path. Store in a secret manager with backup |
 | **The keyring index is a single point of failure** for PII readability | Must be in the snapshot policy. Holds only *wrapped* keys, so a stolen copy is still gated by the KEK |
 | **Snapshots taken before an erasure still contain the destroyed key** | Keep snapshot retention as short as the recovery objective allows; document the window in the DPIA |
-| **A service key grants `audit:export`**, hence PII decryption | Necessary for the backend to render logs to authorised users. It cannot `erase` or read cross-tenant. Rotate on suspicion |
+| **A service key grants `audit:export`**, hence PII decryption | Necessary for the backend to render logs to authorised users. It cannot `erase` or read cross-user. Rotate on suspicion |
 | **No document-level security** (Basic licence) | Isolation is a code invariant with 86 dedicated tests. A licence upgrade would add defence in depth |
 | **Optional blind index survives crypto-shredding** | Off by default. Enabling it retains a "was this email present?" oracle for KEK holders — pseudonymisation, not erasure |
 | **Rate limiter fails open** on a Redis outage | Deliberate: losing audit evidence is worse than a load spike. Logged at error level |
@@ -502,7 +502,7 @@ Stated explicitly rather than left implicit.
 
 | Control area | Evidence |
 |---|---|
-| Tenant isolation | `tests/unit/test_tenant_isolation.py` — 86 tests, every filter permutation |
+| User isolation | `tests/unit/test_user_isolation.py` — 86 tests, every filter permutation |
 | Tamper evidence | `tests/unit/test_integrity.py` — one test per attack class |
 | Crypto-shredding | `tests/unit/test_crypto_shredding.py` — incl. chain intact after erasure |
 | Authentication | `tests/unit/test_auth.py` — incl. `alg: none`, missing `exp` |

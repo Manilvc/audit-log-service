@@ -22,7 +22,7 @@ from app.core.integrity import (
     verify_chain,
 )
 
-CHAIN = "tenant-a:3"
+CHAIN = "user-a:3"
 
 
 def _doc(seq: int, action: str = "user.login") -> dict[str, Any]:
@@ -30,7 +30,7 @@ def _doc(seq: int, action: str = "user.login") -> dict[str, Any]:
     return {
         "@timestamp": f"2026-08-27T10:{seq:02d}:00+00:00",
         "event": {"id": f"evt-{seq}", "action": action, "outcome": "success"},
-        "tenant": {"id": "tenant-a"},
+        "user": {"uuid": "user-a"},
         "actor": {"id": "u-1", "type": "user"},
     }
 
@@ -98,12 +98,12 @@ def test_preimage_is_length_prefixed_against_boundary_shifting() -> None:
 def test_hash_binds_the_chain_id() -> None:
     """The same document in two chains gets different hashes.
 
-    Otherwise a document could be lifted from one tenant's chain into another's
+    Otherwise a document could be lifted from one user's chain into another's
     and still verify.
     """
     document = _doc(0)
-    assert compute_hash("tenant-a:0", 0, GENESIS_HASH, document) != compute_hash(
-        "tenant-b:0", 0, GENESIS_HASH, document
+    assert compute_hash("user-a:0", 0, GENESIS_HASH, document) != compute_hash(
+        "user-b:0", 0, GENESIS_HASH, document
     )
 
 

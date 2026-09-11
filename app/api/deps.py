@@ -22,7 +22,7 @@ from app.core.constants import (
     MAX_IDENTITY_HEADER_LENGTH,
     ON_BEHALF_HEADER,
     SERVICE_NAME_HEADER,
-    TENANT_HEADER,
+    USER_UUID_HEADER,
 )
 from app.core.exceptions import InvalidHeader, ServiceUnavailable
 from app.core.security.auth import (
@@ -32,7 +32,7 @@ from app.core.security.auth import (
     Principal,
 )
 from app.search.api_key_store import ApiKeyRecord
-from app.search.routing import InvalidTenantError, TenantRouter
+from app.search.routing import InvalidUserUuidError, UserRouter
 from app.services.api_key_service import ApiKeyService, to_scopes
 from app.services.compliance_service import ErasureService, IntegrityService
 from app.services.ingest_service import IngestService
@@ -119,39 +119,39 @@ def _validated_identity(value: str | None, *, header: str) -> str | None:
     return candidate
 
 
-def _validated_tenant(tenant_id: str | None) -> str | None:
-    """Shape-check a tenant header that may legitimately be absent.
+def _validated_user(user_uuid: str | None) -> str | None:
+    """Shape-check a user header that may legitimately be absent.
 
-    Absent stays absent: the cross-tenant read paths have no tenant to name,
+    Absent stays absent: the cross-user read paths have no user to name,
     and rejecting them here would make the header impossible to omit. When a
     value *is* present it must be well formed, so a malformed id fails once at
     the boundary rather than three layers down in a query builder.
 
-    Shape only. Whether the tenant exists is the calling backend's business:
-    it resolved and authorised the tenant before making this call, and this
-    service holds no tenant registry to check against.
+    Shape only. Whether the user exists is the calling backend's business:
+    it resolved and authorised the user before making this call, and this
+    service holds no user registry to check against.
 
     Raises:
-        InvalidTenantError: a value was sent but is not shaped like a tenant id.
+        InvalidUserUuidError: a value was sent but is not shaped like a user uuid.
     """
-    if tenant_id is None or not tenant_id.strip():
+    if user_uuid is None or not user_uuid.strip():
         return None
-    return TenantRouter.validate_tenant_id(tenant_id)
+    return UserRouter.validate_user_uuid(user_uuid)
 
 
-def _assert_key_tenant_matches_header(record: ApiKeyRecord, requested: str | None) -> None:
-    """An issued key may only act for the tenant it was issued to.
+def _assert_key_user_matches_header(record: ApiKeyRecord, requested: str | None) -> None:
+    """An issued key may only act for the user it was issued to.
 
     The header stays legal - every emitter sends it - but it can only agree.
-    Naming a different tenant is an attempt to write into someone else's trail,
+    Naming a different user is an attempt to write into someone else's trail,
     so it is refused rather than quietly resolved in the key's favour.
 
     Raises:
-        AuthorizationError: the header names a different tenant.
+        AuthorizationError: the header names a different user.
     """
-    if requested is not None and requested != record.tenant_id:
+    if requested is not None and requested != record.user_uuid:
         raise AuthorizationError(
-            f"this API key is bound to a different tenant than the {TENANT_HEADER} header names"
+            f"this API key is bound to a different user than the {USER_UUID_HEADER} header names"
         )
 
 
@@ -159,7 +159,7 @@ async def _principal_from_issued_key(
     service: ApiKeyService | None,
     presented: str,
     *,
-    requested_tenant: str | None,
+    requested_user: str | None,
     acting_for: str | None,
     authenticator: Authenticator,
 ) -> Principal:
@@ -171,7 +171,7 @@ async def _principal_from_issued_key(
 
     Raises:
         AuthenticationError: the key is not usable, for any reason.
-        AuthorizationError: it is usable but bound to another tenant.
+        AuthorizationError: it is usable but bound to another user.
     """
     if service is None:
         raise AuthenticationError("invalid service API key")
@@ -180,11 +180,11 @@ async def _principal_from_issued_key(
     if record is None:
         raise AuthenticationError("invalid service API key")
 
-    _assert_key_tenant_matches_header(record, requested_tenant)
+    _assert_key_user_matches_header(record, requested_user)
     return authenticator.issued_key_principal(
         key_id=record.key_id,
         domain=record.domain,
-        tenant_id=record.tenant_id,
+        user_uuid=record.user_uuid,
         scopes=to_scopes(record),
         on_behalf_of=acting_for,
     )
@@ -193,20 +193,20 @@ async def _principal_from_issued_key(
 async def current_principal(
     request: Request,
     api_key: Annotated[str | None, Header(alias=API_KEY_HEADER)] = None,
-    tenant_header: Annotated[str | None, Header(alias=TENANT_HEADER)] = None,
+    user_uuid_header: Annotated[str | None, Header(alias=USER_UUID_HEADER)] = None,
     on_behalf_of: Annotated[str | None, Header(alias=ON_BEHALF_HEADER)] = None,
 ) -> Principal:
     """Authenticate the caller.
 
     Two kinds of credential arrive in `x-api-key`, and which one it is decides
-    where the tenant comes from:
+    where the user comes from:
 
     * **An env-configured key** (`SERVICE_API_KEYS`). The admin plane: every
-      scope, not bound to a tenant, so `x-audit-tenant-id` names the tenant and
+      scope, not bound to a user, so `x-audit-user-uuid` names the user and
       is trusted as given after a shape check. The caller in front of this
-      service resolved and authorised that tenant already.
-    * **An issued key** (`evcaud_...`). Bound to one tenant when it was minted,
-      so the tenant comes from the key and the header may only agree with it.
+      service resolved and authorised that user already.
+    * **An issued key** (`evcaud_...`). Bound to one user when it was minted,
+      so the user comes from the key and the header may only agree with it.
       Its scopes are whatever that key was granted - normally write only - and
       its `subject` is the verified domain it was issued to rather than the
       unchecked `x-service-name` claim.
@@ -217,14 +217,14 @@ async def current_principal(
     Raises:
         AuthenticationError: no key was presented, or it is usable as neither
             kind of credential.
-        AuthorizationError: an issued key was used for another tenant.
-        InvalidTenantError: a tenant header was sent but is malformed.
+        AuthorizationError: an issued key was used for another user.
+        InvalidUserUuidError: a user header was sent but is malformed.
     """
     if not api_key:
         raise AuthenticationError("no credentials supplied")
 
     container = _container(request)
-    requested_tenant = _validated_tenant(tenant_header)
+    requested_user = _validated_user(user_uuid_header)
     # The human this call is for. Stamped onto every event the call ingests
     # (`actor.on_behalf_of`), so a service-mediated write stays attributable to
     # a person and not just to the service account.
@@ -236,14 +236,14 @@ async def current_principal(
             # unverified, so it is recorded as a claim rather than trusted for
             # authorisation - the API key is what grants access.
             service_name=request.headers.get(SERVICE_NAME_HEADER, "unknown-service"),
-            tenant_id=requested_tenant,
+            user_uuid=requested_user,
             on_behalf_of=acting_for,
         )
     else:
         principal = await _principal_from_issued_key(
             container.api_keys,
             api_key,
-            requested_tenant=requested_tenant,
+            requested_user=requested_user,
             acting_for=acting_for,
             authenticator=container.authenticator,
         )
@@ -257,61 +257,61 @@ async def current_principal(
 PrincipalDep = Annotated[Principal, Depends(current_principal)]
 
 
-async def tenant_id_header(
-    tenant_header: Annotated[str | None, Header(alias=TENANT_HEADER)] = None,
+async def user_uuid_header(
+    user_uuid_header: Annotated[str | None, Header(alias=USER_UUID_HEADER)] = None,
 ) -> str | None:
-    """The tenant this call acts for, when one was named.
+    """The user this call acts for, when one was named.
 
-    For the two routes that can legitimately run without a tenant - search and
-    aggregate under `cross_tenant=true`. Every other tenant-scoped route takes
-    `TenantIdDep` instead and refuses to run without a tenant.
+    For the two routes that can legitimately run without a user - search and
+    aggregate under `cross_user=true`. Every other user-scoped route takes
+    `UserUuidDep` instead and refuses to run without a user.
 
     Optional here rather than required so the failure surfaces from the
     authorisation layer with an explanatory message, instead of as a bare 422
     from request validation.
     """
-    return tenant_header
+    return user_uuid_header
 
 
-TenantHeaderDep = Annotated[str | None, Depends(tenant_id_header)]
+UserUuidHeaderDep = Annotated[str | None, Depends(user_uuid_header)]
 
 
-async def require_tenant_id(
-    tenant_header: Annotated[str | None, Header(alias=TENANT_HEADER)] = None,
+async def require_user_uuid(
+    user_uuid_header: Annotated[str | None, Header(alias=USER_UUID_HEADER)] = None,
 ) -> str:
-    """The tenant this call acts for. Mandatory, validated, normalised.
+    """The user this call acts for. Mandatory, validated, normalised.
 
-    Applied to every route that touches one tenant's records, so the tenant is
+    Applied to every route that touches one user's records, so the user is
     settled at the API boundary: a caller that forgets the header gets one clear
     400 naming the header, not an ingest rejection from one route and an
     authorisation error from the next.
 
     Declared with a `None` default and checked in the body rather than as a
-    required FastAPI header, because a bare 422 listing `x-audit-tenant-id` as a
+    required FastAPI header, because a bare 422 listing `x-audit-user-uuid` as a
     missing field explains far less than the message below.
 
     Raises:
-        InvalidTenantError: the header is absent, blank, or malformed.
+        InvalidUserUuidError: the header is absent, blank, or malformed.
     """
-    if tenant_header is None or not tenant_header.strip():
-        raise InvalidTenantError(
-            f"the {TENANT_HEADER} header is required: it names the tenant this "
-            "call acts for, and the API key is not bound to a tenant"
+    if user_uuid_header is None or not user_uuid_header.strip():
+        raise InvalidUserUuidError(
+            f"the {USER_UUID_HEADER} header is required: it names the user this "
+            "call acts for, and the API key is not bound to a user"
         )
-    return TenantRouter.validate_tenant_id(tenant_header)
+    return UserRouter.validate_user_uuid(user_uuid_header)
 
 
-TenantIdDep = Annotated[str, Depends(require_tenant_id)]
+UserUuidDep = Annotated[str, Depends(require_user_uuid)]
 
 
 async def issuer_id_header(
     issuer_header: Annotated[str | None, Header(alias=ISSUER_HEADER)] = None,
 ) -> str | None:
-    """The issuer (sub-tenant) this call acts within, when one was named.
+    """The issuer (sub-user) this call acts within, when one was named.
 
     Optional, and a *default* rather than an override: an event that carries its
     own `issuer_id` keeps it, because a batch can legitimately span issuers
-    within one tenant. Unlike the tenant, this is a descriptive field and not a
+    within one user. Unlike the user, this is a descriptive field and not a
     boundary - reads are never scoped by it unless the caller asks - so a wrong
     value mislabels a record without exposing anything.
 

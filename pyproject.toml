@@ -11,7 +11,7 @@
 [project]
 name = "everycred-audit-service"
 version = "1.0.0"
-description = "Tamper-evident, multi-tenant audit log microservice for the EveryCRED DCS platform"
+description = "Tamper-evident, multi-user audit log microservice for the EveryCRED DCS platform"
 readme = "README.md"
 # Floor is 3.13 so the service can also run on the platform's current
 # interpreter; .python-version pins local/CI development to 3.14.
@@ -121,7 +121,7 @@ known-first-party = ["app", "tests"]
 "scripts/**" = ["T201"]
 
 # ---------------------------------------------------------------------------
-# Typing — strict, because a mistyped tenant filter is a data-leak bug
+# Typing — strict, because a mistyped user filter is a data-leak bug
 # ---------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.13"

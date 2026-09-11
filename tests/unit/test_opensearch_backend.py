@@ -6,11 +6,11 @@ diverge. The integration suite covers the rest against a live OpenSearch.
 
 The most important test in this file is the last one. On Elasticsearch, a
 dedicated stream's `constant_keyword` makes the engine itself refuse a document
-carrying another tenant's id - `docs/SECURITY.md` counts that as a layer of the
+carrying another user's id - `docs/SECURITY.md` counts that as a layer of the
 isolation model. OpenSearch has no dependable equivalent, so the guarantee moved
 into `AuditRepository.bulk_index`, where it holds on both engines and on the
 shared stream too. That is the one place a regression would silently weaken
-tenant isolation.
+user isolation.
 """
 
 from __future__ import annotations
@@ -46,16 +46,16 @@ from app.search.backends.opensearch import (
     ism_policy,
 )
 from app.search.mappings import dedicated_index_template, shared_index_template
-from app.search.query import AuditSearchFilter, TenantScope, build_search_body
+from app.search.query import AuditSearchFilter, UserScope, build_search_body
 from app.search.repository import AuditRepository
-from app.search.routing import TenantRouter
+from app.search.routing import UserRouter
 
 RETENTION = RetentionPolicy(
     retention_days=2190,
     rollover_max_primary_shard_size="50gb",
     rollover_max_age="30d",
 )
-PATTERNS = ("audit-shared", "audit-t-*")
+PATTERNS = ("audit-shared", "audit-u-*")
 
 
 @pytest.fixture
@@ -134,7 +134,7 @@ def test_opensearch_field_types(backend: OpenSearchBackend) -> None:
     assert types is OPENSEARCH_FIELD_TYPES
     assert types.subtree == {"type": "flat_object"}
     assert types.log_text == {"type": "text"}
-    assert types.pinned_tenant == {"type": "keyword"}
+    assert types.pinned_user_uuid == {"type": "keyword"}
 
 
 def test_ism_needs_no_index_setting(backend: OpenSearchBackend) -> None:
@@ -157,14 +157,14 @@ def test_templates_render_with_opensearch_types(backend: OpenSearchBackend) -> N
     assert "lifecycle" not in shared["template"]["settings"]["index"]
 
     dedicated = dedicated_index_template(
-        name_pattern="audit-t-*",
+        name_pattern="audit-u-*",
         shards=1,
         replicas=1,
         backend=backend,
         policy_name="audit-retention",
     )
-    tenant_id = dedicated["template"]["mappings"]["properties"]["tenant"]["properties"]["id"]
-    assert tenant_id == {"type": "keyword"}
+    user_uuid = dedicated["template"]["mappings"]["properties"]["user"]["properties"]["uuid"]
+    assert user_uuid == {"type": "keyword"}
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ def store() -> _RecordingStore:
 
 
 @pytest.fixture
-def repository(store: _RecordingStore, router: TenantRouter) -> AuditRepository:
+def repository(store: _RecordingStore, router: UserRouter) -> AuditRepository:
     return AuditRepository(
         store,  # type: ignore[arg-type]
         router,
@@ -279,12 +279,12 @@ def repository(store: _RecordingStore, router: TenantRouter) -> AuditRepository:
     )
 
 
-def _document(tenant_id: str, event_id: str = "evt-1") -> dict[str, Any]:
-    return {"event": {"id": event_id}, "tenant": {"id": tenant_id}}
+def _document(user_uuid: str, event_id: str = "evt-1") -> dict[str, Any]:
+    return {"event": {"id": event_id}, "user": {"uuid": user_uuid}}
 
 
-async def test_a_document_bound_for_the_wrong_tenant_is_never_written(
-    repository: AuditRepository, store: _RecordingStore, router: TenantRouter
+async def test_a_document_bound_for_the_wrong_user_is_never_written(
+    repository: AuditRepository, store: _RecordingStore, router: UserRouter
 ) -> None:
     """The invariant the whole isolation model rests on.
 
@@ -292,27 +292,27 @@ async def test_a_document_bound_for_the_wrong_tenant_is_never_written(
     not, and neither engine does on the shared stream - so it is enforced here,
     before the write, on every engine and every stream.
     """
-    route = router.resolve("tenant-a")
-    outcome = await repository.bulk_index([(route, _document("tenant-b"))])
+    route = router.resolve("user-a")
+    outcome = await repository.bulk_index([(route, _document("user-b"))])
 
-    assert store.calls == [], "a foreign-tenant document reached the store"
+    assert store.calls == [], "a foreign-user document reached the store"
     assert outcome.succeeded == 0
     assert len(outcome.failed) == 1
-    assert "tenant_mismatch" in outcome.failed[0][1]
+    assert "user_uuid_mismatch" in outcome.failed[0][1]
 
 
-async def test_a_document_with_no_tenant_is_never_written(
-    repository: AuditRepository, store: _RecordingStore, router: TenantRouter
+async def test_a_document_with_no_user_is_never_written(
+    repository: AuditRepository, store: _RecordingStore, router: UserRouter
 ) -> None:
-    route = router.resolve("tenant-a")
+    route = router.resolve("user-a")
     outcome = await repository.bulk_index([(route, {"event": {"id": "evt-1"}})])
 
     assert store.calls == []
-    assert "carries no tenant.id" in outcome.failed[0][1]
+    assert "carries no user.uuid" in outcome.failed[0][1]
 
 
 async def test_the_mismatch_reason_is_classified_as_permanent(
-    repository: AuditRepository, router: TenantRouter
+    repository: AuditRepository, router: UserRouter
 ) -> None:
     """It must dead-letter, not retry.
 
@@ -321,25 +321,25 @@ async def test_the_mismatch_reason_is_classified_as_permanent(
     """
     from app.queue.worker import _is_permanent
 
-    route = router.resolve("tenant-a")
-    outcome = await repository.bulk_index([(route, _document("tenant-b"))])
+    route = router.resolve("user-a")
+    outcome = await repository.bulk_index([(route, _document("user-b"))])
     assert _is_permanent(outcome.failed[0][1])
 
 
 async def test_good_documents_still_go_through_alongside_a_rejected_one(
-    repository: AuditRepository, store: _RecordingStore, router: TenantRouter
+    repository: AuditRepository, store: _RecordingStore, router: UserRouter
 ) -> None:
     """One bad document must not discard the batch.
 
     Partial success is the normal case: the other events are evidence, and
     dropping them to punish a routing bug loses more than it protects.
     """
-    route = router.resolve("tenant-a")
+    route = router.resolve("user-a")
     outcome = await repository.bulk_index(
         [
-            (route, _document("tenant-a", "evt-good-1")),
-            (route, _document("tenant-b", "evt-bad")),
-            (route, _document("tenant-a", "evt-good-2")),
+            (route, _document("user-a", "evt-good-1")),
+            (route, _document("user-b", "evt-bad")),
+            (route, _document("user-a", "evt-good-2")),
         ]
     )
 
@@ -367,20 +367,20 @@ def test_opensearch_data_streams_take_no_custom_routing(backend: OpenSearchBacke
 
 def test_router_omits_the_routing_key_when_the_engine_refuses_it() -> None:
     """The router and the template have to agree, or every shared write fails."""
-    unrouted = TenantRouter(
+    unrouted = UserRouter(
         shared_stream="audit-shared",
         index_prefix="audit",
-        dedicated_tenants=frozenset(),
+        dedicated_users=frozenset(),
         custom_routing=False,
     )
-    assert unrouted.resolve("tenant-a").routing_key is None
+    assert unrouted.resolve("user-a").routing_key is None
 
     # The default stays Elasticsearch behaviour, where routing pins a shared
-    # tenant to one shard.
-    routed = TenantRouter(
-        shared_stream="audit-shared", index_prefix="audit", dedicated_tenants=frozenset()
+    # user to one shard.
+    routed = UserRouter(
+        shared_stream="audit-shared", index_prefix="audit", dedicated_users=frozenset()
     )
-    assert routed.resolve("tenant-a").routing_key == "tenant-a"
+    assert routed.resolve("user-a").routing_key == "user-a"
 
 
 def test_shared_template_drops_the_routing_flag_for_opensearch(
@@ -406,7 +406,7 @@ def test_opensearch_sort_takes_no_date_format(backend: OpenSearchBackend) -> Non
     assert backend.sort_date_format is None
 
     body = build_search_body(
-        TenantScope(tenant_id="tenant-a"),
+        UserScope(user_uuid="user-a"),
         AuditSearchFilter(),
         size=10,
         max_window_days=90,
@@ -420,7 +420,7 @@ def test_opensearch_sort_takes_no_date_format(backend: OpenSearchBackend) -> Non
 def test_elasticsearch_keeps_the_formatted_sort_value() -> None:
     """The default, and what an Elasticsearch cursor carries."""
     body = build_search_body(
-        TenantScope(tenant_id="tenant-a"),
+        UserScope(user_uuid="user-a"),
         AuditSearchFilter(),
         size=10,
         max_window_days=90,

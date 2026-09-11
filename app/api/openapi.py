@@ -5,11 +5,11 @@ models, and nothing about how a developer is meant to *use* the API. Three gaps
 matter enough to close here, because each one is invisible in the generated
 document and expensive to discover by trial and error:
 
-1. **Authentication is undocumented.** The credential and the tenant header
+1. **Authentication is undocumented.** The credential and the user header
    both arrive through plain ``Header`` dependencies, so the generated schema
    lists them as unexplained optional headers with no security scheme attached.
    A reader cannot tell that ``x-api-key`` is the credential, that
-   ``x-audit-tenant-id`` is mandatory alongside it on every tenant-scoped
+   ``x-audit-user-uuid`` is mandatory alongside it on every user-scoped
    route, or that the two do different jobs.
 2. **Tags carry no prose.** ReDoc renders a tag as a navigation heading, so an
    untagged description is a section with a title and no introduction.
@@ -33,16 +33,16 @@ from app.core.constants import (
     API_KEY_HEADER,
     ISSUER_HEADER,
     ON_BEHALF_HEADER,
-    TENANT_HEADER,
+    USER_UUID_HEADER,
 )
 
 # ---------------------------------------------------------------------------
 # Security schemes
 # ---------------------------------------------------------------------------
-# One credential, one tenant header, and only the first of them is a security
-# scheme. `x-audit-tenant-id` is not a credential - it grants nothing and is
+# One credential, one user header, and only the first of them is a security
+# scheme. `x-audit-user-uuid` is not a credential - it grants nothing and is
 # checked only for shape - so describing it as one would tell a reader that
-# naming a tenant is what authorises the call. It is documented as an ordinary
+# naming a user is what authorises the call. It is documented as an ordinary
 # required header instead, in `_HEADER_DESCRIPTIONS` below.
 SECURITY_SCHEMES: dict[str, dict[str, Any]] = {
     "ServiceApiKey": {
@@ -58,10 +58,10 @@ SECURITY_SCHEMES: dict[str, dict[str, Any]] = {
             "overlap window: add the new key, redeploy every emitter, then drop the "
             "old one.\n\n"
             "A valid key carries every audit scope - including `audit:erase` and "
-            "`audit:cross_tenant` - because it is the only credential this service "
+            "`audit:cross_user` - because it is the only credential this service "
             "accepts. Treat it accordingly.\n\n"
-            "A service principal is not bound to a tenant, so it **must** name the "
-            f"tenant it is acting for via the `{TENANT_HEADER}` header."
+            "A service principal is not bound to a user, so it **must** name the "
+            f"user it is acting for via the `{USER_UUID_HEADER}` header."
         ),
     },
 }
@@ -79,18 +79,18 @@ _CREDENTIAL_HEADERS = frozenset({API_KEY_HEADER.lower()})
 # These are ordinary headers rather than credentials, so they stay - but the
 # generated schema gives them no description, and each is easy to get wrong.
 _HEADER_DESCRIPTIONS: dict[str, str] = {
-    TENANT_HEADER.lower(): (
-        "Tenant the call acts for. **Required** on every tenant-scoped route: "
-        "the API key is not bound to a tenant, so this header is the only thing "
+    USER_UUID_HEADER.lower(): (
+        "User the call acts for. **Required** on every user-scoped route: "
+        "the API key is not bound to a user, so this header is the only thing "
         "that scopes the request. It may be omitted only on search and aggregate "
-        "with `cross_tenant=true`.\n\n"
-        "Send the tenant's UUID as your own system knows it. It is checked for "
+        "with `cross_user=true`.\n\n"
+        "Send the user's UUID as your own system knows it. It is checked for "
         "shape (`[A-Za-z0-9._-]`, 1-63 chars, alphanumeric first) and otherwise "
-        "trusted: **you** are expected to have resolved and authorised the tenant "
-        "before calling, because this service holds no tenant registry to check "
-        "against. A well-formed id for a tenant that does not exist is accepted, "
-        "and its events then belong to a tenant nobody can read.\n\n"
-        "On ingest, an event whose body `tenant_id` disagrees with this header is "
+        "trusted: **you** are expected to have resolved and authorised the user "
+        "before calling, because this service holds no user registry to check "
+        "against. A well-formed id for a user that does not exist is accepted, "
+        "and its events then belong to a user nobody can read.\n\n"
+        "On ingest, an event whose body `user_uuid` disagrees with this header is "
         "rejected rather than silently resolved."
     ),
     ON_BEHALF_HEADER.lower(): (
@@ -103,11 +103,11 @@ _HEADER_DESCRIPTIONS: dict[str, str] = {
         "own value."
     ),
     ISSUER_HEADER.lower(): (
-        "Issuer (sub-tenant) the call acts within, recorded as `tenant.issuer_id` "
+        "Issuer (sub-user) the call acts within, recorded as `user.issuer_id` "
         "and filterable on search and aggregate.\n\n"
         "A batch default, not an override: an event carrying its own `issuer_id` "
-        "keeps it, so one call can span several issuers inside a tenant. Unlike "
-        "the tenant header this is descriptive rather than a boundary - reads are "
+        "keeps it, so one call can span several issuers inside a user. Unlike "
+        "the user header this is descriptive rather than a boundary - reads are "
         "not scoped by it unless you ask - so at most 64 characters is the only "
         "constraint."
     ),
@@ -123,15 +123,15 @@ TAGS_METADATA: list[dict[str, Any]] = [
         "description": (
             "Write and read the audit trail.\n\n"
             "**Writes return `202 Accepted`, not `201`.** The request path does no "
-            "crypto, no Elasticsearch and no S3: it validates, resolves the tenant "
+            "crypto, no Elasticsearch and no S3: it validates, resolves the user "
             "and enqueues. The event is searchable about a second later. Reporting "
             "`201` would imply it is queryable immediately, which a caller might "
             "then build a read-after-write assumption on.\n\n"
             "**Partial success is normal.** One malformed event does not reject the "
             "batch - check `rejected` and `errors`, which report the index of each "
             "failed event within the batch you sent.\n\n"
-            "**Reads are searches, never document GETs.** A mandatory tenant filter "
-            "is injected in the query layer, so guessing another tenant's event id "
+            "**Reads are searches, never document GETs.** A mandatory user filter "
+            "is injected in the query layer, so guessing another user's event id "
             "returns `404` rather than the record. Every search is itself recorded "
             "as an audit event, as HIPAA 164.312(b) and SOC 2 CC7.2 require."
         ),
@@ -141,7 +141,7 @@ TAGS_METADATA: list[dict[str, Any]] = [
         "description": (
             "Prove the trail is intact, and honour an erasure request without "
             "breaking that proof.\n\n"
-            "**Integrity verification** walks a tenant's hash chain and reports the "
+            "**Integrity verification** walks a user's hash chain and reports the "
             "first break, distinguishing modification from deletion, reordering and "
             "insertion. Chain heads are notarised into WORM storage, so even a "
             "wholesale rewrite of Elasticsearch is detectable.\n\n"
@@ -155,13 +155,13 @@ TAGS_METADATA: list[dict[str, Any]] = [
     {
         "name": "Operations",
         "description": (
-            "Health, metrics and tenant topology.\n\n"
+            "Health, metrics and user topology.\n\n"
             "`/health/live` deliberately checks nothing external: a liveness probe "
             "that fails during an Elasticsearch upgrade would make the orchestrator "
             "restart every replica and turn a degraded read path into an outage. "
             "`/health/ready` does check dependencies, because a replica that cannot "
             "reach its dependencies should be taken out of the load balancer.\n\n"
-            "Promoting a tenant to a dedicated data stream is non-destructive: reads "
+            "Promoting a user to a dedicated data stream is non-destructive: reads "
             "still cover the shared stream, so history from before the promotion "
             "stays visible."
         ),
@@ -241,8 +241,8 @@ _AGGREGATE_EXAMPLE: dict[str, Any] = {
     "buckets": 30,
 }
 
-# No `tenant_id` in either compliance example: both models are `extra: forbid`
-# and the tenant comes from the credential or the `x-audit-tenant-id` header.
+# No `user_uuid` in either compliance example: both models are `extra: forbid`
+# and the user comes from the credential or the `x-audit-user-uuid` header.
 # Sending it in the body is a 422, so an example that included it would send a
 # developer straight into a validation error on their first call.
 _VERIFY_EXAMPLE: dict[str, Any] = {
@@ -259,12 +259,12 @@ _ERASURE_EXAMPLE: dict[str, Any] = {
     "confirm": True,
 }
 
-#: Operations whose route takes `TenantIdDep`, so the tenant header is
+#: Operations whose route takes `UserUuidDep`, so the user header is
 #: mandatory. FastAPI cannot infer this: the dependency declares a `None`
 #: default on purpose, so a missing header produces an explanatory 400 instead
 #: of a bare 422 listing a header name. Curated here like the examples below,
 #: and `tests/unit/test_identity_headers.py` fails if it drifts from the routes.
-_TENANT_REQUIRED_OPERATIONS: frozenset[tuple[str, str]] = frozenset(
+_USER_UUID_REQUIRED_OPERATIONS: frozenset[tuple[str, str]] = frozenset(
     {
         ("/v1/audit/events", "post"),
         ("/v1/audit/events/{event_id}", "get"),
@@ -303,15 +303,15 @@ def _error_example(message: str) -> dict[str, Any]:
 _COMMON_ERRORS: dict[str, dict[str, Any]] = {
     "400": {
         "description": (
-            "No `x-audit-tenant-id` header on a route that acts for one tenant, a "
-            "tenant id that is not shaped like one, or a filter the query builder "
+            "No `x-audit-user-uuid` header on a route that acts for one user, a "
+            "user uuid that is not shaped like one, or a filter the query builder "
             "refused. The message says which."
         ),
         "content": {
             "application/json": {
                 "example": _error_example(
-                    "the x-audit-tenant-id header is required: it names the tenant "
-                    "this call acts for, and the API key is not bound to a tenant"
+                    "the x-audit-user-uuid header is required: it names the user "
+                    "this call acts for, and the API key is not bound to a user"
                 )
             }
         },
@@ -326,7 +326,7 @@ _COMMON_ERRORS: dict[str, dict[str, Any]] = {
     "403": {
         "description": (
             "Authenticated, but the principal lacks the scope for this operation - "
-            "or asked for another tenant's data without `audit:cross_tenant`."
+            "or asked for another user's data without `audit:cross_user`."
         ),
         "content": {
             "application/json": {"example": _error_example("scope audit:export is required")}
@@ -376,12 +376,12 @@ def _decorate_operation(path: str, method: str, operation: dict[str, Any]) -> No
         if param.get("in") == "header" and name in _HEADER_DESCRIPTIONS:
             param["description"] = _HEADER_DESCRIPTIONS[name]
             # `str | None` generates an anyOf whose auto-titles render as
-            # "X-Audit-Tenant-Id (string) or X-Audit-Tenant-Id (null)". It is a
+            # "X-Audit-User-Id (string) or X-Audit-User-Id (null)". It is a
             # string; saying so plainly is both accurate and readable, and
             # `required` below carries the optionality.
             param["schema"] = {"type": "string"}
-            if name == TENANT_HEADER.lower():
-                param["required"] = (path, method) in _TENANT_REQUIRED_OPERATIONS
+            if name == USER_UUID_HEADER.lower():
+                param["required"] = (path, method) in _USER_UUID_REQUIRED_OPERATIONS
         params.append(param)
     if params:
         operation["parameters"] = params

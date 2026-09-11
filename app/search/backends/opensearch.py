@@ -66,18 +66,18 @@ logger = get_logger(__name__)
 
 #: OpenSearch equivalents for the three types Elasticsearch supplies natively.
 #:
-#: `pinned_tenant` is plain `keyword`, not `constant_keyword`, and that is a
+#: `pinned_user_uuid` is plain `keyword`, not `constant_keyword`, and that is a
 #: decision rather than an oversight. Availability of `constant_keyword` varies
-#: across OpenSearch 2.x minors, so depending on it would make the tenant
+#: across OpenSearch 2.x minors, so depending on it would make the user
 #: backstop a function of which patch version a domain happens to run - the
 #: worst possible property for a security control. Instead the guarantee is
 #: enforced in `AuditRepository.bulk_index`, which refuses to write a document
-#: whose `tenant.id` disagrees with its route, on **both** engines. The engine
+#: whose `user.uuid` disagrees with its route, on **both** engines. The engine
 #: check remains a second layer where the engine offers it.
 OPENSEARCH_FIELD_TYPES: Final[FieldTypes] = FieldTypes(
     subtree={"type": "flat_object"},
     log_text={"type": "text"},
-    pinned_tenant={"type": "keyword"},
+    pinned_user_uuid={"type": "keyword"},
 )
 
 #: AWS signing service name. `es` covers managed domains; Serverless
@@ -196,9 +196,9 @@ class OpenSearchBackend:
             directly or remove the custom routing.
 
         There is no template flag to enable it, so the shared stream is written
-        unrouted here and a tenant's searches fan out across its shards. The
+        unrouted here and a user's searches fan out across its shards. The
         cost is search efficiency on the shared stream; isolation is unchanged,
-        because that comes from the mandatory tenant filter. A tenant whose
+        because that comes from the mandatory user filter. A user whose
         volume makes the fan-out expensive is the case dedicated streams exist
         for, and those never used routing on either engine.
         """

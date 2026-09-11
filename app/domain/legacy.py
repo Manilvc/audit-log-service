@@ -29,7 +29,7 @@ LEGACY_ACTION_TO_ECS: dict[str, Action] = {
     "Send OTP": Action.USER_OTP_SEND,
     "Verify OTP": Action.USER_OTP_VERIFY,
     "Account Locked": Action.USER_ACCOUNT_LOCKED,
-    # Authority — closest machine identity is tenant.* (no authority.* action)
+    # Authority — closest machine identity is user.* (no authority.* action)
     "Create Authority": Action.TENANT_CREATE,
     "Update Authority": Action.TENANT_UPDATE,
     # Issuer

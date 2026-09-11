@@ -69,19 +69,19 @@ _SWAGGER_UI_PARAMETERS: Final[dict[str, Any]] = {
 # in a normal literal Python reads backslash-newline as a line join and eats
 # the newline - collapsing every curl example onto one unreadable line.
 _DESCRIPTION = r"""
-Tamper-evident, multi-tenant audit log service for the EveryCRED DCS platform.
+Tamper-evident, multi-user audit log service for the EveryCRED DCS platform.
 
 Every security-relevant action across the platform - credential issuance,
 revocation, login, permission change, consent withdrawal, configuration edit -
 lands here as one canonical event, in one queryable place, with cryptographic
 proof it has not been altered.
 
-**Storage** - Elasticsearch 9.x data streams, hybrid tenant isolation (a shared
-stream by default, dedicated streams for high-volume tenants), with a durable
+**Storage** - Elasticsearch 9.x data streams, hybrid user isolation (a shared
+stream by default, dedicated streams for high-volume users), with a durable
 Redis Streams buffer in front and an immutable S3 Object Lock archive behind.
 
 **Tamper evidence** - every event carries a SHA-256 hash chained to its
-predecessor within its tenant's chain, and chain heads are periodically
+predecessor within its user's chain, and chain heads are periodically
 notarised into WORM storage. Modification, deletion, reordering and insertion
 are all detectable, and distinguishable from each other.
 
@@ -98,7 +98,7 @@ Emit one event, then read it back:
 # 1. Write. Returns 202 - the event is queued, not yet searchable.
 curl -X POST "$AUDIT_URL/v1/audit/events" \
   -H "x-api-key: $AUDIT_API_KEY" \
-  -H "x-audit-tenant-id: $TENANT_ID" \
+  -H "x-audit-user-uuid: $USER_UUID" \
   -H "content-type: application/json" \
   -d '{"events":[{"action":"user.login","outcome":"success",
         "actor":{"type":"user","id":"u_123"},
@@ -108,7 +108,7 @@ curl -X POST "$AUDIT_URL/v1/audit/events" \
 # 2. Read. Allow ~1s for the worker to drain the queue into Elasticsearch.
 curl -X POST "$AUDIT_URL/v1/audit/events/search" \
   -H "x-api-key: $AUDIT_API_KEY" \
-  -H "x-audit-tenant-id: $TENANT_ID" \
+  -H "x-audit-user-uuid: $USER_UUID" \
   -H "content-type: application/json" \
   -d '{"start":"now-1h","end":"now","size":20}'
 ```
@@ -124,18 +124,18 @@ the user's behalf.
 |---|---|
 | Header | `x-api-key` |
 | For | emitting services, machine readers |
-| Tenant | **you must send** `x-audit-tenant-id` |
+| User | **you must send** `x-audit-user-uuid` |
 | Scopes | all of them (see below) |
 
 A valid key carries every scope: `audit:read`, `audit:write`, `audit:export`,
-`audit:erase`, `audit:verify`, `audit:admin`, `audit:cross_tenant`. The key is
+`audit:erase`, `audit:verify`, `audit:admin`, `audit:cross_user`. The key is
 therefore a high-value secret - it is enough to crypto-shred a data subject's
-personal data or read across every tenant - so keep it distinct per environment
+personal data or read across every user - so keep it distinct per environment
 and rotate it on a schedule.
 
-A key is not bound to a tenant, so `x-audit-tenant-id` is what tells the service
-which tenant the call acts for, and it is required on every tenant-scoped route.
-On ingest, an event whose body `tenant_id` disagrees with that header is rejected
+A key is not bound to a user, so `x-audit-user-uuid` is what tells the service
+which user the call acts for, and it is required on every user-scoped route.
+On ingest, an event whose body `user_uuid` disagrees with that header is rejected
 rather than silently resolved.
 
 Three more headers are recorded rather than checked, and each is stamped onto
@@ -144,7 +144,7 @@ every event the call ingests unless the event already carries its own value:
 * `x-audit-on-behalf-of` - the service user, the person the backend is acting
   for. Recorded as `actor.on_behalf_of`, so a service-mediated action is
   attributed to the human and not to the service account.
-* `x-audit-issuer-id` - the issuer (sub-tenant), recorded as `tenant.issuer_id`
+* `x-audit-issuer-id` - the issuer (sub-user), recorded as `user.issuer_id`
   and filterable on search and aggregate.
 * `x-service-name` - the calling service, recorded as `actor.service`.
 
@@ -170,14 +170,14 @@ becomes duplicate audit records.
 `rejected` and `errors` report the index of each failed event within the batch
 you sent.
 
-**Search, not fetch.** Reads are tenant-filtered searches, so an event id from
-another tenant returns `404` rather than the record. Pagination is
+**Search, not fetch.** Reads are user-filtered searches, so an event id from
+another user returns `404` rather than the record. Pagination is
 cursor-based: pass the `cursor` from the previous response, and page 500 costs
 what page 1 costs.
 
-**Errors.** `400` no tenant named, or an identity header wider than the field it
+**Errors.** `400` no user named, or an identity header wider than the field it
 is stored in, `401` no or unrecognised credential, `403` missing scope or another
-tenant's data, `422` schema validation, `429` rate limited - reads are capped low
+user's data, `422` schema validation, `429` rate limited - reads are capped low
 because reads are the sensitive surface, ingest is capped high because throttling
 ingest means dropping evidence.
 """
@@ -205,7 +205,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             environment=resolved.ENVIRONMENT.value,
             pii_encryption=container.cipher.enabled,
             archive_enabled=container.archive.enabled,
-            dedicated_tenants=len(resolved.dedicated_tenant_set),
+            dedicated_users=len(resolved.dedicated_user_set),
         )
 
         # Bootstrap failures are logged but do not abort startup: a replica that
@@ -355,7 +355,7 @@ def _install_middleware(app: FastAPI, settings: Settings) -> None:
                 "Authorization",
                 "Content-Type",
                 "x-api-key",
-                "x-audit-tenant-id",
+                "x-audit-user-uuid",
                 "x-audit-issuer-id",
                 "x-audit-on-behalf-of",
                 "x-request-id",

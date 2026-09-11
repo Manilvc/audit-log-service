@@ -15,9 +15,9 @@ AOF off, Redis is a buffer, not a queue.
 
 Partitioning
 ------------
-One stream per partition, with a tenant pinned to a partition by a stable
-digest. That is what lets the hash chain be per (tenant, partition): all of a
-tenant's events flow through one ordered stream, so sequence numbers are
+One stream per partition, with a user pinned to a partition by a stable
+digest. That is what lets the hash chain be per (user, partition): all of a
+user's events flow through one ordered stream, so sequence numbers are
 allocated in the order the events actually arrived.
 
 Delivery semantics

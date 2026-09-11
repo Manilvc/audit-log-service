@@ -2,7 +2,7 @@
 
 The guiding rule is that a client learns *what to fix*, never *how the service
 is built*. Stack traces, Elasticsearch error bodies, index names and query DSL
-all stay server-side: on a service holding every tenant's audit trail, an error
+all stay server-side: on a service holding every user's audit trail, an error
 message is a reconnaissance channel. The full detail goes to the structured log,
 correlated by request id, so an operator can still diagnose it.
 """
@@ -21,7 +21,7 @@ from app.core.security.auth import AuthenticationError, AuthorizationError
 from app.core.security.crypto import KeyRingError
 from app.search.backends import SearchError, SearchRejected, SearchUnavailable
 from app.search.query import QueryValidationError
-from app.search.routing import InvalidTenantError
+from app.search.routing import InvalidUserUuidError
 
 logger = get_logger(__name__)
 
@@ -39,7 +39,7 @@ class AuditServiceError(Exception):
 
 
 class IngestRejected(AuditServiceError):
-    """An audit event or batch failed validation / tenant resolution."""
+    """An audit event or batch failed validation / user resolution."""
 
     # Numeric literal rather than the starlette constant: 422's constant was
     # renamed (ENTITY -> CONTENT) across versions, and the number never changes.
@@ -126,8 +126,8 @@ def register_exception_handlers(app: FastAPI) -> None:
         # reveal nothing about the cluster.
         return _respond(status.HTTP_400_BAD_REQUEST, str(exc))
 
-    @app.exception_handler(InvalidTenantError)
-    async def _tenant_error(request: Request, exc: InvalidTenantError) -> ORJSONResponse:
+    @app.exception_handler(InvalidUserUuidError)
+    async def _user_error(request: Request, exc: InvalidUserUuidError) -> ORJSONResponse:
         return _respond(status.HTTP_400_BAD_REQUEST, str(exc))
 
     @app.exception_handler(AuditServiceError)
@@ -173,7 +173,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(SearchRejected)
     async def _store_rejected(request: Request, exc: SearchRejected) -> ORJSONResponse:
         # Never echoed: a store error body carries index names, mappings and
-        # sometimes document content from another tenant.
+        # sometimes document content from another user.
         logger.error(
             "search_store_rejected",
             request_id=_request_id(request),

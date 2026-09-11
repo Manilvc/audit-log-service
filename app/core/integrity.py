@@ -6,7 +6,7 @@ archived document years later without booting the service.
 
 The scheme
 ----------
-Every document joins a chain identified by `<tenant_id>:<partition>`. For
+Every document joins a chain identified by `<user_uuid>:<partition>`. For
 sequence *n*:
 
     hash_n = SHA256( chain_id || seq_n || prev_hash || canonical_json(doc_n) )

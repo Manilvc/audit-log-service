@@ -40,7 +40,7 @@ class ApiKeyRecord:
     """One issued key, as stored. Never carries the secret itself."""
 
     key_id: str
-    tenant_id: str
+    user_uuid: str
     domain: str
     label: str
     secret_digest: str
@@ -71,7 +71,7 @@ def _to_document(record: ApiKeyRecord) -> dict[str, Any]:
     """Render a record for storage, dates as ISO-8601 strings."""
     return {
         "key_id": record.key_id,
-        "tenant_id": record.tenant_id,
+        "user_uuid": record.user_uuid,
         "domain": record.domain,
         "label": record.label,
         "secret_digest": record.secret_digest,
@@ -100,7 +100,7 @@ def _to_record(source: dict[str, Any]) -> ApiKeyRecord:
     created_at = _parse_timestamp(source.get("created_at"))
     return ApiKeyRecord(
         key_id=str(source["key_id"]),
-        tenant_id=str(source["tenant_id"]),
+        user_uuid=str(source["user_uuid"]),
         domain=str(source.get("domain", "")),
         label=str(source.get("label", "")),
         secret_digest=str(source["secret_digest"]),
@@ -143,7 +143,7 @@ class ApiKeyStore:
         logger.info(
             "api_key_created",
             key_id=record.key_id,
-            tenant_id=record.tenant_id,
+            user_uuid=record.user_uuid,
             domain=record.domain,
             scopes=list(record.scopes),
         )
@@ -183,19 +183,19 @@ class ApiKeyStore:
         logger.warning(
             "api_key_revoked",
             key_id=key_id,
-            tenant_id=existing.tenant_id,
+            user_uuid=existing.user_uuid,
             domain=existing.domain,
             revoked_by=revoked_by,
         )
         return _to_record({**_to_document(existing), "status": API_KEY_STATUS_REVOKED})
 
-    async def list_for_tenant(
+    async def list_for_user(
         self,
-        tenant_id: str,
+        user_uuid: str,
         *,
         size: int = API_KEY_LIST_MAX_SIZE,
     ) -> list[ApiKeyRecord]:
-        """Every key issued to one tenant, newest first.
+        """Every key issued to one user, newest first.
 
         One query returns the whole page and the records are built from that
         response - there is no per-key lookup, because a list endpoint that
@@ -204,7 +204,7 @@ class ApiKeyStore:
         response = await self._store.search(
             index=self._index,
             body={
-                "query": {"bool": {"filter": [{"term": {"tenant_id": tenant_id}}]}},
+                "query": {"bool": {"filter": [{"term": {"user_uuid": user_uuid}}]}},
                 "size": min(size, API_KEY_LIST_MAX_SIZE),
                 "sort": [{"created_at": {"order": "desc"}}],
                 "track_total_hits": False,

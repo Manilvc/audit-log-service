@@ -7,7 +7,7 @@ service the way they already run the others.
     uv run audit-service worker            # ingest worker (separate process)
     uv run audit-service bootstrap         # apply cluster topology
     uv run audit-service generate-kek      # mint a PII master key
-    uv run audit-service verify --tenant X # integrity check from the shell
+    uv run audit-service verify --user-uuid X # integrity check from the shell
     uv run audit-service backfill --file F # replay legacy NDJSON into ingest
 """
 
@@ -143,11 +143,11 @@ def generate_kek() -> None:
 
 
 @cli.command()
-@click.option("--tenant", required=True, help="Tenant id to verify.")
+@click.option("--user-uuid", required=True, help="User uuid to verify.")
 @click.option("--chain", default=None, help="Specific chain id. Omit for all chains.")
 @click.option("--max-events", default=10_000, type=int)
-def verify(tenant: str, chain: str | None, max_events: int) -> None:
-    """Verify a tenant's hash chains and print the report.
+def verify(user_uuid: str, chain: str | None, max_events: int) -> None:
+    """Verify a user's hash chains and print the report.
 
     Intended for a scheduled job as much as for ad-hoc use: continuous
     verification is what turns tamper *evidence* into tamper *detection*. A
@@ -173,15 +173,15 @@ def verify(tenant: str, chain: str | None, max_events: int) -> None:
             operator = Principal(
                 subject="cli-operator",
                 actor_type=ActorType.SYSTEM,
-                tenant_id=tenant,
+                user_uuid=user_uuid,
                 scopes=frozenset({Scope.VERIFY, Scope.READ}),
             )
             report = await container.integrity.verify(
                 IntegrityVerifyRequest(chain_id=chain, max_events=max_events),
                 principal=operator,
-                tenant_id=tenant,
+                user_uuid=user_uuid,
             )
-            click.echo(f"tenant:           {report.tenant_id}")
+            click.echo(f"user uuid:        {report.user_uuid}")
             click.echo(f"chains checked:   {report.chains_checked}")
             click.echo(f"events verified:  {report.events_verified}")
             click.echo(f"intact:           {report.intact}")
@@ -215,14 +215,14 @@ def verify(tenant: str, chain: str | None, max_events: int) -> None:
     help="Audit API base URL (default: http://127.0.0.1:SERVER_PORT).",
 )
 @click.option("--api-key", default=None, help="Service API key (default: first SERVICE_API_KEYS).")
-@click.option("--tenant", default=None, help="Default tenant_id when a row omits it.")
+@click.option("--default-user-uuid", default=None, help="Default user_uuid when a row omits it.")
 @click.option("--batch-size", default=100, type=int, show_default=True)
 @click.option("--dry-run", is_flag=True, help="Map only; do not POST.")
 def backfill(
     ndjson_path: str,
     url: str | None,
     api_key: str | None,
-    tenant: str | None,
+    default_user_uuid: str | None,
     batch_size: int,
     dry_run: bool,
 ) -> None:
@@ -251,7 +251,7 @@ def backfill(
         api_key=key,
         batch_size=batch_size,
         dry_run=dry_run,
-        default_tenant=tenant,
+        default_user_uuid=default_user_uuid,
     )
     click.echo(f"read:      {stats.read}")
     click.echo(f"mapped:    {stats.mapped}")

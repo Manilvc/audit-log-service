@@ -1,7 +1,7 @@
 """Search-store data access for audit events.
 
 The only module that talks to the store about audit documents. Callers pass a
-`TenantScope`; they never pass an index name, so a wrong-tenant read is not
+`UserScope`; they never pass an index name, so a wrong-user read is not
 expressible through this API.
 
 Engine-agnostic: every call goes through `SearchBackend`, and the query bodies
@@ -19,11 +19,11 @@ from app.core.metrics import EVENTS_DUPLICATE
 from app.search.backends import SearchBackend, SearchNotFound
 from app.search.query import (
     AuditSearchFilter,
-    TenantScope,
+    UserScope,
     build_aggregation_body,
     build_search_body,
 )
-from app.search.routing import RouteDecision, TenantRouter
+from app.search.routing import RouteDecision, UserRouter
 
 logger = get_logger(__name__)
 
@@ -87,7 +87,7 @@ class AuditRepository:
     def __init__(
         self,
         backend: SearchBackend,
-        router: TenantRouter,
+        router: UserRouter,
         *,
         max_window_days: int,
         search_timeout: str,
@@ -115,7 +115,7 @@ class AuditRepository:
         operations: list[dict[str, Any]] = []
         writable: list[tuple[RouteDecision, dict[str, Any]]] = []
         for route, document in items:
-            mismatch = _tenant_mismatch(document, route)
+            mismatch = _user_uuid_mismatch(document, route)
             if mismatch is not None:
                 # Refused before it reaches the store. On a dedicated stream
                 # Elasticsearch would reject this itself via `constant_keyword`,
@@ -124,8 +124,8 @@ class AuditRepository:
                 # here, where every write passes, rather than left to whichever
                 # engine happens to be configured.
                 logger.error(
-                    "bulk_index_tenant_mismatch",
-                    route_tenant=route.tenant_id,
+                    "bulk_index_user_uuid_mismatch",
+                    route_user=route.user_uuid,
                     write_target=route.write_target,
                     event_id=_event_id_of(document),
                 )
@@ -202,7 +202,7 @@ class AuditRepository:
     # ------------------------------------------------------------------- read
     async def search(
         self,
-        scope: TenantScope,
+        scope: UserScope,
         criteria: AuditSearchFilter,
         *,
         size: int,
@@ -210,7 +210,7 @@ class AuditRepository:
         with_total: bool | int = False,
         source_fields: list[str] | None = None,
     ) -> SearchPage:
-        """Run a tenant-scoped search."""
+        """Run a user-scoped search."""
         targets, routing = self._resolve_read(scope)
         body = build_search_body(
             scope,
@@ -228,7 +228,7 @@ class AuditRepository:
             index=",".join(targets),
             body=body,
             routing=routing,
-            # A tenant promoted to a dedicated stream has no stream yet until
+            # A user promoted to a dedicated stream has no stream yet until
             # its first event, so a missing index is expected rather than an error.
             ignore_unavailable=True,
             # Correctness over availability: a partial result set in a
@@ -244,7 +244,7 @@ class AuditRepository:
 
     async def aggregate(
         self,
-        scope: TenantScope,
+        scope: UserScope,
         criteria: AuditSearchFilter,
         *,
         group_by: str,
@@ -276,17 +276,17 @@ class AuditRepository:
         )
         return dict(response.get("aggregations", {}))
 
-    async def get_event(self, scope: TenantScope, event_id: str) -> dict[str, Any] | None:
-        """Fetch one event by id, still tenant-filtered.
+    async def get_event(self, scope: UserScope, event_id: str) -> dict[str, Any] | None:
+        """Fetch one event by id, still user-filtered.
 
         Deliberately a search rather than a GET by document id: a GET would
-        return the document regardless of tenant, making an id-guessing attack a
-        cross-tenant read. The id is unique, so the cost difference is trivial.
+        return the document regardless of user, making an id-guessing attack a
+        cross-user read. The id is unique, so the cost difference is trivial.
         """
         targets, routing = self._resolve_read(scope)
         filters: list[dict[str, Any]] = [{"term": {"event.id": event_id}}]
-        if not scope.cross_tenant:
-            filters.append({"term": {"tenant.id": scope.tenant_id}})
+        if not scope.cross_user:
+            filters.append({"term": {"user.uuid": scope.user_uuid}})
 
         response = await self._store.search(
             index=",".join(targets),
@@ -302,7 +302,7 @@ class AuditRepository:
         return dict(hits[0]["_source"]) if hits else None
 
     # ------------------------------------------------- export / point in time
-    async def open_pit(self, scope: TenantScope, *, keep_alive: str = "5m") -> str:
+    async def open_pit(self, scope: UserScope, *, keep_alive: str = "5m") -> str:
         """Open a point-in-time for a consistent export.
 
         Without a PIT, a long export paginating with `search_after` sees new
@@ -314,7 +314,7 @@ class AuditRepository:
 
     async def search_pit(
         self,
-        scope: TenantScope,
+        scope: UserScope,
         criteria: AuditSearchFilter,
         *,
         pit_id: str,
@@ -358,7 +358,7 @@ class AuditRepository:
         self,
         *,
         chain_id: str,
-        tenant_id: str,
+        user_uuid: str,
         start_seq: int,
         limit: int,
     ) -> list[dict[str, Any]]:
@@ -367,7 +367,7 @@ class AuditRepository:
         Sorted by `integrity.seq` rather than `@timestamp`: the chain's order is
         its sequence, and two events can share a millisecond timestamp.
         """
-        scope = TenantScope(tenant_id=tenant_id)
+        scope = UserScope(user_uuid=user_uuid)
         targets, routing = self._resolve_read(scope)
         response = await self._store.search(
             index=",".join(targets),
@@ -375,7 +375,7 @@ class AuditRepository:
                 "query": {
                     "bool": {
                         "filter": [
-                            {"term": {"tenant.id": tenant_id}},
+                            {"term": {"user.uuid": user_uuid}},
                             {"term": {"integrity.chain_id": chain_id}},
                             {"range": {"integrity.seq": {"gte": start_seq}}},
                         ]
@@ -391,14 +391,14 @@ class AuditRepository:
         )
         return [dict(hit["_source"]) for hit in response.get("hits", {}).get("hits", [])]
 
-    async def count_by_key_id(self, *, tenant_id: str, key_id: str) -> int:
+    async def count_by_key_id(self, *, user_uuid: str, key_id: str) -> int:
         """How many documents are protected by one PII key.
 
         Reported back on an erasure request so the DSR response can state how
         many records were affected - a documentation requirement under both
         GDPR Art. 19 and DPDP.
         """
-        scope = TenantScope(tenant_id=tenant_id)
+        scope = UserScope(user_uuid=user_uuid)
         targets, routing = self._resolve_read(scope)
         return await self._store.count(
             index=",".join(targets),
@@ -406,7 +406,7 @@ class AuditRepository:
                 "query": {
                     "bool": {
                         "filter": [
-                            {"term": {"tenant.id": tenant_id}},
+                            {"term": {"user.uuid": user_uuid}},
                             {"term": {"pii.key_id": key_id}},
                         ]
                     }
@@ -417,12 +417,12 @@ class AuditRepository:
         )
 
     # ------------------------------------------------------------------ helpers
-    def _resolve_read(self, scope: TenantScope) -> tuple[tuple[str, ...], str | None]:
+    def _resolve_read(self, scope: UserScope) -> tuple[tuple[str, ...], str | None]:
         """Translate a scope into concrete read targets and a routing key."""
-        if scope.cross_tenant:
-            # No routing key: a cross-tenant read genuinely must fan out.
-            return self._router.cross_tenant_read_targets(), None
-        decision = self._router.resolve(scope.tenant_id)
+        if scope.cross_user:
+            # No routing key: a cross-user read genuinely must fan out.
+            return self._router.cross_user_read_targets(), None
+        decision = self._router.resolve(scope.user_uuid)
         return decision.read_targets, decision.routing_key
 
 
@@ -448,11 +448,11 @@ def _to_page(response: Any) -> SearchPage:
     )
 
 
-def _tenant_mismatch(document: dict[str, Any], route: RouteDecision) -> str | None:
+def _user_uuid_mismatch(document: dict[str, Any], route: RouteDecision) -> str | None:
     """Why this document must not be written to this route, or None if it may.
 
     The one invariant the whole isolation model rests on: a document lands in
-    the stream belonging to the tenant it names. Everything else - the
+    the stream belonging to the user it names. Everything else - the
     mandatory query filter, dedicated streams, `constant_keyword` - protects
     reads or depends on the engine. This protects the write, on every engine.
 
@@ -460,14 +460,14 @@ def _tenant_mismatch(document: dict[str, Any], route: RouteDecision) -> str | No
     phrased to be classified as permanent by `worker._is_permanent` and
     dead-lettered for a human rather than retried forever.
     """
-    tenant = document.get("tenant")
-    named = tenant.get("id") if isinstance(tenant, dict) else None
+    user = document.get("user")
+    named = user.get("uuid") if isinstance(user, dict) else None
     if not named:
-        return "tenant_mismatch: document carries no tenant.id"
-    if str(named) != route.tenant_id:
+        return "user_uuid_mismatch: document carries no user.uuid"
+    if str(named) != route.user_uuid:
         return (
-            f"tenant_mismatch: document tenant.id={named!r} does not belong to "
-            f"the route for {route.tenant_id!r} ({route.write_target})"
+            f"user_uuid_mismatch: document user.uuid={named!r} does not belong to "
+            f"the route for {route.user_uuid!r} ({route.write_target})"
         )
     return None
 

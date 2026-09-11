@@ -21,7 +21,7 @@ import pytest
 from app.core.integrity import GENESIS_HASH
 from app.queue.chain import ChainAllocator
 
-CHAIN = "tenant-a:3"
+CHAIN = "user-a:3"
 
 
 @pytest.fixture
@@ -44,7 +44,7 @@ class FakeLedger:
         self.calls = 0
 
     async def fetch_chain_slice(
-        self, *, chain_id: str, tenant_id: str, start_seq: int, limit: int
+        self, *, chain_id: str, user_uuid: str, start_seq: int, limit: int
     ) -> list[dict[str, Any]]:
         self.calls += 1
         matching = [
@@ -99,9 +99,9 @@ async def test_commit_publishes_the_new_head(allocator: ChainAllocator) -> None:
 
 
 async def test_chains_are_independent(allocator: ChainAllocator) -> None:
-    """A tenant's sequencing must not be affected by another tenant's volume."""
-    await allocator.reserve("tenant-a:0", 100)
-    other = await allocator.reserve("tenant-b:0", 1)
+    """A user's sequencing must not be affected by another user's volume."""
+    await allocator.reserve("user-a:0", 100)
+    other = await allocator.reserve("user-b:0", 1)
     assert other.start_seq == 0
 
 
@@ -171,7 +171,7 @@ async def test_cold_chain_is_rebuilt_from_the_ledger(
     """
     ledger = FakeLedger([_ledger_doc(seq) for seq in range(42)])
 
-    recovered = await allocator.resync_from_ledger(CHAIN, tenant_id="tenant-a", ledger=ledger)
+    recovered = await allocator.resync_from_ledger(CHAIN, user_uuid="user-a", ledger=ledger)
     assert recovered == (41, "hash-41")
 
     reservation = await allocator.reserve(CHAIN, 1)
@@ -183,9 +183,7 @@ async def test_genuinely_new_chain_resyncs_to_nothing(
     allocator: ChainAllocator,
 ) -> None:
     """An empty ledger means a new chain, not a lost one."""
-    recovered = await allocator.resync_from_ledger(
-        CHAIN, tenant_id="tenant-a", ledger=FakeLedger([])
-    )
+    recovered = await allocator.resync_from_ledger(CHAIN, user_uuid="user-a", ledger=FakeLedger([]))
     assert recovered is None
     assert (await allocator.reserve(CHAIN, 1)).start_seq == 0
 
@@ -195,10 +193,10 @@ async def test_resync_is_performed_once_per_chain_per_process(
 ) -> None:
     """The ledger walk is a cold path and must not run on every batch."""
     ledger = FakeLedger([_ledger_doc(seq) for seq in range(5)])
-    await allocator.resync_from_ledger(CHAIN, tenant_id="tenant-a", ledger=ledger)
+    await allocator.resync_from_ledger(CHAIN, user_uuid="user-a", ledger=ledger)
     calls_after_first = ledger.calls
 
-    await allocator.resync_from_ledger(CHAIN, tenant_id="tenant-a", ledger=ledger)
+    await allocator.resync_from_ledger(CHAIN, user_uuid="user-a", ledger=ledger)
     assert ledger.calls == calls_after_first
 
 
@@ -211,14 +209,14 @@ async def test_resync_walks_past_the_first_page(
     sequence numbers.
     """
     ledger = FakeLedger([_ledger_doc(seq) for seq in range(2500)])
-    recovered = await allocator.resync_from_ledger(CHAIN, tenant_id="tenant-a", ledger=ledger)
+    recovered = await allocator.resync_from_ledger(CHAIN, user_uuid="user-a", ledger=ledger)
     assert recovered == (2499, "hash-2499")
 
 
 async def test_peek_reports_nothing_for_an_unknown_chain(
     allocator: ChainAllocator,
 ) -> None:
-    assert await allocator.peek("tenant-z:0") is None
+    assert await allocator.peek("user-z:0") is None
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +232,7 @@ async def test_forced_resync_rewalks_an_already_reconciled_chain(
     return the stale cached value and the chain would stay broken.
     """
     ledger = FakeLedger([_ledger_doc(seq) for seq in range(3)])
-    first = await allocator.resync_from_ledger(CHAIN, tenant_id="tenant-a", ledger=ledger)
+    first = await allocator.resync_from_ledger(CHAIN, user_uuid="user-a", ledger=ledger)
     assert first == (2, "hash-2")
     calls_after_first = ledger.calls
 
@@ -242,13 +240,13 @@ async def test_forced_resync_rewalks_an_already_reconciled_chain(
     ledger.documents = [_ledger_doc(seq) for seq in range(8)]
 
     # Without force, the memo short-circuits and the stale head is returned.
-    memoised = await allocator.resync_from_ledger(CHAIN, tenant_id="tenant-a", ledger=ledger)
+    memoised = await allocator.resync_from_ledger(CHAIN, user_uuid="user-a", ledger=ledger)
     assert ledger.calls == calls_after_first
     assert memoised == (2, "hash-2")
 
     # With force, the ledger is re-walked and the true tail is adopted.
     forced = await allocator.resync_from_ledger(
-        CHAIN, tenant_id="tenant-a", ledger=ledger, force=True
+        CHAIN, user_uuid="user-a", ledger=ledger, force=True
     )
     assert ledger.calls > calls_after_first
     assert forced == (7, "hash-7")

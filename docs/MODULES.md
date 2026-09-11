@@ -24,7 +24,7 @@ Authoritative detail lives in each file's module docstring.
 | `app.api.v1` | Versioned routes under `/v1` |
 | `app.api.v1.events` | Ingest, search, get, aggregate, export |
 | `app.api.v1.compliance` | Integrity verify + crypto-shred erasure |
-| `app.api.v1.ops` | Health, metrics, dedicate-tenant admin |
+| `app.api.v1.ops` | Health, metrics, dedicate-user admin |
 
 ## `app.archive`
 
@@ -84,7 +84,7 @@ Authoritative detail lives in each file's module docstring.
 | `app.search.bootstrap` | Idempotent ILM / templates / streams / keyring |
 | `app.search.mappings` | Index templates, ILM policy, field mappings |
 | `app.search.routing` | Hybrid shared vs dedicated stream resolution |
-| `app.search.query` | Tenant-scoped DSL builder (isolation boundary) |
+| `app.search.query` | User-scoped DSL builder (isolation boundary) |
 | `app.search.repository` | Bulk write, search, PIT export, aggregations |
 | `app.search.keyring` | Wrapped DEK store for crypto-shredding |
 
@@ -93,7 +93,7 @@ Authoritative detail lives in each file's module docstring.
 | Module | Description |
 |---|---|
 | `app.services` | Application use-cases |
-| `app.services.ingest_service` | Validate, resolve tenant, enqueue |
+| `app.services.ingest_service` | Validate, resolve user, enqueue |
 | `app.services.query_service` | Scoped reads + decrypt + audit-of-audit |
 | `app.services.compliance_service` | Chain verify + subject erasure |
 

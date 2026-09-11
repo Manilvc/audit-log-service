@@ -254,7 +254,7 @@ class Action(StrEnum):
     AUDIT_EXPORT = "audit_log.export"
     AUDIT_INTEGRITY_VERIFY = "audit_log.integrity_verify"
     AUDIT_ERASURE_REQUEST = "audit_log.erasure_request"
-    AUDIT_CROSS_TENANT_ACCESS = "audit_log.cross_tenant_access"
+    AUDIT_CROSS_USER_ACCESS = "audit_log.cross_user_access"
 
     UNKNOWN = "unknown"
 
@@ -273,8 +273,8 @@ class Scope(StrEnum):
     ERASE = "audit:erase"
     VERIFY = "audit:verify"
     ADMIN = "audit:admin"
-    CROSS_TENANT = "audit:cross_tenant"
-    """Query across tenant boundaries. Break-glass only; always self-audited."""
+    CROSS_USER = "audit:cross_user"
+    """Query across user boundaries. Break-glass only; always self-audited."""
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +307,7 @@ DEFAULT_SEVERITY: dict[Action, Severity] = {
     Action.CONSENT_WITHDRAW: Severity.MEDIUM,
     Action.AUDIT_EXPORT: Severity.HIGH,
     Action.AUDIT_ERASURE_REQUEST: Severity.CRITICAL,
-    Action.AUDIT_CROSS_TENANT_ACCESS: Severity.CRITICAL,
+    Action.AUDIT_CROSS_USER_ACCESS: Severity.CRITICAL,
 }
 
 # Category inferred from the action prefix when the emitter omits it. Keeps the

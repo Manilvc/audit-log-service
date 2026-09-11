@@ -1,4 +1,4 @@
-"""Operational endpoints: health probes, metrics and tenant administration.
+"""Operational endpoints: health probes, metrics and user administration.
 
 Probes and ``/metrics`` are mounted *outside* the versioned ``/v1`` prefix so
 orchestrator config does not churn with API versions. ``/metrics`` is
@@ -10,9 +10,9 @@ unauthenticated and must stay unreachable from the public internet — see
     the queue absorbs writes), and a full dependency report for dashboards.
 ``GET /metrics``
     Prometheus scrape endpoint (process defaults + ingest pipeline counters).
-``POST /v1/audit/admin/tenants/{id}/dedicate`` (``audit:admin``)
+``POST /v1/audit/admin/users/{id}/dedicate`` (``audit:admin``)
     Provision a dedicated data stream for a high-volume or contractually
-    isolated tenant. Non-destructive: reads still cover the shared stream.
+    isolated user. Non-destructive: reads still cover the shared stream.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from app.core.logging import get_logger
 from app.core.metrics import QUEUE_DEAD_LETTER_TOTAL, QUEUE_DEPTH
 from app.core.responses import ORJSONResponse, success
 from app.domain.enums import Scope
-from app.search.bootstrap import ensure_tenant_stream
+from app.search.bootstrap import ensure_user_stream
 
 logger = get_logger(__name__)
 
@@ -122,7 +122,7 @@ async def health(request: Request, settings: SettingsDep) -> ORJSONResponse:
     }
     report["pii_encryption"] = container.cipher.enabled
     report["retention_days"] = settings.RETENTION_DAYS
-    report["dedicated_tenants"] = len(settings.dedicated_tenant_set)
+    report["dedicated_users"] = len(settings.dedicated_user_set)
 
     return success(report, message="Health report.")
 
@@ -139,42 +139,42 @@ async def metrics() -> Response:
 
 
 @admin_router.post(
-    "/tenants/{tenant_id}/dedicate",
-    summary="Promote a tenant to a dedicated data stream",
+    "/users/{user_uuid}/dedicate",
+    summary="Promote a user to a dedicated data stream",
 )
-async def dedicate_tenant(
-    tenant_id: Annotated[str, Path(max_length=64)],
+async def dedicate_user(
+    user_uuid: Annotated[str, Path(max_length=64)],
     request: Request,
     principal: PrincipalDep,
     settings: SettingsDep,
 ) -> ORJSONResponse:
-    """Provision a dedicated data stream for a high-volume tenant.
+    """Provision a dedicated data stream for a high-volume user.
 
     Creating the stream is done here rather than lazily at ingest time on
     purpose: an index creation puts cluster-state latency in front of an audit
     write, and a cluster-state timeout would drop evidence.
 
-    This only creates the stream. Routing follows `DEDICATED_TENANTS`, so the
-    tenant must also be added to that setting and the service restarted -
+    This only creates the stream. Routing follows `DEDICATED_USERS`, so the
+    user must also be added to that setting and the service restarted -
     deliberately a config change, so index topology is reviewable in version
     control rather than mutable at runtime. Events already in the shared stream
     stay readable; the router reads both.
     """
     principal.require(Scope.ADMIN)
     container = request.app.state.container
-    stream = await ensure_tenant_stream(container.search, container.router, tenant_id)
+    stream = await ensure_user_stream(container.search, container.router, user_uuid)
 
-    already_routed = tenant_id in settings.dedicated_tenant_set
+    already_routed = user_uuid in settings.dedicated_user_set
     logger.warning(
-        "tenant_dedicated_stream_provisioned",
-        tenant_id=tenant_id,
+        "user_dedicated_stream_provisioned",
+        user_uuid=user_uuid,
         stream=stream,
         routing_active=already_routed,
         by=principal.audit_identity,
     )
     return success(
         {
-            "tenant_id": tenant_id,
+            "user_uuid": user_uuid,
             "stream": stream,
             "routing_active": already_routed,
         },
@@ -182,7 +182,7 @@ async def dedicate_tenant(
             "Dedicated stream ready and routing is active."
             if already_routed
             else (
-                f"Stream {stream} created. Add {tenant_id} to DEDICATED_TENANTS "
+                f"Stream {stream} created. Add {user_uuid} to DEDICATED_USERS "
                 "and restart the service to route writes to it."
             )
         ),

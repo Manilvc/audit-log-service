@@ -34,7 +34,7 @@ from app.search.mappings import (
     keyring_index_settings,
     shared_index_template,
 )
-from app.search.routing import TenantRouter
+from app.search.routing import UserRouter
 
 logger = get_logger(__name__)
 
@@ -72,7 +72,7 @@ def api_key_index_name(settings: Settings) -> str:
 async def bootstrap_cluster(
     backend: SearchBackend,
     settings: Settings,
-    router: TenantRouter,
+    router: UserRouter,
 ) -> dict[str, Any]:
     """Apply the retention policy, templates, keyring index and data streams.
 
@@ -149,7 +149,7 @@ async def bootstrap_cluster(
     created: list[str] = []
     for stream in (
         router.shared_pattern(),
-        *(router.dedicated_stream_name(tenant) for tenant in sorted(settings.dedicated_tenant_set)),
+        *(router.dedicated_stream_name(user) for user in sorted(settings.dedicated_user_set)),
     ):
         if await _ensure_data_stream(backend, stream):
             created.append(stream)
@@ -197,18 +197,18 @@ async def _ensure_data_stream(backend: SearchBackend, name: str) -> bool:
         raise
 
 
-async def ensure_tenant_stream(
+async def ensure_user_stream(
     backend: SearchBackend,
-    router: TenantRouter,
-    tenant_id: str,
+    router: UserRouter,
+    user_uuid: str,
 ) -> str:
-    """Provision a dedicated stream when a tenant is promoted.
+    """Provision a dedicated stream when a user is promoted.
 
     Called from the admin endpoint rather than at ingest time: creating an index
     on the write path would put cluster-state latency in front of an audit
     write, and a cluster-state timeout would then drop evidence.
     """
-    validated = router.validate_tenant_id(tenant_id)
+    validated = router.validate_user_uuid(user_uuid)
     stream = router.dedicated_stream_name(validated)
     await _ensure_data_stream(backend, stream)
     return stream

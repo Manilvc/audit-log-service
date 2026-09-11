@@ -36,12 +36,12 @@ audit/
 │   │   └── v1/
 │   │       ├── events.py       ingest, search, get, aggregate, export
 │   │       ├── compliance.py   integrity verify, subject erasure
-│   │       └── ops.py          health probes, /metrics, tenant admin
+│   │       └── ops.py          health probes, /metrics, user admin
 │   │
 │   ├── schemas/api.py          ── wire contracts ── request/response models
 │   │
 │   ├── services/               ── use-cases ──
-│   │   ├── ingest_service.py   validate → resolve tenant → enqueue
+│   │   ├── ingest_service.py   validate → resolve user → enqueue
 │   │   ├── query_service.py    scope → search → decrypt → audit-the-audit
 │   │   └── compliance_service.py  chain verification, crypto-shred erasure
 │   │
@@ -54,8 +54,8 @@ audit/
 │   │   ├── client.py           hardened AsyncElasticsearch factory
 │   │   ├── mappings.py         ILM policy, index templates, field mappings
 │   │   ├── bootstrap.py        idempotent provisioning
-│   │   ├── routing.py          tenant → data stream (shared vs dedicated)
-│   │   ├── query.py            DSL builder — the tenant isolation boundary
+│   │   ├── routing.py          user → data stream (shared vs dedicated)
+│   │   ├── query.py            DSL builder — the user isolation boundary
 │   │   ├── repository.py       bulk write, search, PIT, aggregations
 │   │   └── keyring.py          wrapped-DEK store
 │   │
@@ -126,7 +126,7 @@ from `app.domain`, the change is in the wrong file.
 | **Add a config setting** | `core/config.py` → `.env.example` | Add a prod-hardening check in `_enforce_production_hardening` if an unsafe value is possible |
 | **Change the ingest pipeline** | `queue/worker.py` | Read the module docstring first: the write ordering and the lease rules are load-bearing, not stylistic |
 | **Change index topology** | `search/mappings.py` → `search/bootstrap.py` | Template names derive from `INDEX_PREFIX`. Re-applying a template whose pattern no longer matches a live data stream is rejected by ES |
-| **Change tenant routing** | `search/routing.py` | `TenantRouter` is pure and cheap. Partition assignment must stay stable — the hash chain depends on it |
+| **Change user routing** | `search/routing.py` | `UserRouter` is pure and cheap. Partition assignment must stay stable — the hash chain depends on it |
 | **Add a scope / change authz** | `domain/enums.py` (`Scope`) → `core/security/auth.py` | Then enforce with `principal.require(...)` at the service layer, not the route |
 | **Add a metric** | `core/metrics.py` | Increment on the hot path; poll gauges in `api/v1/ops.py` |
 | **Add an operational command** | `cli.py` | Import inside the command body so `--help` stays fast and does not build a container |
@@ -136,10 +136,10 @@ from `app.domain`, the change is in the wrong file.
 
 ## The three files to read before changing anything
 
-1. **`app/search/query.py`** — the tenant isolation boundary. The cluster runs
+1. **`app/search/query.py`** — the user isolation boundary. The cluster runs
    the Basic licence, so there is no document-level security. If a query leaves
-   this file without a tenant constraint, one customer reads another's audit
-   trail. `tests/unit/test_tenant_isolation.py` asserts the invariant over every
+   this file without a user constraint, one customer reads another's audit
+   trail. `tests/unit/test_user_isolation.py` asserts the invariant over every
    filter permutation.
 
 2. **`app/queue/worker.py`** — the write ordering (`reserve → hash → ES →
@@ -174,10 +174,10 @@ come up and buffer writes.
 | `container.py` | Constructing every collaborator, once | Business logic |
 | `deps.py` | Credential → `Principal`; container access | Authorisation decisions |
 | `router.py` | The complete route inventory | Handlers |
-| `v1/*.py` | HTTP shape: status codes, headers, streaming | Scope checks, tenant resolution, ES access |
+| `v1/*.py` | HTTP shape: status codes, headers, streaming | Scope checks, user resolution, ES access |
 
 Routes stay thin. They call a service and wrap the result in `success(...)`.
-Authorisation and tenant scoping belong in the service layer, so the CLI and the
+Authorisation and user scoping belong in the service layer, so the CLI and the
 worker get the same checks without going through HTTP.
 
 ### `app/schemas/api.py`
@@ -190,7 +190,7 @@ missing audit field discovered during an incident.
 
 ### `app/services/`
 
-Where authorisation, tenant scoping and orchestration live. Each service takes
+Where authorisation, user scoping and orchestration live. Each service takes
 its collaborators by constructor injection, so tests substitute fakes without
 patching module globals.
 
@@ -205,11 +205,11 @@ registries that three separate subsystems read.
 
 `mappings.py` explains *why* each mapping choice was made — `dynamic: strict`,
 `flattened` for free-form subtrees, `constant_keyword` for dedicated-stream
-tenant ids, `index.sort` for early termination. Read those comments before
+user ids, `index.sort` for early termination. Read those comments before
 changing a field type; several are load-bearing for either isolation or cost.
 
-`query.py` builds DSL from a typed filter and takes a `TenantScope`. There is no
-code path that omits the tenant constraint.
+`query.py` builds DSL from a typed filter and takes a `UserScope`. There is no
+code path that omits the user constraint.
 
 `repository.py` is the only module that talks to the cluster about audit
 documents. Callers pass a scope, never an index name.
@@ -237,13 +237,13 @@ rather than starting and hoping.
 
 | Test file | Covers |
 |---|---|
-| `unit/test_tenant_isolation.py` | `search/query.py`, `search/routing.py` — 86 tests |
+| `unit/test_user_isolation.py` | `search/query.py`, `search/routing.py` — 86 tests |
 | `unit/test_integrity.py` | `core/integrity.py` — one test per attack class |
 | `unit/test_crypto_shredding.py` | `core/security/crypto.py` |
 | `unit/test_auth.py` | `core/security/auth.py` |
-| `unit/test_identity_headers.py` | `api/deps.py` — tenant, issuer and acting-user headers |
+| `unit/test_identity_headers.py` | `api/deps.py` — user, issuer and acting-user headers |
 | `unit/test_search_backends.py` | `search/backends/elastic.py` — the port contract and ILM |
-| `unit/test_opensearch_backend.py` | `search/backends/opensearch.py`, ISM, and the tenant write guard |
+| `unit/test_opensearch_backend.py` | `search/backends/opensearch.py`, ISM, and the user write guard |
 | `unit/test_docs_pages.py` | `main.py` — both documentation pages under every mount |
 | `unit/test_chain_allocator.py` | `queue/chain.py` incl. concurrency and leases |
 | `unit/test_ingest_and_schemas.py` | `services/ingest_service.py`, `schemas/api.py` |

@@ -18,7 +18,7 @@ from app.core.security.crypto import (
 )
 from tests.conftest import InMemoryKeyRing
 
-TENANT = "tenant-a"
+USER = "user-a"
 SUBJECT = "u-42"
 
 
@@ -26,7 +26,7 @@ def _document() -> dict:
     return {
         "@timestamp": "2026-08-27T10:00:00+00:00",
         "event": {"id": "evt-1", "action": "user.login", "outcome": "success"},
-        "tenant": {"id": TENANT},
+        "user": {"uuid": USER},
         "actor": {
             "id": SUBJECT,
             "type": "user",
@@ -46,7 +46,7 @@ async def test_pii_is_removed_from_indexed_fields_and_moved_to_ciphertext(
 ) -> None:
     """PII must not remain anywhere an index could reach it."""
     result = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     document = result.document
 
@@ -72,13 +72,13 @@ async def test_pii_is_removed_from_indexed_fields_and_moved_to_ciphertext(
 async def test_non_pii_fields_are_untouched(cipher: PiiCipher) -> None:
     """The structural evidence an auditor needs stays queryable."""
     result = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     document = result.document
     assert document["event"]["action"] == "user.login"
     assert document["event"]["outcome"] == "success"
     assert document["actor"]["id"] == SUBJECT
-    assert document["tenant"]["id"] == TENANT
+    assert document["user"]["uuid"] == USER
     assert document["source"]["country_code"] == "IN"
 
 
@@ -87,7 +87,7 @@ async def test_ip_is_truncated_to_a_network_prefix_in_the_clear(
 ) -> None:
     """Minimisation: keep the network signal, drop the identifying address."""
     result = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     assert result.document["source"]["ip_prefix"] == "203.0.113.0/24"
 
@@ -96,7 +96,7 @@ async def test_ipv6_is_truncated_to_a_48_prefix(cipher: PiiCipher) -> None:
     document = _document()
     document["source"]["ip"] = "2001:db8:1234:5678::1"
     result = await cipher.encrypt_document(
-        document, tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        document, user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     assert result.document["source"]["ip_prefix"] == "2001:db8:1234::/48"
 
@@ -104,7 +104,7 @@ async def test_ipv6_is_truncated_to_a_48_prefix(cipher: PiiCipher) -> None:
 async def test_round_trip_restores_the_original_values(cipher: PiiCipher) -> None:
     original = _document()
     result = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     result.document["pii"] = {"key_id": result.key_id}
 
@@ -123,10 +123,10 @@ async def test_no_encryption_when_there_is_no_data_subject(cipher: PiiCipher) ->
     """
     document = {
         "event": {"id": "evt-2", "action": "session.idle_expired"},
-        "tenant": {"id": TENANT},
+        "user": {"uuid": USER},
     }
     result = await cipher.encrypt_document(
-        document, tenant_id=TENANT, event_id="evt-2", subject_id=None
+        document, user_uuid=USER, event_id="evt-2", subject_id=None
     )
     assert result.key_id is None
     assert CIPHERTEXT_FIELD not in result.document
@@ -137,21 +137,21 @@ async def test_no_encryption_when_there_is_no_data_subject(cipher: PiiCipher) ->
 # ---------------------------------------------------------------------------
 def test_key_id_is_deterministic_per_subject(cipher: PiiCipher) -> None:
     """All events about one subject share a key, so one erasure covers them."""
-    assert cipher.subject_key_id(TENANT, SUBJECT) == cipher.subject_key_id(TENANT, SUBJECT)
+    assert cipher.subject_key_id(USER, SUBJECT) == cipher.subject_key_id(USER, SUBJECT)
 
 
-def test_key_id_is_tenant_scoped(cipher: PiiCipher) -> None:
-    """Identical subject ids in two tenants must never share a key.
+def test_key_id_is_user_scoped(cipher: PiiCipher) -> None:
+    """Identical subject ids in two users must never share a key.
 
-    Otherwise erasing a subject in one tenant would destroy another tenant's
+    Otherwise erasing a subject in one user would destroy another user's
     audit data.
     """
-    assert cipher.subject_key_id("tenant-a", SUBJECT) != cipher.subject_key_id("tenant-b", SUBJECT)
+    assert cipher.subject_key_id("user-a", SUBJECT) != cipher.subject_key_id("user-b", SUBJECT)
 
 
 def test_key_id_does_not_leak_the_subject_id(cipher: PiiCipher) -> None:
     """A keyed HMAC, so reading the keyring index does not enumerate users."""
-    key_id = cipher.subject_key_id(TENANT, "alice@example.com")
+    key_id = cipher.subject_key_id(USER, "alice@example.com")
     assert "alice" not in key_id
     assert "example.com" not in key_id
 
@@ -166,7 +166,7 @@ async def test_ciphertext_cannot_be_moved_between_fields(cipher: PiiCipher) -> N
     ciphertexts, or move a value into a field with different access rules.
     """
     result = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     document = result.document
     document["pii"] = {"key_id": result.key_id}
@@ -180,7 +180,7 @@ async def test_ciphertext_cannot_be_moved_between_fields(cipher: PiiCipher) -> N
 async def test_ciphertext_cannot_be_moved_between_events(cipher: PiiCipher) -> None:
     """AAD binds a ciphertext to its event id."""
     first = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     document = first.document
     document["pii"] = {"key_id": first.key_id}
@@ -195,7 +195,7 @@ async def test_one_corrupt_field_does_not_sink_the_document(
 ) -> None:
     """The remaining fields are still valid evidence."""
     result = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     document = result.document
     document["pii"] = {"key_id": result.key_id}
@@ -218,12 +218,12 @@ async def test_shredding_makes_pii_unrecoverable_but_keeps_the_record(
     what, when, with what outcome - survives as audit evidence.
     """
     result = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     document = result.document
     document["pii"] = {"key_id": result.key_id}
 
-    key_id, destroyed = await cipher.shred_subject(TENANT, SUBJECT)
+    key_id, destroyed = await cipher.shred_subject(USER, SUBJECT)
     assert destroyed is True
     assert key_id == result.key_id
     assert key_id not in keyring.keys
@@ -247,12 +247,12 @@ async def test_shredding_does_not_break_the_hash_chain(cipher: PiiCipher) -> Non
     Verification must still succeed years after an erasure - otherwise honouring
     a DSR would destroy the tamper evidence for every other record in the chain.
     """
-    chain_id = "tenant-a:0"
+    chain_id = "user-a:0"
     documents = []
     prev = GENESIS_HASH
     for seq in range(3):
         result = await cipher.encrypt_document(
-            _document(), tenant_id=TENANT, event_id=f"evt-{seq}", subject_id=SUBJECT
+            _document(), user_uuid=USER, event_id=f"evt-{seq}", subject_id=SUBJECT
         )
         document = result.document
         document["event"]["id"] = f"evt-{seq}"
@@ -276,7 +276,7 @@ async def test_shredding_does_not_break_the_hash_chain(cipher: PiiCipher) -> Non
 
     assert verify_chain(chain_id, documents, expect_contiguous_from=0).intact
 
-    await cipher.shred_subject(TENANT, SUBJECT)
+    await cipher.shred_subject(USER, SUBJECT)
 
     # The stored bytes are untouched by shredding, so the chain still verifies.
     assert verify_chain(chain_id, documents, expect_contiguous_from=0).intact
@@ -284,11 +284,9 @@ async def test_shredding_does_not_break_the_hash_chain(cipher: PiiCipher) -> Non
 
 async def test_repeated_erasure_is_idempotent(cipher: PiiCipher) -> None:
     """A resubmitted DSR must not be an error."""
-    await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
-    )
-    _, first = await cipher.shred_subject(TENANT, SUBJECT)
-    _, second = await cipher.shred_subject(TENANT, SUBJECT)
+    await cipher.encrypt_document(_document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT)
+    _, first = await cipher.shred_subject(USER, SUBJECT)
+    _, second = await cipher.shred_subject(USER, SUBJECT)
     assert first is True
     assert second is False
 
@@ -301,14 +299,12 @@ async def test_shredded_key_cannot_be_recreated_for_new_writes(
     If it did, a later event would create a fresh key under the same key id and
     the erasure would be quietly undone for all subsequent records.
     """
-    await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
-    )
-    await cipher.shred_subject(TENANT, SUBJECT)
+    await cipher.encrypt_document(_document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT)
+    await cipher.shred_subject(USER, SUBJECT)
 
     with pytest.raises(KeyShreddedError):
         await cipher.encrypt_document(
-            _document(), tenant_id=TENANT, event_id="evt-2", subject_id=SUBJECT
+            _document(), user_uuid=USER, event_id="evt-2", subject_id=SUBJECT
         )
 
 
@@ -317,18 +313,18 @@ async def test_other_subjects_are_unaffected_by_an_erasure(
 ) -> None:
     """Erasure is surgical: one subject, not a blast radius."""
     alice = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id="u-42"
+        _document(), user_uuid=USER, event_id="evt-1", subject_id="u-42"
     )
     bob_doc = _document()
     bob_doc["actor"]["id"] = "u-99"
     bob_doc["actor"]["email"] = "bob@example.com"
     bob = await cipher.encrypt_document(
-        bob_doc, tenant_id=TENANT, event_id="evt-2", subject_id="u-99"
+        bob_doc, user_uuid=USER, event_id="evt-2", subject_id="u-99"
     )
     bob.document["pii"] = {"key_id": bob.key_id}
     alice.document["pii"] = {"key_id": alice.key_id}
 
-    await cipher.shred_subject(TENANT, "u-42")
+    await cipher.shred_subject(USER, "u-42")
 
     assert (await cipher.decrypt_document(alice.document, event_id="evt-1"))["actor"][
         "email"
@@ -362,7 +358,7 @@ async def test_wrong_kek_cannot_unwrap_an_existing_key() -> None:
     keyring = InMemoryKeyRing()
     original = PiiCipher(PiiCipher.generate_master_kek(), keyring=keyring)
     result = await original.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
 
     impostor = PiiCipher(PiiCipher.generate_master_kek(), keyring=keyring)
@@ -374,7 +370,7 @@ async def test_disabled_cipher_is_a_pass_through() -> None:
     """For a deployment with no personal data in scope."""
     cipher = PiiCipher("", keyring=InMemoryKeyRing(), enabled=False)
     result = await cipher.encrypt_document(
-        _document(), tenant_id=TENANT, event_id="evt-1", subject_id=SUBJECT
+        _document(), user_uuid=USER, event_id="evt-1", subject_id=SUBJECT
     )
     assert result.key_id is None
     assert result.document["actor"]["email"] == "alice@example.com"

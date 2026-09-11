@@ -1,5 +1,5 @@
 # One-shot: applies the Elasticsearch topology (ILM policy, index templates,
-# data streams, tenant keyring) before the API and worker first start.
+# data streams, user keyring) before the API and worker first start.
 #
 # Idempotent — safe to re-run after an upgrade that changes mappings.
 #

@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     # The only credential this service accepts. A list, so keys can be rotated
     # with an overlap window (old + new both valid during the cutover).
     #
-    # A valid key carries every audit scope, including erase and cross-tenant,
+    # A valid key carries every audit scope, including erase and cross-user,
     # so it is a high-value secret: keep it distinct per environment and never
     # hand it to a component that only needs to write events.
     SERVICE_API_KEYS: CsvSecretList = Field(default_factory=list)
@@ -144,11 +144,11 @@ class Settings(BaseSettings):
 
     # --------------------------------------------------------- index topology
     INDEX_PREFIX: str = "audit"
-    # Shared data stream used by every tenant without a dedicated stream.
+    # Shared data stream used by every user without a dedicated stream.
     SHARED_DATA_STREAM: str = "audit-shared"
-    # Tenants promoted to their own data stream (high volume or contractual
-    # isolation), as a comma-separated list of tenant UUIDs.
-    DEDICATED_TENANTS: CsvList = Field(default_factory=list)
+    # Users promoted to their own data stream (high volume or contractual
+    # isolation), as a comma-separated list of user UUIDs.
+    DEDICATED_USERS: CsvList = Field(default_factory=list)
     ILM_POLICY_NAME: str = "audit-retention"
     # HIPAA 164.316(b)(2)(i) requires 6 years retention of audit records.
     RETENTION_DAYS: int = 2190
@@ -175,7 +175,7 @@ class Settings(BaseSettings):
     REDIS_URL: SecretStr = SecretStr("redis://localhost:6379/0")
     STREAM_KEY_PREFIX: str = "audit:stream"
     STREAM_CONSUMER_GROUP: str = "audit-writers"
-    # Hash-chain ordering is per-partition, so a tenant is always pinned to
+    # Hash-chain ordering is per-partition, so a user is always pinned to
     # exactly one partition (see queue.partitioning).
     STREAM_PARTITIONS: int = 8
     STREAM_MAX_LEN: int = 1_000_000
@@ -237,7 +237,7 @@ class Settings(BaseSettings):
     @field_validator(
         "CORS_ALLOW_ORIGINS",
         "ES_HOSTS",
-        "DEDICATED_TENANTS",
+        "DEDICATED_USERS",
         "SERVICE_API_KEYS",
         mode="before",
     )
@@ -314,9 +314,9 @@ class Settings(BaseSettings):
         return self.ENVIRONMENT is Environment.PROD
 
     @property
-    def dedicated_tenant_set(self) -> frozenset[str]:
+    def dedicated_user_set(self) -> frozenset[str]:
         """O(1) membership test, consulted on every routing decision."""
-        return frozenset(self.DEDICATED_TENANTS)
+        return frozenset(self.DEDICATED_USERS)
 
     def es_ssl_context(self) -> ssl.SSLContext | None:
         """Build a TLS context pinned to the cluster CA when one is supplied."""

@@ -78,8 +78,8 @@ AUDIT_SERVICE_TIMEOUT_SECONDS=3.0
 ```
 
 `AUDIT_SERVICE_API_KEY` is the whole credential: this service accepts no
-platform token, so the main backend must also send `x-audit-tenant-id` naming
-the tenant each call acts for. One key is enough - `SERVICE_API_KEYS` is a list
+platform token, so the main backend must also send `x-audit-user-uuid` naming
+the user each call acts for. One key is enough - `SERVICE_API_KEYS` is a list
 only so a rotation can keep the outgoing key valid during the cutover.
 
 Send `x-audit-on-behalf-of` (the service user) and `x-audit-issuer-id` with it:
@@ -266,7 +266,7 @@ docker exec audit-redis sh -c \
 
 Stopping a worker releases its leases immediately; a killed one expires within
 30s. To reset a locally poisoned chain, stop all workers, wait for the leases to
-expire, then clear the local keyspace and use a **fresh tenant id** for the next
+expire, then clear the local keyspace and use a **fresh user uuid** for the next
 smoke (existing documents are immutable and keep their original links):
 
 ```bash
@@ -297,7 +297,7 @@ curl -s http://localhost:8020/health/ready
 # Ingest
 curl -s -X POST http://localhost:8020/v1/audit/events \
   -H "x-api-key: $SERVICE_API_KEY" \
-  -H "x-audit-tenant-id: demo-tenant" \
+  -H "x-audit-user-uuid: demo-user" \
   -H "x-audit-issuer-id: demo-issuer" \
   -H "x-audit-on-behalf-of: u-1" \
   -H "x-service-name: everycred-backend" \
@@ -316,10 +316,10 @@ curl -s -X POST http://localhost:8020/v1/audit/events \
 # Wait ~1–2s for the worker, then fetch
 curl -s http://localhost:8020/v1/audit/events/demo-001 \
   -H "x-api-key: $SERVICE_API_KEY" \
-  -H "x-audit-tenant-id: demo-tenant"
+  -H "x-audit-user-uuid: demo-user"
 
 # Integrity gate (exits non-zero on a break)
-uv run audit-service verify --tenant demo-tenant
+uv run audit-service verify --user demo-user
 ```
 
 Search example (typed filters; no raw ES DSL):
@@ -327,7 +327,7 @@ Search example (typed filters; no raw ES DSL):
 ```bash
 curl -s -X POST http://localhost:8020/v1/audit/events/search \
   -H "x-api-key: $SERVICE_API_KEY" \
-  -H "x-audit-tenant-id: demo-tenant" \
+  -H "x-audit-user-uuid: demo-user" \
   -H "Content-Type: application/json" \
   -d '{"event_ids":["demo-001"],"size":10,"with_total":true}'
 ```
@@ -354,12 +354,12 @@ Two files, covering different things:
 
 | File | Verifies |
 |---|---|
-| `tests/integration/test_end_to_end.py` | Guarantees enforced *by Elasticsearch*: `constant_keyword` rejecting a wrong-tenant document, `enabled: false` making ciphertext unsearchable, `op_type: create` rejecting a replay, `dynamic: strict` rejecting an undeclared field, PIT snapshot consistency, cursor pagination |
+| `tests/integration/test_end_to_end.py` | Guarantees enforced *by Elasticsearch*: `constant_keyword` rejecting a wrong-user document, `enabled: false` making ciphertext unsearchable, `op_type: create` rejecting a replay, `dynamic: strict` rejecting an undeclared field, PIT snapshot consistency, cursor pagination |
 | `tests/integration/test_worker_pipeline.py` | Runs the **real worker in-process**: chain integrity across batch boundaries, contiguous sequences, redelivery absorption, worker restart, PII encryption, dead-lettering |
 
 These are not optional coverage. Every check in them has already caught a real
 defect — including a mapping that broke all pagination, and a routing setting
-that would have rejected 100% of writes for dedicated tenants. CI runs them in a
+that would have rejected 100% of writes for dedicated users. CI runs them in a
 separate job with ES and Redis service containers
 ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
 
@@ -367,14 +367,14 @@ separate job with ES and Redis service containers
 
 ## 8. Historical backfill (optional)
 
-1. Export rows from a tenant DB (see `scripts/export_legacy_audit.sql` or
+1. Export rows from a user DB (see `scripts/export_legacy_audit.sql` or
    `everycred-backend/scripts/export_audit_ndjson.py`).
 2. Replay:
 
 ```bash
 uv run audit-service backfill --file user_audit.ndjson --dry-run
 uv run audit-service backfill --file user_audit.ndjson
-uv run audit-service verify --tenant <tenant-id>
+uv run audit-service verify --user <user-id>
 ```
 
 Re-runs are idempotent on legacy row uuids (`event_id`).
@@ -400,7 +400,7 @@ Re-runs are idempotent on legacy row uuids (`event_id`).
 | Settings validation error on boot | Missing `PII_MASTER_KEK` | Generate one with `audit-service generate-kek` |
 | ES yellow / replica unassigned | `INDEX_REPLICAS=1` on one node | Set `INDEX_REPLICAS=0` locally |
 | ES container exits: `unknown setting [xpack.ilm.enabled]` | That setting was **removed in ES 9.x** — ILM is always on | Drop it from compose / k8s env. Already fixed in `docker-compose.yml` |
-| **Integrity `prev_mismatch` on a fresh tenant** | **A stale worker generation is still running against the same Redis keyspace** — by far the most common cause | Stop *all* workers (see [Run exactly one worker generation](#run-exactly-one-worker-generation)), confirm one lease owner, clear `audit:chain:*`, retest on a new tenant id |
+| **Integrity `prev_mismatch` on a fresh user** | **A stale worker generation is still running against the same Redis keyspace** — by far the most common cause | Stop *all* workers (see [Run exactly one worker generation](#run-exactly-one-worker-generation)), confirm one lease owner, clear `audit:chain:*`, retest on a new user uuid |
 | Integrity `gap` with no `prev_mismatch` | Sequences reserved but never written (worker died mid-batch) | Benign and expected; the worker logs `batch_was_redelivery_chain_resynced` explaining the orphaned range |
 | `bootstrap` fails: *a concrete index named 'audit-shared' exists* | Events reached the cluster **before** the index template did, so ES auto-created a plain index. It permanently blocks the data stream of the same name | Reindex anything you need, then `DELETE /audit-shared` and re-run bootstrap. The guard converts ES's opaque 500 into this message |
 | Ingest 202 but GET 404 | Worker not running, or its lease is held by a stale worker | Start `audit-service worker`; check lease owners |
@@ -409,8 +409,8 @@ Re-runs are idempotent on legacy row uuids (`event_id`).
 | Sealed segment vanished from `mc ls` / `s3 ls` | A plain `DeleteObject` wrote a delete marker; the locked version survives | Apply the bucket policy; recover by deleting the *marker* version |
 | Bucket exists without Object Lock | Created without `--with-lock` | New bucket name + re-run init — Object Lock **cannot** be added later |
 | 401 from UI/main backend | Sending a Bearer token; this service accepts none | Send `x-api-key` with a value from `SERVICE_API_KEYS` |
-| 400 *the x-audit-tenant-id header is required* | Header missing on a tenant-scoped route | Add it; the key is not bound to a tenant, so nothing else scopes the call |
-| 400 *name the tenant you are querying* | Header missing on search/aggregate without `cross_tenant=true` | Add the header, or pass `cross_tenant=true` if you really mean every tenant |
+| 400 *the x-audit-user-uuid header is required* | Header missing on a user-scoped route | Add it; the key is not bound to a user, so nothing else scopes the call |
+| 400 *name the user you are querying* | Header missing on search/aggregate without `cross_user=true` | Add the header, or pass `cross_user=true` if you really mean every user |
 | 400 *x-audit-issuer-id must be at most 64 characters* | Issuer header wider than the stored field | Send the issuer UUID, not a composite key |
 | `/docs` or `/redoc` returns 200 but renders blank | A second `Content-Security-Policy` header from nginx; a browser enforces both, and the intersection with the docs policy is "load nothing" | Drop the server-level CSP for the docs paths (`deploy/nginx/audit-subpath.conf` explains it) - the app already sends the right policy per route |
 | Dual-write silent no-ops | Flag or key missing | `AUDIT_DUAL_WRITE_ENABLED=true` and matching API key |
@@ -432,7 +432,7 @@ instead of rejecting the write — either way the no-lost-events guarantee fails
 | `make serve` / `make worker` | Run API (reload) / worker |
 | `make test` / `make test-all` | Unit / all tests |
 | `make check` | Full CI gate |
-| `make verify TENANT=…` | Integrity check |
+| `make verify USER=…` | Integrity check |
 
 ---
 

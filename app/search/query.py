@@ -1,18 +1,18 @@
 """Query construction.
 
-This module is the tenant isolation boundary. The cluster runs a Basic licence,
+This module is the user isolation boundary. The cluster runs a Basic licence,
 so there is no document-level security to fall back on: if a query leaves here
-without a tenant constraint, one customer can read another's audit trail. Two
+without a user constraint, one customer can read another's audit trail. Two
 structural decisions keep that from happening.
 
 **Clients never send query DSL.** They send a typed `AuditSearchFilter`; the DSL
 is assembled here. Accepting raw DSL would hand callers `script`, `regexp`,
 wildcard-heavy and deeply-nested queries - a search-injection and
-denial-of-service surface on a cluster holding every tenant's data.
+denial-of-service surface on a cluster holding every user's data.
 
-**The tenant filter is applied by the builder, not the caller.** `build_query`
-takes a `TenantScope` and there is no code path that omits it.
-`tests/unit/test_tenant_isolation.py` asserts this over every filter
+**The user filter is applied by the builder, not the caller.** `build_query`
+takes a `UserScope` and there is no code path that omits it.
+`tests/unit/test_user_isolation.py` asserts this over every filter
 permutation.
 
 Performance
@@ -50,30 +50,30 @@ class QueryValidationError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class TenantScope:
-    """The authorised tenant boundary for one query.
+class UserScope:
+    """The authorised user boundary for one query.
 
-    Built by `QueryService.resolve_scope` from the `x-audit-tenant-id` header,
+    Built by `QueryService.resolve_scope` from the `x-audit-user-uuid` header,
     never from a body field or a query parameter a caller can restate. The
     header is shape-checked and taken as given: the backend in front of this
-    service resolved and authorised that tenant before calling.
+    service resolved and authorised that user before calling.
 
-    `cross_tenant` requires the `audit:cross_tenant` scope and is audited at
+    `cross_user` requires the `audit:cross_user` scope and is audited at
     CRITICAL severity every time it is used.
     """
 
-    tenant_id: str | None
-    cross_tenant: bool = False
+    user_uuid: str | None
+    cross_user: bool = False
     issuer_id: str | None = None
-    """Narrows to one issuer inside a tenant, for issuer-scoped operators."""
+    """Narrows to one issuer inside a user, for issuer-scoped operators."""
     actor_id: str | None = None
     """Restricts a caller to their own events - used for self-service history."""
 
     def __post_init__(self) -> None:
-        if not self.cross_tenant and not self.tenant_id:
+        if not self.cross_user and not self.user_uuid:
             raise QueryValidationError(
-                "a tenant-scoped query requires tenant_id; "
-                "cross-tenant access needs the audit:cross_tenant scope"
+                "a user-scoped query requires user_uuid; "
+                "cross-user access needs the audit:cross_user scope"
             )
 
 
@@ -109,13 +109,13 @@ class AuditSearchFilter:
 
 
 def build_query(
-    scope: TenantScope,
+    scope: UserScope,
     criteria: AuditSearchFilter,
     *,
     max_window_days: int,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Assemble the bool query, tenant constraint always included.
+    """Assemble the bool query, user constraint always included.
 
     Args:
         scope: the authorised boundary. Applied unconditionally.
@@ -129,15 +129,15 @@ def build_query(
     reference = now or datetime.now(UTC)
     start, end = _resolve_window(criteria, reference, max_window_days)
 
-    # ---- tenant constraint: first clause, never conditional on caller input --
+    # ---- user constraint: first clause, never conditional on caller input --
     filters: list[dict[str, Any]] = []
-    if not scope.cross_tenant:
+    if not scope.cross_user:
         # `term` on a keyword is the cheapest possible filter, and on a
         # dedicated stream's `constant_keyword` it is resolved at rewrite time
         # for effectively zero cost.
-        filters.append({"term": {"tenant.id": scope.tenant_id}})
+        filters.append({"term": {"user.uuid": scope.user_uuid}})
     if scope.issuer_id:
-        filters.append({"term": {"tenant.issuer_id": scope.issuer_id}})
+        filters.append({"term": {"user.issuer_id": scope.issuer_id}})
     if scope.actor_id:
         # Self-service history: the caller may only see their own events, and
         # this cannot be widened by anything in `criteria`.
@@ -173,7 +173,7 @@ def build_query(
     if criteria.session_id:
         filters.append({"term": {"actor.session_id": criteria.session_id}})
     if criteria.issuer_id and not scope.issuer_id:
-        filters.append({"term": {"tenant.issuer_id": criteria.issuer_id}})
+        filters.append({"term": {"user.issuer_id": criteria.issuer_id}})
     if criteria.request_id:
         filters.append({"term": {"http.request_id": criteria.request_id}})
     if criteria.trace_id:
@@ -229,7 +229,7 @@ def build_query(
 
 
 def build_search_body(
-    scope: TenantScope,
+    scope: UserScope,
     criteria: AuditSearchFilter,
     *,
     size: int,
@@ -272,7 +272,7 @@ def build_search_body(
 
 
 def build_aggregation_body(
-    scope: TenantScope,
+    scope: UserScope,
     criteria: AuditSearchFilter,
     *,
     group_by: str,

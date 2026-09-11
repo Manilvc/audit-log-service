@@ -38,7 +38,7 @@ from app.search.backends import (
 )
 from app.search.backends.elastic import ELASTIC_FIELD_TYPES, _translated, ilm_policy
 from app.search.mappings import dedicated_index_template, shared_index_template
-from app.search.routing import TenantRouter
+from app.search.routing import UserRouter
 
 RETENTION = RetentionPolicy(
     retention_days=2190,
@@ -103,7 +103,7 @@ def test_elastic_field_types_are_the_elastic_ones(backend: ElasticsearchBackend)
     assert types is ELASTIC_FIELD_TYPES
     assert types.subtree == {"type": "flattened"}
     assert types.log_text == {"type": "match_only_text"}
-    assert types.pinned_tenant == {"type": "constant_keyword"}
+    assert types.pinned_user_uuid == {"type": "constant_keyword"}
 
 
 def test_lifecycle_attaches_through_the_index_settings(backend: ElasticsearchBackend) -> None:
@@ -127,7 +127,7 @@ def test_shared_template_is_unchanged_by_the_port(backend: ElasticsearchBackend)
     )
     properties = _properties(template)
 
-    assert properties["tenant"]["properties"]["id"] == {"type": "keyword"}
+    assert properties["user"]["properties"]["uuid"] == {"type": "keyword"}
     assert properties["labels"] == {"type": "flattened"}
     assert properties["message"] == {"type": "match_only_text"}
     assert properties["change"]["properties"]["before"] == {"type": "flattened"}
@@ -136,20 +136,20 @@ def test_shared_template_is_unchanged_by_the_port(backend: ElasticsearchBackend)
     settings = template["template"]["settings"]["index"]
     assert settings["lifecycle"] == {"name": "audit-retention"}
     assert settings["number_of_shards"] == 3
-    # Custom routing pins a shared tenant to one shard; it must stay on.
+    # Custom routing pins a shared user to one shard; it must stay on.
     assert template["data_stream"] == {"allow_custom_routing": True}
 
 
-def test_dedicated_template_still_pins_the_tenant_id(backend: ElasticsearchBackend) -> None:
-    """`constant_keyword` is a tenant-isolation control, not a size tweak.
+def test_dedicated_template_still_pins_the_user_uuid(backend: ElasticsearchBackend) -> None:
+    """`constant_keyword` is a user-isolation control, not a size tweak.
 
     On a dedicated stream the engine itself rejects a document carrying another
-    tenant's id. `docs/SECURITY.md` counts that as a layer, so it has to survive
+    user's id. `docs/SECURITY.md` counts that as a layer, so it has to survive
     the refactor - and its absence on another engine is a decision, not an
     accident.
     """
     template = dedicated_index_template(
-        name_pattern="audit-t-*",
+        name_pattern="audit-u-*",
         shards=1,
         replicas=1,
         backend=backend,
@@ -157,17 +157,17 @@ def test_dedicated_template_still_pins_the_tenant_id(backend: ElasticsearchBacke
     )
     properties = _properties(template)
 
-    assert properties["tenant"]["properties"]["id"] == {"type": "constant_keyword"}
+    assert properties["user"]["properties"]["uuid"] == {"type": "constant_keyword"}
     # No custom routing here: a dedicated stream has no routing key to supply,
     # and enabling it would reject every write with routing_missing_exception.
     assert template["data_stream"] == {}
 
 
 def test_dedicated_template_outranks_the_shared_one(backend: ElasticsearchBackend) -> None:
-    """Otherwise `audit-t-<uuid>-*` could match the broader shared pattern."""
+    """Otherwise `audit-u-<uuid>-*` could match the broader shared pattern."""
     shared = shared_index_template(
-        name_pattern=TenantRouter(
-            shared_stream="audit-shared", index_prefix="audit", dedicated_tenants=frozenset()
+        name_pattern=UserRouter(
+            shared_stream="audit-shared", index_prefix="audit", dedicated_users=frozenset()
         ).shared_pattern(),
         shards=3,
         replicas=1,
@@ -175,7 +175,7 @@ def test_dedicated_template_outranks_the_shared_one(backend: ElasticsearchBacken
         policy_name="p",
     )
     dedicated = dedicated_index_template(
-        name_pattern="audit-t-*", shards=1, replicas=1, backend=backend, policy_name="p"
+        name_pattern="audit-u-*", shards=1, replicas=1, backend=backend, policy_name="p"
     )
     assert dedicated["priority"] > shared["priority"]
 

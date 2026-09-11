@@ -38,7 +38,7 @@ from app.services.api_key_service import (
 )
 
 PEPPER = "unit-test-pepper"
-TENANT = "tenant-a"
+USER = "user-a"
 DOMAIN = "hrms.acme.example"
 
 
@@ -64,8 +64,8 @@ class FakeApiKeyStore:
         self.records[key_id] = revoked
         return revoked
 
-    async def list_for_tenant(self, tenant_id: str, *, size: int) -> list[ApiKeyRecord]:
-        matching = [r for r in self.records.values() if r.tenant_id == tenant_id]
+    async def list_for_user(self, user_uuid: str, *, size: int) -> list[ApiKeyRecord]:
+        matching = [r for r in self.records.values() if r.user_uuid == user_uuid]
         return matching[:size]
 
 
@@ -159,10 +159,10 @@ def test_a_narrower_request_is_honoured() -> None:
     )
 
 
-@pytest.mark.parametrize("scope", ["audit:erase", "audit:admin", "audit:cross_tenant"])
+@pytest.mark.parametrize("scope", ["audit:erase", "audit:admin", "audit:cross_user"])
 def test_the_dangerous_scopes_can_never_be_delegated(scope: str) -> None:
-    """Erase destroys data, admin mints credentials, cross_tenant leaves the
-    tenant boundary. All three stay with the key rotated by deploy."""
+    """Erase destroys data, admin mints credentials, cross_user leaves the
+    user boundary. All three stay with the key rotated by deploy."""
     with pytest.raises(ApiKeyError, match="cannot be delegated"):
         resolve_requested_scopes((scope,))
 
@@ -196,7 +196,7 @@ def _record(**overrides: object) -> ApiKeyRecord:
     """A stored record with sensible defaults, for the pure-function tests."""
     base: dict[str, object] = {
         "key_id": build_key_id(),
-        "tenant_id": TENANT,
+        "user_uuid": USER,
         "domain": DOMAIN,
         "label": "",
         "secret_digest": "digest",
@@ -212,28 +212,28 @@ def _record(**overrides: object) -> ApiKeyRecord:
 async def test_issuing_stores_a_digest_and_returns_the_secret_once(
     service: ApiKeyService, store: FakeApiKeyStore
 ) -> None:
-    minted = await service.issue(tenant_id=TENANT, domain=DOMAIN, label="HRMS", created_by="admin")
+    minted = await service.issue(user_uuid=USER, domain=DOMAIN, label="HRMS", created_by="admin")
     stored = store.records[minted.record.key_id]
 
     assert minted.plaintext.startswith(f"{API_KEY_PREFIX}{API_KEY_SEPARATOR}")
     # The secret exists in the response and nowhere else.
     assert minted.plaintext not in stored.secret_digest
     assert stored.secret_digest != minted.plaintext
-    assert stored.tenant_id == TENANT
+    assert stored.user_uuid == USER
     assert stored.expires_at is not None
 
 
 async def test_a_freshly_issued_key_verifies(service: ApiKeyService) -> None:
-    minted = await service.issue(tenant_id=TENANT, domain=DOMAIN, label="", created_by="admin")
+    minted = await service.issue(user_uuid=USER, domain=DOMAIN, label="", created_by="admin")
     verified = await service.verify(minted.plaintext)
 
     assert verified is not None
     assert verified.key_id == minted.record.key_id
-    assert verified.tenant_id == TENANT
+    assert verified.user_uuid == USER
 
 
 async def test_a_tampered_secret_does_not_verify(service: ApiKeyService) -> None:
-    minted = await service.issue(tenant_id=TENANT, domain=DOMAIN, label="", created_by="admin")
+    minted = await service.issue(user_uuid=USER, domain=DOMAIN, label="", created_by="admin")
     key_id, secret = parse_api_key(minted.plaintext)  # type: ignore[misc]
 
     assert await service.verify(format_api_key(key_id, secret[:-1] + "x")) is None
@@ -247,7 +247,7 @@ async def test_a_revoked_key_stops_verifying(
     service: ApiKeyService, store: FakeApiKeyStore
 ) -> None:
     """And the process cache is dropped, so it stops on this replica at once."""
-    minted = await service.issue(tenant_id=TENANT, domain=DOMAIN, label="", created_by="admin")
+    minted = await service.issue(user_uuid=USER, domain=DOMAIN, label="", created_by="admin")
     assert await service.verify(minted.plaintext) is not None
 
     await service.revoke(minted.record.key_id, revoked_by="admin")
@@ -257,7 +257,7 @@ async def test_a_revoked_key_stops_verifying(
 async def test_an_expired_key_does_not_verify(
     service: ApiKeyService, store: FakeApiKeyStore
 ) -> None:
-    minted = await service.issue(tenant_id=TENANT, domain=DOMAIN, label="", created_by="admin")
+    minted = await service.issue(user_uuid=USER, domain=DOMAIN, label="", created_by="admin")
     expired = replace(minted.record, expires_at=datetime.now(UTC) - timedelta(seconds=1))
     store.records[expired.key_id] = expired
 
@@ -269,7 +269,7 @@ async def test_verification_hits_the_store_once_then_the_cache(
     service: ApiKeyService, store: FakeApiKeyStore
 ) -> None:
     """The ingest path must not pay a round trip per event batch."""
-    minted = await service.issue(tenant_id=TENANT, domain=DOMAIN, label="", created_by="admin")
+    minted = await service.issue(user_uuid=USER, domain=DOMAIN, label="", created_by="admin")
 
     await service.verify(minted.plaintext)
     await service.verify(minted.plaintext)
@@ -278,9 +278,9 @@ async def test_verification_hits_the_store_once_then_the_cache(
     assert store.reads == 1
 
 
-async def test_a_key_from_another_tenant_reads_as_missing(service: ApiKeyService) -> None:
+async def test_a_key_from_another_user_reads_as_missing(service: ApiKeyService) -> None:
     """So the management endpoints cannot be used to discover foreign key ids."""
-    minted = await service.issue(tenant_id=TENANT, domain=DOMAIN, label="", created_by="admin")
+    minted = await service.issue(user_uuid=USER, domain=DOMAIN, label="", created_by="admin")
 
-    assert await service.get_for_tenant(minted.record.key_id, tenant_id=TENANT) is not None
-    assert await service.get_for_tenant(minted.record.key_id, tenant_id="tenant-b") is None
+    assert await service.get_for_user(minted.record.key_id, user_uuid=USER) is not None
+    assert await service.get_for_user(minted.record.key_id, user_uuid="user-b") is None

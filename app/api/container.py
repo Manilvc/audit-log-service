@@ -24,7 +24,7 @@ from app.search.backends import SearchBackend, build_backend
 from app.search.bootstrap import api_key_index_name, keyring_index_name
 from app.search.keyring import SearchKeyRing
 from app.search.repository import AuditRepository
-from app.search.routing import TenantRouter
+from app.search.routing import UserRouter
 from app.services.api_key_service import ApiKeyService
 from app.services.compliance_service import ErasureService, IntegrityService
 from app.services.ingest_service import IngestService
@@ -40,7 +40,7 @@ class ServiceContainer:
     settings: Settings
     search: SearchBackend
     redis: Redis
-    router: TenantRouter
+    router: UserRouter
     repository: AuditRepository
     keyring: SearchKeyRing
     cipher: PiiCipher
@@ -112,10 +112,10 @@ def build_container(settings: Settings) -> ServiceContainer:
         max_connections=64,
     )
 
-    router = TenantRouter(
+    router = UserRouter(
         shared_stream=settings.SHARED_DATA_STREAM,
         index_prefix=settings.INDEX_PREFIX,
-        dedicated_tenants=settings.dedicated_tenant_set,
+        dedicated_users=settings.dedicated_user_set,
         # The engine decides: a routed write to a data stream is fine on
         # Elasticsearch and rejected on OpenSearch.
         custom_routing=search.supports_custom_routing,

@@ -57,11 +57,11 @@ class FieldTypes:
     across six years of retention; OpenSearch has no equivalent and pays for
     plain `text`."""
 
-    pinned_tenant: dict[str, Any]
-    """For `tenant.id` on a *dedicated* stream, where every document belongs to
-    one tenant by construction. Elastic `constant_keyword` makes the engine
-    itself reject a document carrying the wrong tenant id - a storage-level
-    backstop beneath the application's tenant filter (`docs/SECURITY.md`). An
+    pinned_user_uuid: dict[str, Any]
+    """For `user.uuid` on a *dedicated* stream, where every document belongs to
+    one user by construction. Elastic `constant_keyword` makes the engine
+    itself reject a document carrying the wrong user uuid - a storage-level
+    backstop beneath the application's user filter (`docs/SECURITY.md`). An
     engine without it degrades to plain `keyword`, and the backstop then has to
     be re-established in the worker rather than quietly lost."""
 
@@ -113,15 +113,15 @@ class SearchBackend(Protocol):
         """Whether a write to a data stream may carry a routing value.
 
         Elasticsearch allows it when the template opts in, and this service uses
-        it to pin a shared tenant to one shard: a tenant-scoped search then hits
+        it to pin a shared user to one shard: a user-scoped search then hits
         one shard instead of fanning out across all of them.
 
         OpenSearch data streams refuse it outright - an indexing request with a
         routing value is rejected with `illegal_argument_exception: index request
         targeting data stream [...] specifies a custom routing`. So on that
-        engine `TenantRouter` issues no routing key and searches fan out. That is
-        a performance difference, not a correctness one: the mandatory tenant
-        filter is what isolates tenants, and it is unaffected.
+        engine `UserRouter` issues no routing key and searches fan out. That is
+        a performance difference, not a correctness one: the mandatory user
+        filter is what isolates users, and it is unaffected.
         """
         ...
 

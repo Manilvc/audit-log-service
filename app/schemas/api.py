@@ -61,12 +61,12 @@ class AuditEventIn(BaseModel):
     """When it happened. Defaults to receipt time, but emitters should send it:
     the gap between occurrence and ingest is itself audit-relevant."""
 
-    tenant_id: Keyword | None = None
+    user_uuid: Keyword | None = None
     """Optional here because a service principal may set it via the
-    `x-audit-tenant-id` header. Exactly one of the two must be present, and the
+    `x-audit-user-uuid` header. Exactly one of the two must be present, and the
     ingest service rejects the event when the two disagree."""
 
-    tenant_name: str | None = Field(default=None, max_length=1024)
+    user_name: str | None = Field(default=None, max_length=1024)
     issuer_id: str | None = Field(default=None, max_length=64)
 
     category: EventCategory | None = None
@@ -118,7 +118,7 @@ class AuditEventIn(BaseModel):
     def to_domain(
         self,
         *,
-        tenant_id: str,
+        user_uuid: str,
         issuer_id: str | None = None,
         submitted_by: str | None = None,
         on_behalf_of: str | None = None,
@@ -132,7 +132,7 @@ class AuditEventIn(BaseModel):
         asserted would make the record a worse description of what happened.
 
         Args:
-            tenant_id: the resolved tenant, already reconciled against the
+            user_uuid: the resolved user, already reconciled against the
                 authenticated principal by the ingest service.
             issuer_id: issuer from `x-audit-issuer-id`, used when the event
                 carries none of its own.
@@ -192,8 +192,8 @@ class AuditEventIn(BaseModel):
             event_id=self.event_id or str(_new_uuid()),
             timestamp=occurred,
             ingested_at=received,
-            tenant_id=tenant_id,
-            tenant_name=self.tenant_name,
+            user_uuid=user_uuid,
+            user_name=self.user_name,
             issuer_id=self.issuer_id or issuer_id,
             action=self.action,
             category=category,
@@ -244,7 +244,7 @@ class SearchRequest(BaseModel):
 
     Note what is absent: there is no field for raw Elasticsearch DSL. Accepting
     one would hand callers `script` queries, unbounded wildcards and deep
-    aggregations on a cluster holding every tenant's audit trail.
+    aggregations on a cluster holding every user's audit trail.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -336,7 +336,7 @@ class AggregationRequest(SearchRequest):
         "target.type",
         "service.name",
         "source.country_code",
-        "tenant.id",
+        "user.uuid",
     ] = "event.action"
     """A closed allow-list. An arbitrary field name would let a caller aggregate
     on a high-cardinality keyword and exhaust cluster heap."""
@@ -352,7 +352,7 @@ class IntegrityVerifyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     chain_id: str | None = Field(default=None, max_length=128)
-    """Verify one chain. Omit to verify every chain for the tenant."""
+    """Verify one chain. Omit to verify every chain for the user."""
     start_seq: int = Field(default=0, ge=0)
     max_events: int = Field(default=10_000, ge=1, le=100_000)
 
@@ -360,7 +360,7 @@ class IntegrityVerifyRequest(BaseModel):
 class IntegrityReport(BaseModel):
     """Result of a verification run - the artefact an auditor is shown."""
 
-    tenant_id: str
+    user_uuid: str
     chains_checked: int
     events_verified: int
     intact: bool
@@ -474,8 +474,8 @@ def _redact_mapping(value: dict[str, Any], *, depth: int) -> dict[str, Any]:
 class ApiKeyIssueRequest(BaseModel):
     """Ask for an ingest credential for one emitting system.
 
-    No `tenant_id` field: the tenant comes from `x-audit-tenant-id`, so a key
-    can only be bound to the tenant the request itself named.
+    No `user_uuid` field: the user comes from `x-audit-user-uuid`, so a key
+    can only be bound to the user the request itself named.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -498,7 +498,7 @@ class ApiKeyIssueRequest(BaseModel):
 
     scopes: list[str] | None = None
     """Defaults to `audit:write` alone. `audit:erase`, `audit:admin` and
-    `audit:cross_tenant` are refused however they are asked for."""
+    `audit:cross_user` are refused however they are asked for."""
 
     expires_in_days: int | None = Field(default=None, ge=1, le=3650)
     """Shorter than the configured default, never longer."""
@@ -510,7 +510,7 @@ class ApiKeySummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     key_id: str
-    tenant_id: str
+    user_uuid: str
     domain: str
     label: str
     scopes: list[str]
@@ -535,7 +535,7 @@ class ApiKeyIssued(ApiKeySummary):
 
 
 class ApiKeyListResponse(BaseModel):
-    """Every key issued to one tenant."""
+    """Every key issued to one user."""
 
     model_config = ConfigDict(extra="forbid")
 

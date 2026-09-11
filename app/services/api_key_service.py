@@ -5,12 +5,12 @@ Two planes, deliberately separated:
 * **Admin plane** - the keys in `SERVICE_API_KEYS`. Rotated by deploy, hold every
   scope, and are the only credential that may mint or revoke other keys.
 * **Ingest plane** - keys issued through this service. Each is bound to one
-  tenant and one emitting domain, holds `audit:write` unless narrowed, and can be
+  user and one emitting domain, holds `audit:write` unless narrowed, and can be
   revoked in seconds without a deploy.
 
 That split is what makes per-emitter credentials safe to hand out: a leaked
-ingest key can write events for one tenant and nothing else - it cannot read the
-trail, cannot erase a data subject, and cannot reach another tenant.
+ingest key can write events for one user and nothing else - it cannot read the
+trail, cannot erase a data subject, and cannot reach another user.
 
 Why a digest and not bcrypt
 ---------------------------
@@ -56,7 +56,7 @@ logger = get_logger(__name__)
 
 #: Returned by `issue`, and the only moment the secret exists outside the
 #: caller's own storage. It is never persisted and never logged.
-MINTED_KEY_LOG_FIELDS: Final[tuple[str, ...]] = ("key_id", "tenant_id", "domain")
+MINTED_KEY_LOG_FIELDS: Final[tuple[str, ...]] = ("key_id", "user_uuid", "domain")
 
 
 class ApiKeyError(Exception):
@@ -135,7 +135,7 @@ def build_secret_digest(secret: str, *, pepper: str) -> str:
 def resolve_requested_scopes(requested: tuple[str, ...] | None) -> tuple[str, ...]:
     """Narrow the scopes an issued key may hold.
 
-    Defaults to write-only, and refuses the three that reach across tenants or
+    Defaults to write-only, and refuses the three that reach across users or
     destroy data whatever the request asks for.
 
     Raises:
@@ -226,14 +226,14 @@ class ApiKeyService:
     async def issue(
         self,
         *,
-        tenant_id: str,
+        user_uuid: str,
         domain: str,
         label: str,
         created_by: str,
         requested_scopes: tuple[str, ...] | None = None,
         expires_in_days: int | None = None,
     ) -> MintedApiKey:
-        """Mint a key for one tenant and one emitting domain.
+        """Mint a key for one user and one emitting domain.
 
         The plaintext is returned once and never stored: the record holds only a
         peppered digest and a six-character hint. A caller who loses it issues a
@@ -249,7 +249,7 @@ class ApiKeyService:
 
         record = ApiKeyRecord(
             key_id=key_id,
-            tenant_id=tenant_id,
+            user_uuid=user_uuid,
             domain=domain,
             label=label,
             secret_digest=build_secret_digest(secret, pepper=self._pepper),
@@ -323,18 +323,18 @@ class ApiKeyService:
         self._cache.invalidate(key_id)
         return record
 
-    async def list_for_tenant(self, tenant_id: str, *, size: int) -> list[ApiKeyRecord]:
-        """Keys issued to one tenant, newest first. Never includes a secret."""
-        return await self._store.list_for_tenant(tenant_id, size=size)
+    async def list_for_user(self, user_uuid: str, *, size: int) -> list[ApiKeyRecord]:
+        """Keys issued to one user, newest first. Never includes a secret."""
+        return await self._store.list_for_user(user_uuid, size=size)
 
-    async def get_for_tenant(self, key_id: str, *, tenant_id: str) -> ApiKeyRecord | None:
-        """One key, but only if it belongs to this tenant.
+    async def get_for_user(self, key_id: str, *, user_uuid: str) -> ApiKeyRecord | None:
+        """One key, but only if it belongs to this user.
 
-        A key id from another tenant reads as "no such key". Without that, the
+        A key id from another user reads as "no such key". Without that, the
         management endpoints would confirm which ids exist elsewhere.
         """
         record = await self._store.get(key_id)
-        if record is None or record.tenant_id != tenant_id:
+        if record is None or record.user_uuid != user_uuid:
             return None
         return record
 

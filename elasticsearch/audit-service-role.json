@@ -32,7 +32,7 @@
     ],
     "indices": [
       {
-        "names": ["audit-shared", "audit-shared*", "audit-t-*", ".ds-audit-*"],
+        "names": ["audit-shared", "audit-shared*", "audit-u-*", ".ds-audit-*"],
         "privileges": [
           "create_doc",
           "create_index",

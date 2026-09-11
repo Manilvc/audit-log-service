@@ -3,7 +3,7 @@
 ``client`` / ``bootstrap`` / ``mappings``
     Hardened client, idempotent cluster provisioning, ILM + index templates.
 ``routing`` / ``query`` / ``repository``
-    Hybrid tenant → data-stream resolution, tenant-scoped DSL builder, CRUD.
+    Hybrid user → data-stream resolution, user-scoped DSL builder, CRUD.
 ``keyring``
     Wrapped per-subject DEKs used by crypto-shredding.
 """

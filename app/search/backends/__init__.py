@@ -2,7 +2,7 @@
 
 The engine is a *deploy-time* choice, not a runtime one. One process talks to
 one store, chosen by `SEARCH_BACKEND`, because the alternative - both at once -
-doubles the integration matrix and buys nothing operationally: a tenant's trail
+doubles the integration matrix and buys nothing operationally: a user's trail
 lives in exactly one place.
 """
 
@@ -59,8 +59,8 @@ def build_backend(settings: Settings) -> SearchBackend:
         "search_backend_selected",
         engine=backend.name,
         # Worth a line in the startup log: the field types decide the mapping,
-        # and on OpenSearch the tenant type is `keyword` rather than
+        # and on OpenSearch the user type is `keyword` rather than
         # `constant_keyword`, which changes where isolation is enforced.
-        pinned_tenant_type=backend.field_types.pinned_tenant.get("type"),
+        pinned_user_uuid_type=backend.field_types.pinned_user_uuid.get("type"),
     )
     return backend

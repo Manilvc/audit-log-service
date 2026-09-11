@@ -70,7 +70,7 @@ from app.domain.events import AuditEvent
 from app.queue.chain import ChainAllocator
 from app.queue.stream import IngestQueue, QueuedEvent
 from app.search.repository import AuditRepository
-from app.search.routing import TenantRouter
+from app.search.routing import UserRouter
 
 logger = get_logger(__name__)
 
@@ -127,7 +127,7 @@ class IngestWorker:
         queue: IngestQueue,
         chains: ChainAllocator,
         repository: AuditRepository,
-        router: TenantRouter,
+        router: UserRouter,
         cipher: PiiCipher,
         archive: Any,
         consumer_name: str | None = None,
@@ -293,27 +293,27 @@ class IngestWorker:
         """Turn one batch of queued payloads into durable audit records."""
         stats = BatchStats(read=len(events))
 
-        # Group by tenant: the hash chain is per (tenant, partition), so each
-        # tenant's events must be sequenced as one contiguous block.
-        by_tenant: dict[str, list[QueuedEvent]] = {}
+        # Group by user: the hash chain is per (user, partition), so each
+        # user's events must be sequenced as one contiguous block.
+        by_user: dict[str, list[QueuedEvent]] = {}
         for queued in events:
-            tenant_id = str(queued.payload.get("tenant_id") or "")
-            if not tenant_id:
+            user_uuid = str(queued.payload.get("user_uuid") or "")
+            if not user_uuid:
                 await self._queue.to_dead_letter(
                     partition,
                     payload=queued.payload,
-                    reason="missing tenant_id",
+                    reason="missing user_uuid",
                     attempts=queued.delivery_count,
                 )
                 await self._queue.ack(partition, [queued.message_id])
                 stats.dead_lettered += 1
                 continue
-            by_tenant.setdefault(tenant_id, []).append(queued)
+            by_user.setdefault(user_uuid, []).append(queued)
 
-        for tenant_id, group in by_tenant.items():
-            await self._process_tenant_group(
+        for user_uuid, group in by_user.items():
+            await self._process_user_group(
                 partition,
-                tenant_id,
+                user_uuid,
                 group,
                 stats,
                 lease_key=lease_key,
@@ -321,28 +321,28 @@ class IngestWorker:
             )
         return stats
 
-    async def _process_tenant_group(
+    async def _process_user_group(
         self,
         partition: int,
-        tenant_id: str,
+        user_uuid: str,
         group: list[QueuedEvent],
         stats: BatchStats,
         *,
         lease_key: str = "",
         lease_token: str = "",
     ) -> None:
-        chain_id = self._router.chain_id(tenant_id, partition)
+        chain_id = self._router.chain_id(user_uuid, partition)
         stats.chains_touched.add(chain_id)
 
         # ---- 1. validate + encrypt ------------------------------------------
         prepared: list[tuple[QueuedEvent, dict[str, Any]]] = []
         for queued in group:
             try:
-                document = await self._prepare_document(tenant_id, queued.payload)
+                document = await self._prepare_document(user_uuid, queued.payload)
             except KeyRingError as exc:
                 # Encrypting without a persisted key would create a permanently
                 # unreadable record, so retry rather than store it.
-                logger.error("keyring_unavailable", error=str(exc), tenant_id=tenant_id)
+                logger.error("keyring_unavailable", error=str(exc), user_uuid=user_uuid)
                 return
             except Exception as exc:
                 await self._queue.to_dead_letter(
@@ -367,7 +367,7 @@ class IngestWorker:
             # Redis dataset by consulting the authoritative ledger; getting this
             # wrong would restart sequencing at 0 and look like forgery.
             recovered = await self._chains.resync_from_ledger(
-                chain_id, tenant_id=tenant_id, ledger=self._repository
+                chain_id, user_uuid=user_uuid, ledger=self._repository
             )
             if recovered is not None:
                 logger.warning(
@@ -394,7 +394,7 @@ class IngestWorker:
             prev_hash = digest
             documents.append(document)
 
-        route = self._router.resolve(tenant_id)
+        route = self._router.resolve(user_uuid)
 
         # ---- 4. Elasticsearch -----------------------------------------------
         outcome = await self._repository.bulk_index([(route, doc) for doc in documents])
@@ -435,7 +435,7 @@ class IngestWorker:
             # authoritative ledger, and acknowledge. The orphaned range becomes a
             # gap that `verify` reports and this log line explains.
             await self._chains.resync_from_ledger(
-                chain_id, tenant_id=tenant_id, ledger=self._repository, force=True
+                chain_id, user_uuid=user_uuid, ledger=self._repository, force=True
             )
             await self._queue.ack(partition, [q.message_id for q, _ in prepared])
             stats.duplicates += outcome.duplicates
@@ -458,7 +458,7 @@ class IngestWorker:
         if self._archive is not None and getattr(self._archive, "enabled", False):
             try:
                 await self._archive.seal_segment(
-                    tenant_id=tenant_id, chain_id=chain_id, documents=documents
+                    user_uuid=user_uuid, chain_id=chain_id, documents=documents
                 )
             except Exception as exc:
                 # Un-notarised evidence is not acceptable, so leave the batch
@@ -498,14 +498,14 @@ class IngestWorker:
         stats.written += len(documents)
 
         await self._maybe_checkpoint(
-            tenant_id=tenant_id,
+            user_uuid=user_uuid,
             chain_id=chain_id,
             seq=reservation.last_seq,
             head_hash=prev_hash,
             added=len(documents),
         )
 
-    async def _prepare_document(self, tenant_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _prepare_document(self, user_uuid: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Validate the payload and encrypt its PII.
 
         Validation happens here as well as at the API boundary: an event may
@@ -519,7 +519,7 @@ class IngestWorker:
         subject_id = _subject_of(event)
         result = await self._cipher.encrypt_document(
             document,
-            tenant_id=tenant_id,
+            user_uuid=user_uuid,
             event_id=event.event_id,
             subject_id=subject_id,
         )
@@ -536,7 +536,7 @@ class IngestWorker:
     async def _maybe_checkpoint(
         self,
         *,
-        tenant_id: str,
+        user_uuid: str,
         chain_id: str,
         seq: int,
         head_hash: str,
@@ -551,7 +551,7 @@ class IngestWorker:
             return
         try:
             await self._archive.seal_checkpoint(
-                tenant_id=tenant_id,
+                user_uuid=user_uuid,
                 chain_id=chain_id,
                 seq=seq,
                 head_hash=head_hash,
@@ -598,13 +598,13 @@ def _is_permanent(reason: str) -> bool:
         "mapper_parsing_exception",
         "illegal_argument_exception",
         # Covers the constant_keyword rejection a dedicated stream raises when a
-        # document carries the wrong tenant id - a routing bug, not a blip, and
+        # document carries the wrong user uuid - a routing bug, not a blip, and
         # retrying it would spin forever.
         "document_parsing_exception",
         # The same bug caught before the write, by the repository's own guard.
         # Engine-independent, so it is the marker that matters on OpenSearch,
-        # where no field type refuses a foreign tenant id.
-        "tenant_mismatch",
+        # where no field type refuses a foreign user uuid.
+        "user_uuid_mismatch",
         "status=400",
     )
     lowered = reason.lower()
