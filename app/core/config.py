@@ -169,11 +169,14 @@ class Settings(BaseSettings):
     # Refuse unbounded time ranges - an audit search with no window is a
     # full-retention scan across six years of data.
     MAX_QUERY_WINDOW_DAYS: int = 400
-    # Window applied when a caller names neither `start` nor `end`. One day
-    # keeps a careless "show me everything" cheap, but a console that lists
-    # recent activity without asking the user for dates needs more, so it is
-    # configuration rather than a constant. Capped by MAX_QUERY_WINDOW_DAYS.
-    DEFAULT_QUERY_WINDOW_DAYS: int = 1
+    # Window applied when a caller names neither `start` nor `end`. Defaults to
+    # the maximum, so "no filters" means "everything I am allowed to see" -
+    # which is what a caller listing a trail expects, and what any other list
+    # API would do. Lower it where unfiltered searches are frequent and the
+    # index is large: a narrow default makes a careless query cheap, at the
+    # cost of hiding older events from a caller who named no dates.
+    # Clamped into [1, MAX_QUERY_WINDOW_DAYS].
+    DEFAULT_QUERY_WINDOW_DAYS: int = 400
     SEARCH_TIMEOUT: str = "20s"
 
     # ------------------------------------------------------------ redis queue

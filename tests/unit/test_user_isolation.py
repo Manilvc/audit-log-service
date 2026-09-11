@@ -541,3 +541,30 @@ def test_a_timeline_is_still_confined_to_its_user() -> None:
     )
 
     assert {"term": {"user.uuid": "user-a"}} in query["bool"]["filter"]
+
+
+def test_a_search_with_no_filters_at_all_returns_everything_in_range() -> None:
+    """No dates, no actions: only the user filter and the window narrow it.
+
+    This is the shape a caller uses first - "show me the trail" - so anything
+    else silently applied here reads as missing data.
+    """
+    from app.search.query import build_query
+
+    query = build_query(UserScope(user_uuid="user-a"), AuditSearchFilter(), max_window_days=400)
+    flat = json.dumps(query)
+
+    assert {"term": {"user.uuid": "user-a"}} in query["bool"]["filter"]
+    assert "event.action" not in flat, "omitting actions must not filter by action"
+    assert "event.category" not in flat, "omitting categories must not filter by category"
+    assert "event.outcome" not in flat, "omitting outcomes must not filter by outcome"
+    assert len(query["bool"]["filter"]) == 2, "only the user filter and the time range"
+
+
+def test_the_shipped_default_window_covers_the_whole_queryable_range() -> None:
+    """A caller who names no dates should not have older events hidden."""
+    from app.core.config import Settings
+
+    settings = Settings(SERVICE_API_KEYS=["x"], PII_MASTER_KEK="y")
+
+    assert settings.DEFAULT_QUERY_WINDOW_DAYS == settings.MAX_QUERY_WINDOW_DAYS
