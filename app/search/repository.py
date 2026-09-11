@@ -214,19 +214,31 @@ class AuditRepository:
         search_after: list[Any] | None = None,
         with_total: bool | int = False,
         source_fields: list[str] | None = None,
+        ascending: bool = False,
+        full_history: bool = False,
     ) -> SearchPage:
-        """Run a user-scoped search."""
+        """Run a user-scoped search.
+
+        `ascending` returns oldest first, which is what a timeline of one
+        entity wants - the steps of an issuance read in the order they
+        happened. `full_history` widens the default window to the maximum, for
+        the same reason: the life of a credential is not "the last day".
+        Neither affects the mandatory user filter.
+        """
         targets, routing = self._resolve_read(scope)
         body = build_search_body(
             scope,
             criteria,
             size=size,
             max_window_days=self._max_window_days,
-            default_window_days=self._default_window_days,
+            default_window_days=(
+                self._max_window_days if full_history else self._default_window_days
+            ),
             search_after=search_after,
             track_total_hits=with_total,
             source_fields=source_fields,
             timeout=self._search_timeout,
+            ascending=ascending,
             sort_date_format=self._store.sort_date_format,
         )
 

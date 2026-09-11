@@ -255,7 +255,11 @@ def _refuses_without_a_user(client: TestClient, path: str, method: str) -> bool:
     handler runs, so a route that requires a user answers 400 without ever
     looking at the payload.
     """
-    url = path.replace("{event_id}", "evt_probe").replace("{user_uuid}", "user-a")
+    url = (
+        path.replace("{event_id}", "evt_probe")
+        .replace("{user_uuid}", "user-a")
+        .replace("{target_id}", "cred_probe")
+    )
     response = client.request(method.upper(), url, json=None if method == "get" else {})
     return response.status_code == 400 and "x-audit-user-uuid" in response.text
 

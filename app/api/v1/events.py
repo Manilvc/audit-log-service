@@ -126,6 +126,54 @@ async def search_events(
 
 
 @router.get(
+    "/events/timeline/{target_id}",
+    summary="The full history of one entity, oldest first",
+)
+async def entity_timeline(
+    target_id: Annotated[str, Path(max_length=64)],
+    principal: PrincipalDep,
+    service: QueryServiceDep,
+    user_uuid_header: UserUuidDep,
+    size: Annotated[int, Query(ge=1, le=500)] = 200,
+    action: Annotated[
+        list[str] | None,
+        Query(description="Restrict to these actions, e.g. action=credential.issue"),
+    ] = None,
+) -> ORJSONResponse:
+    """Everything that happened to one entity, in the order it happened.
+
+    Answers "show me this credential's trail": the issuance steps, the signing
+    and anchoring, and every later view, share, reissue or revocation. Pass the
+    credential's id (or a record's, or a subject's - the mechanism is the same
+    for any entity an event targets).
+
+    A GET with the id in the path rather than a POST body, because unlike a
+    search filter an entity id is the resource being addressed. It is not
+    personal data, so it is safe in an access log in a way a search over actor
+    emails would not be.
+
+    Spans the entire retained history rather than the default search window: a
+    credential issued eight months ago is still the answer to a question asked
+    today. Bulk-issued credentials are included - those record their id in
+    `target.ids` rather than `target.id`, and both are matched.
+
+    User-scoped like every other read. A credential id belonging to another
+    user returns an empty timeline, not its history.
+    """
+    result = await service.timeline(
+        target_id,
+        principal=principal,
+        requested_user_uuid=user_uuid_header,
+        size=size,
+        actions=tuple(action or ()),
+    )
+    return success(
+        result.model_dump(),
+        message=f"{len(result.events)} event(s) in the timeline for {target_id}.",
+    )
+
+
+@router.get(
     "/events/{event_id}",
     summary="Fetch one audit event",
 )

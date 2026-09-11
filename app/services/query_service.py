@@ -182,6 +182,65 @@ class QueryService:
             partial=page.timed_out,
         )
 
+    async def timeline(
+        self,
+        target_id: str,
+        *,
+        principal: Principal,
+        requested_user_uuid: str | None = None,
+        size: int = 200,
+        cursor: list[Any] | None = None,
+        actions: tuple[str, ...] = (),
+    ) -> SearchResponse:
+        """Every event about one entity, oldest first, across its whole history.
+
+        Built for the question "what happened to this credential?" - the
+        issuance steps, the signing, the anchoring, every later view, share,
+        reissue and revocation, in the order they occurred.
+
+        Three differences from `search`, and each one is what makes it a
+        timeline rather than a filtered list:
+
+        * **Oldest first.** Steps read in the order they happened.
+        * **Whole history, not the default window.** A credential issued eight
+          months ago is still the answer to a question asked today.
+        * **Matches bulk events too.** A credential issued in a batch records
+          its id in `target.ids`, not `target.id`; the filter checks both, so a
+          bulk-issued credential is not invisible to its own timeline.
+
+        Still user-scoped: the mandatory user filter applies exactly as it does
+        to any other read, so a credential id belonging to another user returns
+        an empty timeline rather than its history.
+        """
+        principal.require(Scope.READ)
+        scope = self.resolve_scope(principal, requested_user_uuid=requested_user_uuid)
+
+        page = await self._repository.search(
+            scope,
+            AuditSearchFilter(target_ids=(target_id,), actions=actions),
+            size=min(size, self._settings.MAX_PAGE_SIZE),
+            search_after=cursor,
+            ascending=True,
+            full_history=True,
+        )
+        events = await self._reveal(page.events, principal=principal)
+
+        await self.record_access(
+            principal=principal,
+            scope=scope,
+            action=Action.AUDIT_SEARCH,
+            result_count=len(events),
+            detail={"timeline_for": target_id, "size": size},
+        )
+
+        return SearchResponse(
+            events=events,
+            cursor=page.next_cursor if len(page.events) == size else None,
+            total=page.total,
+            took_ms=page.took_ms,
+            partial=page.timed_out,
+        )
+
     async def get_event(
         self,
         event_id: str,

@@ -10,6 +10,7 @@ rather than trusting a reviewer to notice a missing clause.
 from __future__ import annotations
 
 import itertools
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -476,3 +477,67 @@ def test_an_explicit_range_still_wins_over_the_default() -> None:
 
     assert datetime.fromisoformat(clause["gte"]) == start
     assert datetime.fromisoformat(clause["lte"]) == end
+
+
+# ---------------------------------------------------------------------------
+# Entity timeline - "what happened to this credential?"
+# ---------------------------------------------------------------------------
+def test_a_timeline_matches_both_single_and_bulk_targets() -> None:
+    """A bulk-issued credential records its id in target.ids, not target.id.
+
+    Checking only one of the two would make exactly the credentials issued in a
+    batch invisible to their own history.
+    """
+    from app.search.query import build_query
+
+    query = build_query(
+        UserScope(user_uuid="user-a"),
+        AuditSearchFilter(target_ids=("cred-1",)),
+        max_window_days=400,
+    )
+    flat = json.dumps(query)
+
+    assert '"target.id"' in flat
+    assert '"target.ids"' in flat
+
+
+def test_a_timeline_reads_oldest_first() -> None:
+    """Issuance steps only make sense in the order they happened."""
+    from app.search.query import build_search_body
+
+    body = build_search_body(
+        UserScope(user_uuid="user-a"),
+        AuditSearchFilter(target_ids=("cred-1",)),
+        size=50,
+        max_window_days=400,
+        ascending=True,
+    )
+
+    assert body["sort"][0]["@timestamp"]["order"] == "asc"
+
+
+def test_an_ordinary_search_still_reads_newest_first() -> None:
+    """The timeline's ordering must not leak into normal search."""
+    from app.search.query import build_search_body
+
+    body = build_search_body(
+        UserScope(user_uuid="user-a"),
+        AuditSearchFilter(),
+        size=50,
+        max_window_days=400,
+    )
+
+    assert body["sort"][0]["@timestamp"]["order"] == "desc"
+
+
+def test_a_timeline_is_still_confined_to_its_user() -> None:
+    """A credential id from another user must not reveal its history."""
+    from app.search.query import build_query
+
+    query = build_query(
+        UserScope(user_uuid="user-a"),
+        AuditSearchFilter(target_ids=("cred-1",)),
+        max_window_days=400,
+    )
+
+    assert {"term": {"user.uuid": "user-a"}} in query["bool"]["filter"]
