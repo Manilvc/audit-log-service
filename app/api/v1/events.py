@@ -9,9 +9,13 @@ Routes
 ``POST /events``
     Batch ingest (≤500). Returns **202** after durable enqueue; crypto/ES/S3
     happen in the worker, so credential flows never wait on audit I/O.
+``GET /events``
+    The console listing: one page of display-ready rows for the audit log
+    table and its detail drawer. Filter chips, cursor pagination, and a
+    per-row hash self-check.
 ``POST /events/search`` / ``GET /events/{id}`` / ``POST /events/aggregate``
-    User-scoped reads. Each successful read emits an ``audit_log.*`` event
-    (HIPAA 164.312(b) audit-of-the-audit).
+    User-scoped reads over canonical ECS documents. Each successful read emits
+    an ``audit_log.*`` event (HIPAA 164.312(b) audit-of-the-audit).
 ``POST /events/export``
     Streaming NDJSON over a Point-in-Time; requires ``audit:export``.
 """
@@ -19,6 +23,7 @@ Routes
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Annotated
 
 import orjson
@@ -33,15 +38,18 @@ from app.api.deps import (
     UserUuidDep,
     UserUuidHeaderDep,
 )
+from app.core.constants import DEFAULT_LISTING_PAGE_SIZE, MAX_CURSOR_LENGTH
 from app.core.exceptions import NotFound
 from app.core.logging import get_logger
 from app.core.responses import ORJSONResponse, success
-from app.domain.enums import Scope
+from app.domain.display import FilterPreset
+from app.domain.enums import Outcome, Scope, Severity
 from app.schemas.api import (
     AggregationRequest,
     ExportRequest,
     IngestBatchIn,
     SearchRequest,
+    decode_cursor,
 )
 
 logger = get_logger(__name__)
@@ -88,6 +96,130 @@ async def ingest_events(
         message=message,
         status_code=status.HTTP_202_ACCEPTED,
     )
+
+
+@router.get(
+    "/events",
+    summary="List audit events for the console",
+    response_description="One page of display-ready audit log rows",
+)
+async def list_events(
+    principal: PrincipalDep,
+    service: QueryServiceDep,
+    user_uuid_header: UserUuidDep,
+    # Named `preset` in Python, `filter` on the wire: the query parameter has to
+    # read as the chip the operator clicked, while shadowing the `filter`
+    # builtin inside the function would be a lint failure and a readability one.
+    preset: Annotated[
+        FilterPreset,
+        Query(
+            alias="filter",
+            description="Filter chip: all, critical, revocation, approval, issuance, verification",
+        ),
+    ] = FilterPreset.ALL,
+    start: Annotated[
+        datetime | None,
+        Query(description="Earliest event, inclusive. ISO 8601 with an offset."),
+    ] = None,
+    end: Annotated[datetime | None, Query(description="Latest event, inclusive.")] = None,
+    action: Annotated[
+        list[str] | None,
+        Query(max_length=50, description="Restrict to these actions, e.g. action=credential.issue"),
+    ] = None,
+    severity: Annotated[list[Severity] | None, Query()] = None,
+    outcome: Annotated[list[Outcome] | None, Query()] = None,
+    actor_id: Annotated[list[str] | None, Query(max_length=50)] = None,
+    target_id: Annotated[list[str] | None, Query(max_length=50)] = None,
+    issuer_id: Annotated[str | None, Query(max_length=64)] = None,
+    size: Annotated[int, Query(ge=1, le=200, description="Rows per page.")] = (
+        DEFAULT_LISTING_PAGE_SIZE
+    ),
+    cursor: Annotated[
+        str | None,
+        Query(max_length=MAX_CURSOR_LENGTH, description="Opaque cursor from the previous page."),
+    ] = None,
+    with_total: Annotated[
+        bool,
+        Query(description="Count matches for the 'N events' heading. Capped for cost."),
+    ] = True,
+) -> ORJSONResponse:
+    """One page of the audit log table, ready to render.
+
+    The console's list view and its detail drawer are served by this one call.
+    Each row carries both what the table shows - time, event title, category,
+    severity badge, target, actor, abbreviated anchor - and what the drawer adds
+    when a row is opened: source IP, session, the full event hash and the
+    previous one. Opening a row therefore needs no second request.
+
+    Why a GET, when `POST /events/search` exists
+    --------------------------------------------
+    `search` is a POST because its filter is a structured document, and because
+    audit search criteria (actor ids, session ids) are personal data that should
+    not land in access logs and browser history. This listing's filters are
+    presets, dates and severities - none of them personal - so it can be what a
+    console page wants to be: a bookmarkable, shareable, cacheable URL. Pass an
+    `actor_id` or `target_id` and you have opted into putting that id in a URL;
+    the structured search remains there for filters that should not be.
+
+    `search` is not deprecated by this and is still the right call for a SIEM
+    forwarder or a compliance extract, which want canonical ECS documents rather
+    than a rendering of them.
+
+    Filtering
+    ---------
+    `filter` is the chip above the table and narrows by activity - `issuance`
+    selects the actions the Category column labels *Issuance*, so the chip and
+    the column can never disagree. `critical` selects the severity that draws
+    the red badge. Supplying `action` or `severity` as well narrows further
+    still: chip AND filter, exactly as the screen reads. A combination that
+    excludes everything returns an empty page rather than quietly dropping one
+    of the two clauses.
+
+    Integrity
+    ---------
+    Every row carries `anchor.self_check`, recomputed locally: `pass` means the
+    record still hashes to the value stored on it, so it has not been edited in
+    place. It is not a full chain verification - proving nothing was deleted,
+    reordered or inserted means walking the sequence, which is what the drawer's
+    "Verify chain" button calls
+    (`POST /v1/audit/compliance/integrity/verify`). `unavailable` means the
+    check could not run, typically an event written before chaining was enabled;
+    it is not a failure and must not be displayed as one.
+
+    Personal data
+    -------------
+    Actor names, target names, source IPs and messages are encrypted at rest and
+    are returned only to a caller holding `audit:export` or `audit:admin`.
+    Without one, those fields come back null and `pii_protected` is true on the
+    row, so the console can offer to escalate rather than let a reader take the
+    blanks to mean there was nothing there. The row title falls back to a label
+    derived from the action, so the table stays readable either way.
+
+    Like every read here, listing the trail is itself recorded as an audit event
+    (HIPAA 164.312(b), SOC 2 CC7.2).
+    """
+    result = await service.list_events(
+        principal=principal,
+        requested_user_uuid=user_uuid_header,
+        preset=preset,
+        start=start,
+        end=end,
+        actions=tuple(action or ()),
+        severities=tuple(severity or ()),
+        outcomes=tuple(outcome or ()),
+        actor_ids=tuple(actor_id or ()),
+        target_ids=tuple(target_id or ()),
+        issuer_id=issuer_id,
+        size=size,
+        cursor=decode_cursor(cursor),
+        with_total=with_total,
+    )
+    total = result.total
+    if total is None:
+        heading = f"{len(result.events)} event(s) returned."
+    else:
+        heading = f"{total}{'+' if result.total_capped else ''} event(s)."
+    return success(result.model_dump(mode="json"), message=heading)
 
 
 @router.post(

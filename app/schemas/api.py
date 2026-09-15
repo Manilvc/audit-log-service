@@ -14,12 +14,21 @@ time is not.
 
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final, Literal
 
+import orjson
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-from app.core.constants import DOMAIN_PATTERN, MAX_DOMAIN_LENGTH, MAX_KEY_LABEL_LENGTH
+from app.core.constants import (
+    DOMAIN_PATTERN,
+    FILTER_PRESET_ALL,
+    MAX_CURSOR_LENGTH,
+    MAX_DOMAIN_LENGTH,
+    MAX_KEY_LABEL_LENGTH,
+)
+from app.core.exceptions import InvalidCursor
 from app.domain.enums import (
     ActorType,
     EntityType,
@@ -415,6 +424,229 @@ class ExportRequest(SearchRequest):
     include_integrity: bool = True
     """Keep the integrity block so the recipient can verify the chain
     independently - which is the point of an evidence export."""
+
+
+# ---------------------------------------------------------------------------
+# Console listing
+# ---------------------------------------------------------------------------
+# The models below are a *read model*: a flattened, display-ready projection of
+# the stored ECS document, built for the audit log table and its detail drawer.
+# `SearchResponse` stays the machine contract - raw ECS documents, nothing
+# derived - because a SIEM forwarder and a compliance export want the canonical
+# shape, not a rendering of it. Two consumers with genuinely different needs get
+# two representations rather than one that serves neither well.
+
+
+class AuditLogActor(BaseModel):
+    """Who acted, resolved for display."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    type: str | None = None
+    name: str | None = None
+    """Personal data. Null when the caller may not decrypt it."""
+    service: str | None = None
+    session_id: str | None = None
+    on_behalf_of: str | None = None
+    label: str
+    """One line for the Actor column - a name, a service, or an id, in that
+    order of preference. Never null, so the column never renders blank."""
+
+
+class AuditLogTarget(BaseModel):
+    """What was acted upon, resolved for display."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    type: str | None = None
+    name: str | None = None
+    """Personal data. Null when the caller may not decrypt it."""
+    count: int | None = None
+    """Records affected by a bulk action."""
+    label: str
+
+
+#: Outcome of a row's hash self-check. Named rather than inlined so the service
+#: that computes it and the model that carries it are typed by the same thing.
+AnchorSelfCheck = Literal["pass", "fail", "unavailable"]
+
+
+class AuditLogAnchor(BaseModel):
+    """This event's link in the tamper-evident chain.
+
+    Both the full hash and the abbreviated form travel together: the table shows
+    `#a1f4...e2`, while an operator reconciling an event against an export needs
+    all 64 characters.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int | None = None
+    chain_id: str | None = None
+    algo: str | None = None
+    hash: str | None = None
+    hash_short: str | None = None
+    prev_hash: str | None = None
+    prev_hash_short: str | None = None
+
+    self_check: AnchorSelfCheck = "unavailable"
+    """Whether this record still hashes to the value stored on it.
+
+    Recomputed from the document as read, so it detects an in-place edit - the
+    "was this row modified" question - at the cost of one SHA-256.
+
+    It is deliberately *not* a chain verification: proving that nothing was
+    deleted, reordered or inserted means walking neighbouring sequence numbers,
+    which is what `POST /v1/audit/compliance/integrity/verify` does. A listing
+    that walked the chain per row would issue a query per row.
+
+    `unavailable` means the check could not be run - a document written before
+    integrity was enabled, or a response narrowed with `fields` so the hashed
+    content is not all present. It is not a failure and must not be shown as
+    one.
+    """
+
+
+class AuditLogRow(BaseModel):
+    """One row of the audit log table.
+
+    Carries everything both screens need: the table's seven columns, and the
+    detail drawer's timestamp, subject, actor, source IP, session and hash
+    chain. Opening a row therefore needs no second request - the drawer renders
+    from the row the client already holds.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str
+    timestamp: datetime | None = None
+    """When it happened, per the emitter."""
+    ingested_at: datetime | None = None
+    """When this service received it. A wide gap from `timestamp` is itself
+    audit-relevant, which is why both are surfaced rather than just one."""
+
+    title: str
+    """The Event column. The emitter's message when there is one, otherwise a
+    label derived from the action."""
+    action: str
+    category: str
+    """Display category - `issuance`, `revocation`, `verification`, ... See
+    `app.domain.display.DisplayCategory`. A lowercase code; the console
+    title-cases it."""
+    ecs_category: str | None = None
+    """The stored ECS `event.category`, kept alongside the display one so a
+    caller can still correlate against the canonical taxonomy."""
+    type: str | None = None
+    outcome: str | None = None
+    severity: str | None = None
+    """The stored five-level severity."""
+    severity_tier: str
+    """`info` / `warn` / `critical` - the three badges the console draws."""
+    reason: str | None = None
+
+    actor: AuditLogActor
+    target: AuditLogTarget
+
+    source_ip: str | None = None
+    """Personal data. Null when the caller may not decrypt it."""
+    country_code: str | None = None
+    service_name: str | None = None
+    issuer_id: str | None = None
+    request_id: str | None = None
+    trace_id: str | None = None
+
+    anchor: AuditLogAnchor
+    pii_protected: bool = False
+    """True when this row holds personal data the caller was not entitled to
+    decrypt, so the console can offer "request elevated access" rather than let
+    a reader take the blanks to mean there was nothing there."""
+
+
+class AnchorNetwork(BaseModel):
+    """The notary the console names under an event's hash chain."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    id: str | None = None
+    notarised: bool
+    """Whether this deployment seals WORM checkpoints at all.
+
+    A deployment-level fact, not a per-event one: it says checkpointing is
+    configured, not that this particular event has been sealed into a checkpoint
+    yet. The console must not promise more than that from this flag - the
+    per-event proof comes from the integrity verify endpoint."""
+
+
+class AuditLogListResponse(BaseModel):
+    """One page of the audit log table."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    events: list[AuditLogRow]
+    total: int | None = None
+    """Matching events, for the "N events" heading. Counted up to
+    `TOTAL_HITS_CAP` and then reported as the cap - see `total_capped`."""
+    total_capped: bool = False
+    """True when `total` reached the accuracy cap, so the heading reads
+    "10,000+" rather than claiming an exact figure nobody counted."""
+    cursor: str | None = None
+    """Opaque. Pass back as `cursor` for the next page; null means this was the
+    last one."""
+    took_ms: int = 0
+    partial: bool = False
+    """The search timed out server-side, so the page is incomplete. Surfaced
+    rather than hidden: a compliance view that silently drops rows is worse than
+    one that says it could not finish."""
+    filter: str = FILTER_PRESET_ALL
+    """The preset this page was built with, echoed so a client restoring a
+    bookmarked URL can highlight the right chip."""
+    anchor_network: AnchorNetwork
+
+
+def encode_cursor(sort_values: list[Any] | None) -> str | None:
+    """Pack `search_after` sort values into one URL-safe token.
+
+    The listing is a GET, so the cursor has to survive a query string. Base64url
+    over compact JSON keeps it to a single parameter and keeps its internals out
+    of the client's hands: the sort tuple is an implementation detail of the
+    sort order, and a client that learned to build one would break the moment
+    the tiebreaker changed.
+
+    Not encrypted and not signed, because it carries no authority. Every request
+    is re-authenticated and re-scoped to the caller's own user, so a forged
+    cursor can only produce a wrong page of events that caller could already
+    read.
+    """
+    if not sort_values:
+        return None
+    packed = base64.urlsafe_b64encode(orjson.dumps(sort_values))
+    return packed.decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor: str | None) -> list[Any] | None:
+    """Unpack a cursor token, or None when there was none.
+
+    Raises:
+        InvalidCursor: the token is not one this service issued.
+    """
+    if cursor is None or not cursor.strip():
+        return None
+    token = cursor.strip()
+    if len(token) > MAX_CURSOR_LENGTH:
+        raise InvalidCursor("the pagination cursor is longer than any cursor this service issues")
+    try:
+        # Re-pad: the trailing "=" are stripped on the way out to keep the token
+        # clean in a URL, and urlsafe_b64decode requires them back.
+        padded = token + "=" * (-len(token) % 4)
+        decoded = orjson.loads(base64.urlsafe_b64decode(padded))
+    except Exception as exc:
+        raise InvalidCursor("the pagination cursor could not be decoded") from exc
+    if not isinstance(decoded, list) or not decoded:
+        raise InvalidCursor("the pagination cursor does not carry sort values")
+    return decoded
 
 
 # ---------------------------------------------------------------------------

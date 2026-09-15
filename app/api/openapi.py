@@ -267,6 +267,7 @@ _ERASURE_EXAMPLE: dict[str, Any] = {
 _USER_UUID_REQUIRED_OPERATIONS: frozenset[tuple[str, str]] = frozenset(
     {
         ("/v1/audit/events", "post"),
+        ("/v1/audit/events", "get"),
         ("/v1/audit/events/{event_id}", "get"),
         ("/v1/audit/events/timeline/{target_id}", "get"),
         ("/v1/audit/events/export", "post"),

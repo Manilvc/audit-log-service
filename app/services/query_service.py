@@ -18,16 +18,36 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.core.config import Settings
+from app.core.constants import DEFAULT_LISTING_PAGE_SIZE
+from app.core.integrity import compute_hash, hashes_equal
 from app.core.logging import get_logger
 from app.core.security.auth import AuthorizationError, Principal
 from app.core.security.crypto import PiiCipher
+from app.domain.display import (
+    FilterPreset,
+    actor_label,
+    display_category,
+    event_title,
+    severity_tier,
+    short_hash,
+    target_label,
+)
 from app.domain.enums import Action, EventCategory, EventType, Outcome, Scope, Severity
+from app.domain.events import PROTECTED_PLACEHOLDER
 from app.queue.stream import IngestQueue
 from app.schemas.api import (
     AggregationRequest,
+    AnchorNetwork,
+    AnchorSelfCheck,
+    AuditLogActor,
+    AuditLogAnchor,
+    AuditLogListResponse,
+    AuditLogRow,
+    AuditLogTarget,
     ExportRequest,
     SearchRequest,
     SearchResponse,
+    encode_cursor,
 )
 from app.search.query import AuditSearchFilter, UserScope
 from app.search.repository import AuditRepository
@@ -239,6 +259,159 @@ class QueryService:
             total=page.total,
             took_ms=page.took_ms,
             partial=page.timed_out,
+        )
+
+    # ---------------------------------------------------------------- listing
+    async def list_events(
+        self,
+        *,
+        principal: Principal,
+        requested_user_uuid: str | None = None,
+        preset: FilterPreset = FilterPreset.ALL,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        actions: tuple[str, ...] = (),
+        severities: tuple[Severity, ...] = (),
+        outcomes: tuple[Outcome, ...] = (),
+        actor_ids: tuple[str, ...] = (),
+        target_ids: tuple[str, ...] = (),
+        issuer_id: str | None = None,
+        size: int = DEFAULT_LISTING_PAGE_SIZE,
+        cursor: list[Any] | None = None,
+        with_total: bool = True,
+    ) -> AuditLogListResponse:
+        """One page of the audit log table, rendered for display.
+
+        Same query path, same user scope and same audit-of-the-audit trail as
+        `search`; what differs is the shape of what comes back. `search` hands
+        over raw ECS documents because a SIEM forwarder wants the canonical
+        record. This hands over rows: a title, a display category, a badge tier,
+        resolved actor and target labels and an abbreviated anchor - the seven
+        columns of the table, plus everything the detail drawer shows, so
+        opening a row costs no second request.
+
+        Ordering and integrity
+        ----------------------
+        Newest first, because a console opens on "what just happened".
+
+        Each row carries a hash self-check, recomputed locally from the document
+        as read. It is computed *before* PII is decrypted, which is not
+        incidental: the hash covers the stored document, and decrypting a field
+        would change the bytes it was taken over and turn every row into a false
+        `fail`.
+
+        Args:
+            preset: the console's filter chip. Narrows the query; never widens
+                it, and never displaces the user scope.
+            actions / severities: explicit filters, intersected with the
+                preset's rather than replacing it, so a chip plus a filter is
+                the conjunction the user sees on screen.
+            with_total: count matches for the "N events" heading, capped at
+                `TOTAL_HITS_CAP`. Costly on a wide window, so a caller paging
+                deep can switch it off after the first page.
+        """
+        principal.require(Scope.READ)
+        scope = self.resolve_scope(principal, requested_user_uuid=requested_user_uuid)
+
+        selected_actions = _narrow(actions, preset.actions)
+        selected_severities = _narrow(severities, preset.severities)
+        if selected_actions is None or selected_severities is None:
+            # The chip and the explicit filter have nothing in common, so
+            # nothing can match. Answered without a query rather than by
+            # dropping one of the two clauses - silently widening a filter on an
+            # audit view would show rows the operator believes they excluded.
+            await self.record_access(
+                principal=principal,
+                scope=scope,
+                action=Action.AUDIT_SEARCH,
+                result_count=0,
+                detail={"listing": True, "filter": preset.value, "contradictory_filter": True},
+            )
+            return self._empty_listing(preset)
+
+        # Clamped once and reused: the "was the page full" test below has to ask
+        # about the size actually requested of the store, not the one the caller
+        # asked for. Comparing against an unclamped size would never match, so a
+        # caller asking for more than MAX_PAGE_SIZE would silently get one page
+        # and no cursor to reach the rest.
+        page_size = min(size, self._settings.MAX_PAGE_SIZE)
+        page = await self._repository.search(
+            scope,
+            AuditSearchFilter(
+                start=start,
+                end=end,
+                actions=selected_actions,
+                severities=selected_severities,
+                outcomes=tuple(outcomes),
+                actor_ids=tuple(actor_ids),
+                target_ids=tuple(target_ids),
+                issuer_id=issuer_id,
+            ),
+            size=page_size,
+            search_after=cursor,
+            with_total=(self._settings.TOTAL_HITS_CAP if with_total else False),
+        )
+
+        # Before `_reveal`: the hash was taken over the stored (encrypted)
+        # document, so this has to run on the bytes as they came back.
+        checks = [_integrity_self_check(document) for document in page.events]
+        revealed = await self._reveal(page.events, principal=principal)
+        rows = [
+            _to_row(document, self_check=check)
+            for document, check in zip(revealed, checks, strict=True)
+        ]
+
+        await self.record_access(
+            principal=principal,
+            scope=scope,
+            action=Action.AUDIT_SEARCH,
+            result_count=len(rows),
+            detail={
+                "listing": True,
+                "filter": preset.value,
+                "size": size,
+                "paginated": cursor is not None,
+            },
+        )
+
+        total = page.total
+        return AuditLogListResponse(
+            events=rows,
+            total=total,
+            total_capped=(total is not None and total >= self._settings.TOTAL_HITS_CAP),
+            # A cursor only when the page was full. Handing one back on a short
+            # page costs the caller an extra request that returns nothing.
+            cursor=(encode_cursor(page.next_cursor) if len(page.events) == page_size else None),
+            took_ms=page.took_ms,
+            partial=page.timed_out,
+            filter=preset.value,
+            anchor_network=self._anchor_network(),
+        )
+
+    def _anchor_network(self) -> AnchorNetwork:
+        """The notary this deployment names beneath an event's hash chain.
+
+        `notarised` reports whether WORM checkpointing is actually configured,
+        so a deployment that seals nothing cannot have the console claim its
+        events are anchored. The label is cosmetic; this flag is the part that
+        has to be true.
+        """
+        return AnchorNetwork(
+            name=self._settings.ANCHOR_NETWORK_NAME,
+            id=self._settings.ANCHOR_NETWORK_ID or None,
+            notarised=bool(self._settings.ARCHIVE_ENABLED and self._settings.ARCHIVE_BUCKET),
+        )
+
+    def _empty_listing(self, preset: FilterPreset) -> AuditLogListResponse:
+        """A well-formed empty page, so the console renders a table with no rows
+        rather than an error."""
+        return AuditLogListResponse(
+            events=[],
+            total=0,
+            cursor=None,
+            took_ms=0,
+            filter=preset.value,
+            anchor_network=self._anchor_network(),
         )
 
     async def get_event(
@@ -463,6 +636,164 @@ def _to_filter(request: SearchRequest) -> AuditSearchFilter:
     )
 
 
+def _narrow(
+    requested: tuple[Any, ...],
+    preset: tuple[Any, ...],
+) -> tuple[Any, ...] | None:
+    """Intersect an explicit filter with a chip's, or None when they conflict.
+
+    Three cases, and the third is the one that matters. With only one of the
+    two supplied, that one applies. With both, the answer is the intersection -
+    a chip and a filter shown together on screen read as "and". When the
+    intersection is empty the correct answer is "no rows", which is why this
+    returns None rather than an empty tuple: an empty tuple means *no filter*
+    to the query builder, so returning one would quietly show everything the
+    operator just excluded.
+    """
+    if not preset:
+        return requested
+    if not requested:
+        return preset
+    allowed = set(preset)
+    kept = tuple(value for value in requested if value in allowed)
+    return kept or None
+
+
+def _integrity_self_check(document: dict[str, Any]) -> AnchorSelfCheck:
+    """Does this record still hash to the value stored on it?
+
+    Detects an in-place edit of a single document at the cost of one SHA-256
+    over content already in memory - cheap enough to run on every row.
+
+    It is not a chain verification: deletion, reordering and insertion are
+    detected by walking neighbouring sequence numbers, which is what the
+    compliance verify endpoint does and what the drawer's "Verify chain" button
+    calls. This answers the narrower question the table can afford to ask.
+
+    Must be called on the document as stored, before PII is decrypted: the hash
+    was taken over the encrypted bytes, so a decrypted document would never
+    match.
+    """
+    integrity = document.get("integrity")
+    if not isinstance(integrity, dict):
+        # No integrity block: written before chaining was enabled, or the
+        # caller narrowed `_source` and left it out. Not a failure, and
+        # reporting it as one would cry wolf on a legitimately old record.
+        return "unavailable"
+    try:
+        recomputed = compute_hash(
+            str(integrity["chain_id"]),
+            int(integrity["seq"]),
+            str(integrity["prev_hash"]),
+            document,
+        )
+        stored = str(integrity["hash"])
+    except (KeyError, TypeError, ValueError):
+        return "unavailable"
+    return "pass" if hashes_equal(recomputed, stored) else "fail"
+
+
+def _to_row(document: dict[str, Any], *, self_check: AnchorSelfCheck) -> AuditLogRow:
+    """Project one stored document onto a table row."""
+    event = _section(document, "event")
+    actor = _section(document, "actor")
+    target = _section(document, "target")
+    source = _section(document, "source")
+    http = _section(document, "http")
+    integrity = _section(document, "integrity")
+    user = _section(document, "user")
+    service = _section(document, "service")
+
+    # Each `_visible` call reports whether it hit a mask, so the row can say
+    # "there is personal data here you may not see" instead of leaving the
+    # console to read a null as "this field was empty".
+    protected = False
+    actor_name, protected = _visible(actor.get("name"), protected)
+    target_name, protected = _visible(target.get("name"), protected)
+    source_ip, protected = _visible(source.get("ip"), protected)
+    _, protected = _visible(document.get("message"), protected)
+
+    stored_hash = _text(integrity.get("hash"))
+    stored_prev = _text(integrity.get("prev_hash"))
+
+    return AuditLogRow(
+        event_id=_text(event.get("id")) or "",
+        timestamp=document.get("@timestamp"),
+        ingested_at=event.get("ingested"),
+        title=event_title(document),
+        action=_text(event.get("action")) or str(Action.UNKNOWN),
+        category=display_category(_text(event.get("action")) or "").value,
+        ecs_category=_text(event.get("category")) or None,
+        type=_text(event.get("type")) or None,
+        outcome=_text(event.get("outcome")) or None,
+        severity=_text(event.get("severity")) or None,
+        severity_tier=severity_tier(_text(event.get("severity"))).value,
+        reason=_text(event.get("reason")) or None,
+        actor=AuditLogActor(
+            id=_text(actor.get("id")) or None,
+            type=_text(actor.get("type")) or None,
+            name=actor_name or None,
+            service=_text(actor.get("service")) or None,
+            session_id=_text(actor.get("session_id")) or None,
+            on_behalf_of=_text(actor.get("on_behalf_of")) or None,
+            label=actor_label(actor),
+        ),
+        target=AuditLogTarget(
+            id=_text(target.get("id")) or None,
+            type=_text(target.get("type")) or None,
+            name=target_name or None,
+            count=target.get("count") if isinstance(target.get("count"), int) else None,
+            label=target_label(target),
+        ),
+        source_ip=source_ip or None,
+        country_code=_text(source.get("country_code")) or None,
+        service_name=_text(service.get("name")) or None,
+        issuer_id=_text(user.get("issuer_id")) or None,
+        request_id=_text(http.get("request_id")) or None,
+        trace_id=_text(http.get("trace_id")) or None,
+        anchor=AuditLogAnchor(
+            seq=integrity.get("seq") if isinstance(integrity.get("seq"), int) else None,
+            chain_id=_text(integrity.get("chain_id")) or None,
+            algo=_text(integrity.get("algo")) or None,
+            hash=stored_hash or None,
+            hash_short=short_hash(stored_hash),
+            prev_hash=stored_prev or None,
+            prev_hash_short=short_hash(stored_prev),
+            self_check=self_check,
+        ),
+        pii_protected=protected,
+    )
+
+
+def _section(document: dict[str, Any], key: str) -> dict[str, Any]:
+    """One nested block of the ECS document, or an empty dict.
+
+    The stored shape prunes empty containers (see `AuditEvent.to_document`), so
+    a missing `source` or `integrity` block is ordinary rather than an error.
+    """
+    value = document.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _visible(value: Any, protected: bool) -> tuple[str, bool]:
+    """Split a possibly-masked PII field into its value and the masked flag.
+
+    Returns the value only when it is genuinely readable; `[PROTECTED]` comes
+    back as empty with the flag raised, so the row reports the masking once
+    rather than repeating the marker in every field.
+    """
+    if not isinstance(value, str):
+        return "", protected
+    stripped = value.strip()
+    if stripped == PROTECTED_PLACEHOLDER:
+        return "", True
+    return stripped, protected
+
+
 def _validated_fields(fields: list[str] | None) -> list[str] | None:
     """Filter requested `_source` paths against the allow-list.
 
@@ -498,4 +829,4 @@ def _set_masked(document: dict[str, Any], path: str) -> None:
             child = {}
             node[part] = child
         node = child
-    node[parts[-1]] = "[PROTECTED]"
+    node[parts[-1]] = PROTECTED_PLACEHOLDER

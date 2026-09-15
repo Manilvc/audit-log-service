@@ -209,6 +209,16 @@ class Settings(BaseSettings):
     ARCHIVE_SEGMENT_MAX_SECONDS: int = 300
     ARCHIVE_KMS_KEY_ID: str | None = None
 
+    # What the console names as the notary when it shows an event's anchor.
+    # Presentation only - it labels the WORM checkpointing configured above and
+    # grants nothing. The read API reports it alongside a flag saying whether
+    # checkpointing is actually switched on, so the console cannot claim an
+    # event is anchored on a deployment that seals no checkpoints.
+    ANCHOR_NETWORK_NAME: str = "EveryCRED Anchor Network"
+    # Which instance of it, e.g. `evcred-mainnet-1`. Blank in an environment
+    # that has not been given one; the console then shows the name alone.
+    ANCHOR_NETWORK_ID: str = ""
+
     # ------------------------------------------------ crypto-shredding / PII
     # Master key-encryption key: 32 bytes, base64url-encoded. Wraps every
     # per-subject data key. Rotate by adding a KEK version, never in place.

@@ -59,6 +59,18 @@ class InvalidHeader(AuditServiceError):
     message = "A request header is malformed."
 
 
+class InvalidCursor(AuditServiceError):
+    """A pagination cursor is present but unreadable.
+
+    400 rather than silently restarting from page one: a caller paging through
+    an audit trail that quietly jumps back to the beginning would read the same
+    events twice and never learn it had lost its place.
+    """
+
+    status_code = status.HTTP_400_BAD_REQUEST
+    message = "The pagination cursor is not valid."
+
+
 class RateLimited(AuditServiceError):
     """Caller exceeded the configured per-principal rate ceiling."""
 

@@ -107,6 +107,13 @@ REDACT_KEYS: Final[frozenset[str]] = frozenset(
 
 REDACTED_PLACEHOLDER: Final[str] = "[REDACTED]"
 
+#: Stands in for a PII field a reader is not entitled to decrypt. Distinct from
+#: `REDACTED_PLACEHOLDER`, which marks a value that was never stored at all: this
+#: one says "personal data exists here and you may not see it", so a reader knows
+#: to ask for elevated access rather than assume the field was empty. Written by
+#: `services.query_service` on read; never stored.
+PROTECTED_PLACEHOLDER: Final[str] = "[PROTECTED]"
+
 
 class Actor(BaseModel):
     """Who did it."""

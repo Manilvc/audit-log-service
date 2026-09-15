@@ -204,7 +204,8 @@ Base path `/v1`. Responses use the platform envelope
 | Method | Path | Scope | Notes |
 |---|---|---|---|
 | `POST` | `/v1/audit/events` | `audit:write` | Batch ingest, ≤500 events. **202**, partial success |
-| `POST` | `/v1/audit/events/search` | `audit:read` | Cursor pagination |
+| `GET` | `/v1/audit/events` | `audit:read` | Console listing — display-ready rows, filter chips, per-row hash check |
+| `POST` | `/v1/audit/events/search` | `audit:read` | Cursor pagination over raw ECS documents |
 | `GET` | `/v1/audit/events/{id}` | `audit:read` | User-filtered |
 | `POST` | `/v1/audit/events/aggregate` | `audit:read` | `group_by` allow-list |
 | `POST` | `/v1/audit/events/export` | `audit:export` | Streaming NDJSON over a PIT |
@@ -212,6 +213,52 @@ Base path `/v1`. Responses use the platform envelope
 | `POST` | `/v1/audit/compliance/erasure` | `audit:erase` | Crypto-shred a data subject |
 | `POST` | `/v1/audit/admin/users/{id}/dedicate` | `audit:admin` | Provision a dedicated stream |
 | `GET` | `/health`, `/health/live`, `/health/ready`, `/metrics` | — | Unversioned |
+
+### Two read shapes, on purpose
+
+`GET /v1/audit/events` and `POST /v1/audit/events/search` read the same data
+through the same user-scoped query path, and hand back deliberately different
+things.
+
+`search` returns **canonical ECS documents** — `event.action`,
+`event.category`, five-level `event.severity`, nothing derived. That is what a
+SIEM forwarder, a compliance extract and any machine consumer wants, and it
+stays stable for six years.
+
+`GET /events` returns **rows**: a title, a display category, a three-level badge
+tier, resolved actor and target labels, and an abbreviated anchor. One row
+carries both what the console table shows and what its detail drawer adds
+(source IP, session, this event's hash and the previous one), so opening a row
+costs no second request.
+
+The translation lives in `app/domain/display.py`, server-side, for one reason:
+the filter chips and the Category column have to agree. `filter=issuance`
+selects exactly the actions the column labels *Issuance*, because the chip and
+the label read the same table — a property asserted in
+`tests/unit/test_audit_log_listing.py`. Split across two codebases, that is how
+a chip ends up hiding rows it should show.
+
+```bash
+curl -s "$AUDIT/v1/audit/events?filter=critical&size=25" \
+  -H "x-api-key: $KEY" -H "x-audit-user-uuid: $USER_UUID"
+```
+
+Filtering is a conjunction: `filter=issuance&action=credential.revoke` matches
+nothing and returns an empty page, rather than quietly dropping one of the two
+clauses and showing everything the operator just excluded.
+
+Each row carries `anchor.self_check`, recomputed locally from the document as
+read — `pass` means the record still hashes to the value stored on it, so it
+has not been edited in place. It is not a chain verification: deletion,
+reordering and insertion are found by walking the sequence, which is what
+`POST /v1/audit/compliance/integrity/verify` does and what the drawer's "Verify
+chain" button calls. `unavailable` means the check could not run (typically an
+event written before chaining was enabled) and must not be shown as a failure.
+
+`anchor_network` names the notary the console displays
+(`ANCHOR_NETWORK_NAME` / `ANCHOR_NETWORK_ID`). Its `notarised` flag reports
+whether this deployment actually seals WORM checkpoints, so a console cannot
+claim an event is anchored where nothing is being sealed.
 
 ### Search store
 
@@ -500,6 +547,7 @@ app/
 │   └── logging.py         structlog JSON + secret redaction
 ├── domain/
 │   ├── enums.py           action/category/scope taxonomy (ECS conventions)
+│   ├── display.py         console read model — chips, categories, badges, titles
 │   ├── legacy.py          map legacy ActionType/session strings ↔ ECS Actions
 │   └── events.py          canonical event + PII field registry
 ├── search/

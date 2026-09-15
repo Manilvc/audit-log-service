@@ -180,7 +180,10 @@ class Action(StrEnum):
     CREDENTIAL_REVOKE = "credential.revoke"
     CREDENTIAL_REVOKE_BULK = "credential.revoke.bulk"
     CREDENTIAL_REISSUE = "credential.reissue"
+    CREDENTIAL_RENEW = "credential.renew"
     CREDENTIAL_SUSPEND = "credential.suspend"
+    CREDENTIAL_UNSUSPEND = "credential.unsuspend"
+    CREDENTIAL_EXPIRE = "credential.expire"
     CREDENTIAL_SHARE = "credential.share"
     CREDENTIAL_SHARE_BULK = "credential.share.bulk"
     CREDENTIAL_VIEW = "credential.view"
@@ -297,6 +300,13 @@ DEFAULT_SEVERITY: dict[Action, Severity] = {
     Action.API_KEY_REVOKE: Severity.MEDIUM,
     Action.CREDENTIAL_REVOKE: Severity.MEDIUM,
     Action.CREDENTIAL_REVOKE_BULK: Severity.HIGH,
+    # Suspension withholds a credential without ending it, so it sits below
+    # revocation; lifting one restores access and is worth the same attention.
+    Action.CREDENTIAL_SUSPEND: Severity.MEDIUM,
+    Action.CREDENTIAL_UNSUSPEND: Severity.MEDIUM,
+    # Expiry is the scheduled, expected end of a credential's life. It is
+    # deliberately left at INFO: raising every expiry above it would bury the
+    # revocations, which are the ones somebody decided to make happen.
     Action.CREDENTIAL_SIGN: Severity.MEDIUM,
     Action.RECORD_DELETE_BULK: Severity.HIGH,
     Action.REQUEST_DELETE_BULK: Severity.HIGH,

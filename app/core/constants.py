@@ -128,3 +128,26 @@ DOMAIN_PATTERN: Final[str] = rf"^{_DOMAIN_LABEL}(?:\.{_DOMAIN_LABEL})*$"
 
 #: Free-text note on a key, for the operator who has to recognise it later.
 MAX_KEY_LABEL_LENGTH: Final[int] = 128
+
+# ---------------------------------------------------------------------------
+# Console listing
+# ---------------------------------------------------------------------------
+#: The unfiltered chip above the audit log table. A named constant because it
+#: is both the query-parameter default and the value echoed back in the
+#: response, and those two must not drift apart.
+FILTER_PRESET_ALL: Final[str] = "all"
+
+#: Ceiling on an inbound pagination cursor. A cursor this service issues is a
+#: base64 of two short sort values - well under 200 characters - so anything
+#: past this is either a mistake or an attempt to make the decoder do work.
+MAX_CURSOR_LENGTH: Final[int] = 512
+
+#: Default rows per page in the console table. Matches DEFAULT_PAGE_SIZE, but
+#: is a separate constant because the listing is a UI contract: changing what a
+#: table shows should not require touching a search-tuning setting.
+DEFAULT_LISTING_PAGE_SIZE: Final[int] = 50
+
+#: How much of an event message may become a row title before it is trimmed.
+#: A row is one line; a 8 KB message pushed through a table cell is a layout
+#: problem, and the full text is in the event itself.
+MAX_ROW_TITLE_LENGTH: Final[int] = 160
