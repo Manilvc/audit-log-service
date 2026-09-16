@@ -5,6 +5,10 @@ that one for the topology, mapping and index-settings reasoning — all of it
 applies here. This document covers only what is different when
 `SEARCH_BACKEND=opensearch`, and how to stand up a managed AWS domain.
 
+Migrating a **running** deployment from Elasticsearch to a managed domain is a
+sequenced operation with its own failure modes — see
+[OPENSEARCH_CUTOVER.md](./OPENSEARCH_CUTOVER.md).
+
 ## Version and support
 
 | Item | Value |

@@ -4,7 +4,9 @@ Deploying the audit log service to a shared environment: build, configure,
 release, roll back and operate.
 
 For local development use [SETUP.md](./SETUP.md). For the cluster itself see
-[ELASTICSEARCH_DEPLOYMENT.md](./ELASTICSEARCH_DEPLOYMENT.md).
+[ELASTICSEARCH_DEPLOYMENT.md](./ELASTICSEARCH_DEPLOYMENT.md). To move an existing
+deployment onto a managed AWS OpenSearch domain see
+[OPENSEARCH_CUTOVER.md](./OPENSEARCH_CUTOVER.md).
 
 ---
 
