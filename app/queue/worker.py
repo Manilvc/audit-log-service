@@ -61,8 +61,10 @@ from app.core.config import Settings
 from app.core.integrity import compute_hash
 from app.core.logging import get_logger
 from app.core.metrics import (
+    ARCHIVE_SEAL_FAILED,
     EVENTS_DEAD_LETTERED,
     EVENTS_DUPLICATE,
+    EVENTS_UNARCHIVED,
     EVENTS_WRITTEN,
 )
 from app.core.security.crypto import KeyRingError, PiiCipher
@@ -148,6 +150,16 @@ class IngestWorker:
         # every batch would be a tiny S3 object per batch; batching keeps the
         # notarisation rate sane without weakening the guarantee much.
         self._since_checkpoint: dict[str, int] = {}
+        # Chains whose last archive seal failed, and how many events were in
+        # that batch. Read on the redelivery path so a batch that reaches ES
+        # but never reaches the archive is reported as the compliance gap it
+        # is, rather than as routine redelivery.
+        #
+        # Best-effort by design: the marker lives in this process, so a
+        # redelivery picked up by another worker (or after a restart) loses it.
+        # The `archive_seal_failed` error is always emitted, so nothing goes
+        # unlogged - this only sharpens the follow-up line.
+        self._unsealed: dict[str, int] = {}
 
     # ------------------------------------------------------------------ run
     async def run(self) -> None:
@@ -439,6 +451,30 @@ class IngestWorker:
             )
             await self._queue.ack(partition, [q.message_id for q, _ in prepared])
             stats.duplicates += outcome.duplicates
+
+            # Was this redelivery caused by an archive seal that failed on the
+            # previous attempt? If so the events are now acknowledged as
+            # durable while no WORM segment covers them. That is a silent
+            # compliance gap, and it must not be filed under routine
+            # redelivery - the sequence range below cannot be re-sealed from
+            # here, because the numbers in the stored documents came from the
+            # earlier reservation.
+            unsealed = self._unsealed.pop(chain_id, 0)
+            if unsealed:
+                EVENTS_UNARCHIVED.inc(unsealed)
+                logger.error(
+                    "batch_acked_without_archive_segment",
+                    chain_id=chain_id,
+                    events=unsealed,
+                    detail=(
+                        "a prior attempt failed to seal this batch and the "
+                        "redelivery found the events already in Elasticsearch. "
+                        "They are queryable but have NO immutable archive copy, "
+                        "so tamper-evidence does not cover them. Fix the archive "
+                        "target, then re-seal these events from the ledger."
+                    ),
+                )
+
             logger.warning(
                 "batch_was_redelivery_chain_resynced",
                 chain_id=chain_id,
@@ -460,12 +496,27 @@ class IngestWorker:
                 await self._archive.seal_segment(
                     user_uuid=user_uuid, chain_id=chain_id, documents=documents
                 )
+                self._unsealed.pop(chain_id, None)
             except Exception as exc:
                 # Un-notarised evidence is not acceptable, so leave the batch
                 # unacknowledged and retry. ES already holds the documents and
                 # will answer 409 next time, which triggers the resync path -
                 # correct, if noisy.
-                logger.error("archive_seal_failed", error=str(exc), chain_id=chain_id)
+                self._unsealed[chain_id] = len(documents)
+                ARCHIVE_SEAL_FAILED.inc()
+                logger.error(
+                    "archive_seal_failed",
+                    error=str(exc),
+                    chain_id=chain_id,
+                    events=len(documents),
+                    detail=(
+                        "the batch was NOT acknowledged and will be redelivered. "
+                        "Elasticsearch already holds these events, so the retry "
+                        "takes the duplicate path: if the archive is still "
+                        "unreachable then, the events stay queryable with no "
+                        "immutable copy and audit_events_unarchived_total rises."
+                    ),
+                )
                 return
 
         # ---- 6. commit head, then ack ---------------------------------------

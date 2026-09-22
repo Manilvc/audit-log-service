@@ -87,6 +87,28 @@ def worker(name: str | None) -> None:
         if name:
             ingest_worker._consumer = name
 
+        # The worker is the only process that writes to the archive, so the
+        # bucket check belongs here as well as in the API lifespan. Without it
+        # a misconfigured archive target surfaces only per-batch, as
+        # `archive_seal_failed`, after the events are already in Elasticsearch.
+        #
+        # A warning, not a hard failure, for the same reason as in the API:
+        # refusing to start would halt audit collection entirely, which is
+        # worse than collecting into a mutable store and saying so loudly.
+        if container.archive.enabled:
+            try:
+                await container.archive.verify_bucket()
+                logger.info("worm_archive_verified")
+            except Exception as exc:
+                logger.error(
+                    "worm_archive_misconfigured",
+                    error=str(exc),
+                    impact=(
+                        "every batch will fail to seal and be redelivered; "
+                        "events stay queryable with no immutable copy"
+                    ),
+                )
+
         loop = asyncio.get_running_loop()
         # Graceful shutdown: finish the in-flight batch so events are not left
         # pending and later reclaimed as stale.

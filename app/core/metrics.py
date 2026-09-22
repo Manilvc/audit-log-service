@@ -52,3 +52,14 @@ CHAIN_RESYNCED = Counter(
     "audit_chain_resynced_from_ledger_total",
     "Times a partition chain head was rebuilt from Elasticsearch",
 )
+
+ARCHIVE_SEAL_FAILED = Counter(
+    "audit_archive_seal_failed_total",
+    "Batches whose WORM segment write failed (batch left unacknowledged)",
+)
+
+EVENTS_UNARCHIVED = Counter(
+    "audit_events_unarchived_total",
+    "Events acknowledged as durable in ES with no WORM segment written. "
+    "Any non-zero value is a compliance gap and must alert.",
+)
