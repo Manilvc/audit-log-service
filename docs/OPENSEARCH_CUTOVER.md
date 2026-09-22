@@ -173,6 +173,58 @@ Single-quote any password containing `,` `>` `=` or `#`.
 with the host's IAM role. It needs an instance role, so it is only available on
 an EC2 or container host.
 
+### The archive target moves too
+
+This is the step that is easy to miss, because nothing about it fails at
+startup. Moving the search backend to AWS does **not** move the WORM archive,
+and a host cut over from local Elasticsearch is usually also running local
+MinIO:
+
+```env
+# Leftovers from the local stack - both wrong once the host is on AWS.
+S3_ENDPOINT_URL=http://localhost:9000
+ARCHIVE_BUCKET=everycred-audit-archive-local
+```
+
+Left as-is, ingest keeps working and reads keep working, so the cutover looks
+clean. Only the worker notices, once per batch:
+
+```
+archive_seal_failed  error='archive write failed for audit/events/...ndjson.gz:
+An error occurred (404) when calling the PutObject operation: Not Found'
+```
+
+A bare `404` rather than `NoSuchBucket` means nothing S3-shaped answered at all
+- the error body carried no `<Code>`, so botocore fell back to the HTTP status.
+That is the signature of an endpoint override pointing at a MinIO that is no
+longer there.
+
+The consequence is worse than the log suggests. The seal failure leaves the
+batch unacknowledged, the redelivery finds the events already in OpenSearch,
+and the duplicate path resyncs the chain and acknowledges. The events stay
+queryable, but **no immutable segment covers them** and the orphaned
+reservation leaves a numbering gap. Nothing is lost; the tamper-evidence
+guarantee simply does not apply to that window, and re-sealing after the fact
+needs the events read back out of the ledger.
+
+So change both keys in the same edit as the search keys:
+
+```env
+# Comment out, do NOT blank: an empty value is not None, and boto rejects it
+# with `ValueError: Invalid endpoint:` at client construction.
+#S3_ENDPOINT_URL=
+ARCHIVE_BUCKET=everycred-audit-archive-dev
+```
+
+Create the bucket in the same account and region as the domain, with Object
+Lock enabled *at creation* - it cannot be added later. Commands in
+[DEPLOYMENT.md](./DEPLOYMENT.md#s3-worm-bucket).
+
+On an EC2 host, leave `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` unset and
+let the instance role supply credentials - the archive falls through to boto's
+default chain. The role needs `s3:PutObject` **and** `s3:PutObjectRetention`;
+without the second the 404 merely becomes an `AccessDenied`.
+
 ### Checkpoint
 
 Config validation refuses to start with neither credential nor SigV4, so a
@@ -190,11 +242,14 @@ print('user    :', s.ES_USERNAME)
 print('pwd len :', len(s.ES_PASSWORD.get_secret_value()))
 print('ca path :', repr(s.ES_CA_CERT_PATH))
 print('replicas:', s.INDEX_REPLICAS)
+print('archive :', s.ARCHIVE_BUCKET, '@', s.S3_ENDPOINT_URL or 'aws')
 "
 ```
 
 Expect `SearchEngine.OPENSEARCH`, `audit_admin`, `ca path : ''`, and a `pwd len`
-matching the real password.
+matching the real password. `archive` must print `@ aws` and a real bucket name
+- `@ http://localhost:9000` means the archive was left behind on the local
+stack.
 
 ---
 
@@ -345,6 +400,7 @@ decrypts them. That is correct behaviour, not corruption.
 | `strict_dynamic_mapping_exception` in the worker | A backing index predates the current template. Classified permanent, so dead-lettered rather than retried | Recreate the stream, clear the DLQs |
 | Cluster stuck **yellow** | One data node cannot host a replica of its own primary | `INDEX_REPLICAS=0`, or add nodes |
 | A `curl` prints nothing at all | `$ES` or auth unset; `-s` swallows "URL malformed" | Always `-sS -w "\nHTTP %{http_code}\n"` |
+| `archive_seal_failed` with `An error occurred (404) ... PutObject ... Not Found` | `S3_ENDPOINT_URL` still points at the local MinIO, which is gone. A bare `404` instead of `NoSuchBucket` means no S3 answered | Comment out the override, set a real Object Lock bucket; see *The archive target moves too* |
 | A config edit has no effect | Duplicate key later in `.env`, or the unit's `WorkingDirectory` points at another checkout | `systemctl show audit -p WorkingDirectory`; de-duplicate |
 
 ### Clearing dead-lettered events
