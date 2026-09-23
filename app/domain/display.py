@@ -295,36 +295,6 @@ _PREFIX_CATEGORY: Final[tuple[tuple[str, DisplayCategory], ...]] = (
     ("audit_log.", DisplayCategory.AUDIT),
 )
 
-#: Action spellings this platform emits that the taxonomy above does not name.
-#:
-#: A chip filters on a closed list built from `_ACTION_CATEGORY`, so an action
-#: missing from that table is never pulled into a chip - even when the Category
-#: column already labels it correctly by prefix. That is how the Issuance chip
-#: came back empty over a log full of issuances: the emitting backend writes
-#: `credential.issued`, while the enum above names `credential.issue`. They are
-#: the same activity to anyone reading the screen.
-#:
-#: Listed explicitly rather than resolved by prefix, for the reason
-#: `FilterPreset.actions` gives: a prefix query would also sweep in a future
-#: `credential.issue_draft` that nobody has classified, and on an audit screen a
-#: chip that quietly widens is worse than one that misses.
-_CATEGORY_ACTION_ALIASES: Final[dict[DisplayCategory, tuple[str, ...]]] = {
-    DisplayCategory.ISSUANCE: ("credential.issued", "credential.reissued"),
-    DisplayCategory.VERIFICATION: ("verify.event",),
-    DisplayCategory.REVOCATION: ("credential.revoked", "credential.suspended"),
-    DisplayCategory.APPROVAL: (
-        "request.approved",
-        "request.rejected",
-        "request.sent",
-    ),
-}
-
-#: Flattened for `display_category`, so an alias is labelled by the same
-#: category that filters on it - the invariant the chip rests on.
-_ALIAS_CATEGORY: Final[dict[str, DisplayCategory]] = {
-    action: category for category, actions in _CATEGORY_ACTION_ALIASES.items() for action in actions
-}
-
 #: Inverted `_ACTION_CATEGORY`, so a chip and a column label share one source.
 #:
 #: `str(action)` rather than the `Action` member itself: these values are handed
@@ -333,10 +303,7 @@ _ALIAS_CATEGORY: Final[dict[str, DisplayCategory]] = {
 #: two compare equal - `Action` is a `StrEnum` - so this only pins the type.
 _CATEGORY_ACTIONS: Final[dict[DisplayCategory, tuple[str, ...]]] = {
     category: tuple(
-        sorted(
-            {str(action) for action, mapped in _ACTION_CATEGORY.items() if mapped is category}
-            | set(_CATEGORY_ACTION_ALIASES.get(category, ()))
-        )
+        sorted(str(action) for action, mapped in _ACTION_CATEGORY.items() if mapped is category)
     )
     for category in DisplayCategory
 }
@@ -370,12 +337,6 @@ def display_category(action: str) -> DisplayCategory:
     exact = _ACTION_CATEGORY.get(action)
     if exact is not None:
         return exact
-    # Before the prefix table: `credential.reissued` would fall to LIFECYCLE on
-    # `credential.` and `verify.event` to OTHER, neither of which is the chip
-    # that now selects them.
-    aliased = _ALIAS_CATEGORY.get(action)
-    if aliased is not None:
-        return aliased
     for prefix, category in _PREFIX_CATEGORY:
         if action.startswith(prefix):
             return category
