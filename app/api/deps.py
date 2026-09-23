@@ -323,6 +323,54 @@ async def require_user_uuid(
 UserUuidDep = Annotated[str, Depends(require_user_uuid)]
 
 
+def _wants_cross_user(request: Request) -> bool:
+    """Did this call ask to read across every user?
+
+    Read off the raw query string rather than taken as an argument, because a
+    dependency resolves before the handler's parameters are bound. The truthy
+    spellings are FastAPI's own, so this and the handler's `cross_user`
+    parameter cannot disagree about what "true" means - a disagreement would
+    either demand a user header for a cross-user read or, far worse, waive it
+    for a single-user one.
+    """
+    value = request.query_params.get("cross_user")
+    return value is not None and value.strip().lower() in {"1", "true", "on", "yes", "y"}
+
+
+async def user_uuid_unless_cross_user(
+    request: Request,
+    user_uuid_header: Annotated[str | None, Header(alias=USER_UUID_HEADER)] = None,
+) -> str | None:
+    """The user this call acts for. Mandatory unless the read is cross-user.
+
+    Keeps the boundary guarantee `require_user_uuid` gives - a user-scoped call
+    that forgets the header is refused with one clear 400 naming it, before the
+    handler runs - while letting a cross-user listing through, since that read
+    names no single user.
+
+    Nothing is authorised here. `resolve_scope` still demands
+    `audit:cross_user` for a cross-user scope, so omitting the header buys a
+    caller an authorisation failure rather than everyone's trail.
+
+    Raises:
+        InvalidUserUuidError: the header is absent, blank, or malformed on a
+            call that is not cross-user.
+    """
+    if _wants_cross_user(request):
+        return None
+    if user_uuid_header is None or not user_uuid_header.strip():
+        raise InvalidUserUuidError(
+            f"the {USER_UUID_HEADER} header is required: it names the user this "
+            "call acts for, and the API key is not bound to a user. To read "
+            "every user's trail instead, pass cross_user=true, which requires "
+            "the audit:cross_user scope"
+        )
+    return UserRouter.validate_user_uuid(user_uuid_header)
+
+
+UserUuidUnlessCrossUserDep = Annotated[str | None, Depends(user_uuid_unless_cross_user)]
+
+
 async def issuer_id_header(
     issuer_header: Annotated[str | None, Header(alias=ISSUER_HEADER)] = None,
 ) -> str | None:

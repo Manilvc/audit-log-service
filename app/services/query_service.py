@@ -279,6 +279,7 @@ class QueryService:
         size: int = DEFAULT_LISTING_PAGE_SIZE,
         cursor: list[Any] | None = None,
         with_total: bool = True,
+        cross_user: bool = False,
     ) -> AuditLogListResponse:
         """One page of the audit log table, rendered for display.
 
@@ -311,7 +312,11 @@ class QueryService:
                 deep can switch it off after the first page.
         """
         principal.require(Scope.READ)
-        scope = self.resolve_scope(principal, requested_user_uuid=requested_user_uuid)
+        scope = self.resolve_scope(
+            principal,
+            requested_user_uuid=requested_user_uuid,
+            cross_user=cross_user,
+        )
 
         selected_actions = _narrow(actions, preset.actions)
         selected_severities = _narrow(severities, preset.severities)
@@ -323,7 +328,7 @@ class QueryService:
             await self.record_access(
                 principal=principal,
                 scope=scope,
-                action=Action.AUDIT_SEARCH,
+                action=_listing_access_action(cross_user),
                 result_count=0,
                 detail={"listing": True, "filter": preset.value, "contradictory_filter": True},
             )
@@ -364,13 +369,14 @@ class QueryService:
         await self.record_access(
             principal=principal,
             scope=scope,
-            action=Action.AUDIT_SEARCH,
+            action=_listing_access_action(cross_user),
             result_count=len(rows),
             detail={
                 "listing": True,
                 "filter": preset.value,
                 "size": size,
                 "paginated": cursor is not None,
+                "cross_user": cross_user,
             },
         )
 
@@ -634,6 +640,17 @@ def _to_filter(request: SearchRequest) -> AuditSearchFilter:
         label_terms=request.label_terms,
         text=request.text,
     )
+
+
+def _listing_access_action(cross_user: bool) -> Action:
+    """Which audit-of-the-audit action a listing read records.
+
+    A cross-user listing crosses the isolation boundary the whole model rests
+    on, exactly as a cross-user search does, so it is recorded under the action
+    that carries CRITICAL severity rather than filed away as a routine listing.
+    Reading everyone's trail must not look like reading your own.
+    """
+    return Action.AUDIT_CROSS_USER_ACCESS if cross_user else Action.AUDIT_SEARCH
 
 
 def _narrow(

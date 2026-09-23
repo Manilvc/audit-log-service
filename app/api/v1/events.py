@@ -37,6 +37,7 @@ from app.api.deps import (
     QueryServiceDep,
     UserUuidDep,
     UserUuidHeaderDep,
+    UserUuidUnlessCrossUserDep,
 )
 from app.core.constants import DEFAULT_LISTING_PAGE_SIZE, MAX_CURSOR_LENGTH
 from app.core.exceptions import NotFound
@@ -106,7 +107,21 @@ async def ingest_events(
 async def list_events(
     principal: PrincipalDep,
     service: QueryServiceDep,
-    user_uuid_header: UserUuidDep,
+    # Required exactly as before, except on a `cross_user=true` read, which
+    # names no single user. The 400 still comes from the dependency, before the
+    # handler runs, so the listing keeps the boundary guarantee every other
+    # user-scoped route has.
+    user_uuid_header: UserUuidUnlessCrossUserDep,
+    cross_user: Annotated[
+        bool,
+        Query(
+            description=(
+                "List every user's events in one page instead of one user's. "
+                "Requires audit:cross_user, which only a SERVICE_API_KEYS "
+                "credential holds. Recorded as a critical break-glass event."
+            )
+        ),
+    ] = False,
     # Named `preset` in Python, `filter` on the wire: the query parameter has to
     # read as the chip the operator clicked, while shadowing the `filter`
     # builtin inside the function would be a lint failure and a readability one.
@@ -213,6 +228,7 @@ async def list_events(
         size=size,
         cursor=decode_cursor(cursor),
         with_total=with_total,
+        cross_user=cross_user,
     )
     total = result.total
     if total is None:
